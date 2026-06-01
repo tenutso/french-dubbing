@@ -28,7 +28,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # Accelerated HF downloads — must be set before huggingface_hub is imported.
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -126,6 +126,12 @@ class PipelineConfig:
     # TTS — Coqui XTTS-v2 (Idiap fork)
     tts_max_stretch: float = 1.25
     tts_min_stretch: float = 0.8
+    # Grouped tempo smoothing: segments separated by ≤ this many seconds of
+    # original silence share a single uniform stretch ratio, so speed-ups/
+    # slow-downs are spread across the group instead of hitting one segment.
+    tts_group_gap: float = 0.4
+    # Stretch engine: "rubberband" (natural, formant-preserving) or "atempo".
+    tts_stretcher: str = "rubberband"
     xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
     xtts_temperature: float = 0.65
     xtts_length_penalty: float = 1.0
@@ -227,6 +233,8 @@ def load_config(path: str) -> PipelineConfig:
         xtts_top_p=tts.get("xtts_top_p", 0.85),
         tts_max_stretch=tts.get("max_stretch", 1.25),
         tts_min_stretch=tts.get("min_stretch", 0.8),
+        tts_group_gap=tts.get("group_gap", 0.4),
+        tts_stretcher=tts.get("stretcher", "rubberband"),
         output_volume_boost_pct=float(aud.get("volume_boost_pct", 0.0)),
         huggingface_token=(
             t.get("huggingface_token", "")
@@ -1429,35 +1437,54 @@ def _apply_fade_in(audio: np.ndarray, fade_samples: int) -> np.ndarray:
     return out
 
 
-def _atempo_stretch(
+def _stretch_audio(
     audio: np.ndarray,
-    target_samples: int,
+    speed_factor: float,
     src_rate: int,
-    max_ratio: float,
-    min_ratio: float,
     temp_dir: str,
     log: logging.Logger,
+    stretcher: str = "rubberband",
 ) -> np.ndarray:
-    ratio = len(audio) / max(target_samples, 1)
-    if 0.98 <= ratio <= 1.02:
+    """Time-stretch `audio` by `speed_factor` (>1 = faster, <1 = slower).
+
+    Uses ffmpeg's rubberband filter by default — formant-preserving, sounds
+    more natural than atempo at moderate ratios. Falls back to atempo if the
+    rubberband filter isn't available.
+    """
+    if len(audio) == 0 or 0.98 <= speed_factor <= 1.02:
         return audio
 
-    ratio   = max(min_ratio, min(max_ratio, ratio))
-    tmp_in  = os.path.join(temp_dir, "_at_in.wav")
-    tmp_out = os.path.join(temp_dir, "_at_out.wav")
+    tmp_in  = os.path.join(temp_dir, "_st_in.wav")
+    tmp_out = os.path.join(temp_dir, "_st_out.wav")
     sf.write(tmp_in, audio, src_rate)
 
-    af = f"atempo={ratio:.4f}" if ratio <= 2.0 else f"atempo=2.0,atempo={ratio / 2:.4f}"
+    if stretcher == "rubberband":
+        af = f"rubberband=tempo={speed_factor:.4f}"
+    else:
+        af = (
+            f"atempo={speed_factor:.4f}"
+            if 0.5 <= speed_factor <= 2.0
+            else f"atempo=2.0,atempo={speed_factor / 2:.4f}"
+        )
+
     try:
         subprocess.run(
             ["ffmpeg", "-y", "-i", tmp_in, "-af", af, tmp_out],
-            check=True, capture_output=True, timeout=60,
+            check=True, capture_output=True, timeout=120,
         )
         stretched, _ = librosa.load(tmp_out, sr=src_rate, mono=True)
         return stretched
     except Exception as e:
-        log.debug(f"atempo failed ({e}), truncating instead")
-        return audio[:target_samples]
+        if stretcher == "rubberband":
+            log.debug(f"rubberband failed ({e}), falling back to atempo")
+            for f in (tmp_in, tmp_out):
+                try: os.unlink(f)
+                except OSError: pass
+            return _stretch_audio(
+                audio, speed_factor, src_rate, temp_dir, log, stretcher="atempo"
+            )
+        log.debug(f"atempo failed ({e}), returning unstretched")
+        return audio
     finally:
         for f in (tmp_in, tmp_out):
             try:
@@ -1512,67 +1539,135 @@ def assemble_and_encode(
     temp_dir: str,
     log: logging.Logger,
     volume_boost_pct: float = 0.0,
+    group_gap: float = 0.4,
+    stretcher: str = "rubberband",
+    placements_out: Optional[Dict[int, Tuple[float, float]]] = None,
 ) -> bool:
-    """Place each synthesized segment into the timeline.
+    """Place synthesized segments into the timeline with grouped tempo smoothing.
 
-    Per-segment policy:
-      1. Fit in the original window + 1 borrowed gap from the next segment.
-      2. If audio still overflows by ≤ max_stretch: atempo stretch.
-      3. Otherwise truncate with an 80 ms cosine fade-out.
-    Adjacent segments are joined with a 50 ms equal-power crossfade on overlap.
+    Consecutive segments separated by <= `group_gap` seconds of original
+    silence share a single uniform stretch ratio. The ratio is only applied
+    when the group's total audio can't fit in its time window — groups
+    that already fit play at natural speed with natural gaps preserved.
+    This avoids the noticeable per-segment speed-ups/slow-downs that came
+    from stretching each chunk to fill its own window.
+
+    If `placements_out` is provided, it's populated with
+    {round(original_start * 1000): (new_start, played_duration)} so the SRT
+    retime step can follow the actual audio placement.
     """
     log.info(
         f"Assembling {len(synthesized)} segments at {src_rate} Hz "
-        f"(stretch ≤ {max_stretch:.2f}, crossfade {_CROSSFADE_MS:.0f}ms) …"
+        f"(stretch <= {max_stretch:.2f}, group gap {group_gap:.2f}s, "
+        f"engine {stretcher}, crossfade {_CROSSFADE_MS:.0f}ms) ..."
     )
 
     total_samples = int((total_duration + 2) * src_rate)
     assembled     = np.zeros(total_samples, dtype=np.float32)
-    ordered       = sorted(synthesized, key=lambda x: x[1])
+    ordered       = [(a, s, e) for (a, s, e) in sorted(synthesized, key=lambda x: x[1]) if len(a) > 0]
 
-    xfade_samples = int(_CROSSFADE_MS / 1000.0 * src_rate)
-    fade_in_samples = int(_FADE_IN_MS / 1000.0 * src_rate)
+    if not ordered:
+        log.warning("No synthesized audio to assemble.")
+        return False
+
+    xfade_samples    = int(_CROSSFADE_MS / 1000.0 * src_rate)
+    fade_in_samples  = int(_FADE_IN_MS / 1000.0 * src_rate)
     fade_out_samples = int(_FADE_OUT_MS / 1000.0 * src_rate)
+    xfade_s          = _CROSSFADE_MS / 1000.0
 
-    stretched_count = 0
-    truncated_count = 0
+    trimmed = [_trim_silence(a) for a, _, _ in ordered]
 
-    for i, (audio, start, end) in enumerate(ordered):
-        # 1. Clean the synthesized audio
-        audio = _trim_silence(audio)
-        
-        # 2. Apply micro-fades to prevent sharp cuts
-        audio = _apply_fade_in(audio, fade_in_samples)
-        audio = _apply_fade_out(audio, fade_in_samples) # Use fade_in_samples for symmetric micro-fade
-
-        start_s  = int(start * src_rate)
-        window_s = int((end - start) * src_rate)
-
-        if i + 1 < len(ordered):
-            next_start_s = int(ordered[i + 1][1] * src_rate)
-            available    = max(window_s, next_start_s - start_s - xfade_samples)
+    # Build groups: consecutive segments whose original inter-gap <= group_gap.
+    groups: List[List[int]] = []
+    current = [0]
+    for i in range(1, len(ordered)):
+        prev_end   = ordered[i - 1][2]
+        next_start = ordered[i][1]
+        if next_start - prev_end <= group_gap:
+            current.append(i)
         else:
-            available = max(window_s, total_samples - start_s)
+            groups.append(current)
+            current = [i]
+    groups.append(current)
 
-        ratio = len(audio) / max(available, 1)
-        if ratio > max_stretch:
-            # Speed up as much as allowed, then truncate
-            audio = _atempo_stretch(audio, int(len(audio) / max_stretch), src_rate, max_stretch, min_stretch, temp_dir, log)
-            audio = _apply_fade_out(audio[:available], fade_out_samples)
-            truncated_count += 1
-            log.debug(f"  segment {i}: truncated ({ratio:.2f}x over budget, available={available / src_rate:.2f}s)")
-        elif ratio > 1.02 or ratio < 0.98:
-            # Stretch to fit (either speed up or slow down)
-            audio = _atempo_stretch(audio, available, src_rate, max_stretch, min_stretch, temp_dir, log)
-            stretched_count += 1
+    stretched_groups = 0
+    truncated_groups = 0
+    natural_groups   = 0
 
-        _equal_power_crossfade(assembled, start_s, audio, xfade_samples)
+    for g_i, group in enumerate(groups):
+        group_start    = ordered[group[0]][1]
+        group_orig_end = ordered[group[-1]][2]
 
-    if stretched_count or truncated_count:
+        # Window upper bound: extend up to the next group's start (minus
+        # crossfade). This multi-gap borrowing lets a dense run lean on the
+        # silence before the next run.
+        if g_i + 1 < len(groups):
+            next_group_start = ordered[groups[g_i + 1][0]][1]
+            window_end = max(group_orig_end, next_group_start - xfade_s)
+        else:
+            window_end = max(group_orig_end, total_duration + 2.0)
+
+        W = max(window_end - group_start, 1e-3)
+        A = sum(len(trimmed[idx]) for idx in group) / src_rate
+
+        if A <= W * 1.02:
+            speed = 1.0
+            natural_groups += 1
+        else:
+            ideal_speed = A / W
+            speed = min(ideal_speed, max_stretch)
+            stretched_groups += 1
+            if ideal_speed > max_stretch:
+                truncated_groups += 1
+                log.debug(
+                    f"  group {g_i}: ideal speed {ideal_speed:.2f}x exceeds "
+                    f"max {max_stretch:.2f}x, will truncate tail"
+                )
+
+        audios = []
+        for idx in group:
+            a = trimmed[idx]
+            if speed != 1.0:
+                a = _stretch_audio(a, speed, src_rate, temp_dir, log, stretcher)
+            a = _apply_fade_in(a, fade_in_samples)
+            a = _apply_fade_out(a, fade_in_samples)
+            audios.append(a)
+
+        if speed == 1.0:
+            for j, idx in enumerate(group):
+                orig_start = ordered[idx][1]
+                start_s = int(orig_start * src_rate)
+                _equal_power_crossfade(assembled, start_s, audios[j], xfade_samples)
+                if placements_out is not None:
+                    placements_out[round(orig_start * 1000)] = (
+                        orig_start, len(audios[j]) / src_rate
+                    )
+        else:
+            cursor_s  = int(group_start * src_rate)
+            max_end_s = int(window_end * src_rate)
+            for j, idx in enumerate(group):
+                a = audios[j]
+                is_last = (j == len(group) - 1)
+                if is_last and cursor_s + len(a) > max_end_s:
+                    keep = max(0, max_end_s - cursor_s)
+                    a = _apply_fade_out(a[:keep], fade_out_samples)
+                placed_start_s = cursor_s
+                _equal_power_crossfade(assembled, placed_start_s, a, xfade_samples)
+                if placements_out is not None:
+                    orig_start = ordered[idx][1]
+                    placements_out[round(orig_start * 1000)] = (
+                        placed_start_s / src_rate, len(a) / src_rate
+                    )
+                cursor_s += len(a)
+
+    if stretched_groups or truncated_groups:
         log.info(
-            f"  Overflow/gap handling: {stretched_count} stretched ({min_stretch:.2f}x\u2013{max_stretch:.2f}x), "
-            f"{truncated_count} truncated with fade-out"
+            f"  Grouped smoothing: {natural_groups} natural, "
+            f"{stretched_groups} stretched (<= {max_stretch:.2f}x), "
+            f"{truncated_groups} tail-truncated"
         )
+    else:
+        log.info(f"  Grouped smoothing: all {natural_groups} groups fit naturally")
 
     peak = np.max(np.abs(assembled))
     if peak > 0:
@@ -1662,18 +1757,18 @@ def retime_segments_to_audio(
     src_rate: int,
     total_duration: float,
     log: logging.Logger,
+    placements: Optional[Dict[int, Tuple[float, float]]] = None,
 ) -> List[dict]:
     """Match each segment's SRT timing to where its dubbed audio actually plays.
 
-    The audio assembler places each TTS chunk at seg["start"] and lets it
-    extend up to the next segment's start (minus a 50 ms crossfade). When the
-    TTS is shorter than the original Whisper window, the dubbed audio finishes
-    early and the rest of the window is silent. Without this retime, the SRT
-    keeps the subtitle on screen through that silence — which the viewer
-    perceives as the subtitles "falling behind" the audio.
+    When `placements` is provided (the assembler's actual placement of each
+    segment after grouped tempo smoothing), the SRT follows those positions
+    exactly — keeping subtitles synced with the audio even when segments
+    were shifted within a stretched group.
 
-    Also drops segments whose TTS produced no audio so the SRT doesn't list
-    entries with nothing playing underneath them.
+    Otherwise falls back to the previous behavior: assume each segment
+    starts at its original timestamp and just tighten its end to the actual
+    audio length.
     """
     XFADE_S = _CROSSFADE_MS / 1000.0
     syn_by_start: dict = {}
@@ -1687,24 +1782,30 @@ def retime_segments_to_audio(
     tightened = 0
 
     for i, seg in enumerate(by_start):
-        audio = syn_by_start.get(round(seg["start"] * 1000))
+        key = round(seg["start"] * 1000)
+        audio = syn_by_start.get(key)
         if audio is None or len(audio) == 0:
             dropped += 1
             continue
 
-        if i + 1 < len(by_start):
-            available = by_start[i + 1]["start"] - seg["start"] - XFADE_S
+        if placements and key in placements:
+            new_start, played = placements[key]
+            new_end = new_start + max(played, 0.5)
         else:
-            available = (total_duration + 2.0) - seg["start"]
+            if i + 1 < len(by_start):
+                available = by_start[i + 1]["start"] - seg["start"] - XFADE_S
+            else:
+                available = (total_duration + 2.0) - seg["start"]
+            tts_dur = len(audio) / src_rate
+            played  = min(tts_dur, max(available, 0.5))
+            new_start = seg["start"]
+            new_end   = new_start + max(played, 0.5)
 
-        tts_dur  = len(audio) / src_rate
-        played   = min(tts_dur, max(available, 0.5))
-        new_end  = seg["start"] + max(played, 0.5)
         orig_end = seg["end"]
-
         new_seg = dict(seg)
-        new_seg["end"] = new_end
-        if abs(new_end - orig_end) > 0.3:
+        new_seg["start"] = new_start
+        new_seg["end"]   = new_end
+        if abs(new_end - orig_end) > 0.3 or abs(new_start - seg["start"]) > 0.05:
             tightened += 1
         kept.append(new_seg)
 
@@ -2018,6 +2119,7 @@ def process_video(
     log.info("\n[6/6] ASSEMBLING & ENCODING")
     interim_wav = os.path.join(temp_dir, f"{name}_french.wav")
 
+    placements: Dict[int, Tuple[float, float]] = {}
     if not assemble_and_encode(
         synthesized,
         total_duration,
@@ -2030,6 +2132,9 @@ def process_video(
         temp_dir=temp_dir,
         log=log,
         volume_boost_pct=config.output_volume_boost_pct,
+        group_gap=config.tts_group_gap,
+        stretcher=config.tts_stretcher,
+        placements_out=placements,
     ):
         return False
 
@@ -2042,7 +2147,8 @@ def process_video(
             log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
 
     srt_segments = retime_segments_to_audio(
-        segments, synthesized, actual_sr, total_duration, log
+        segments, synthesized, actual_sr, total_duration, log,
+        placements=placements,
     )
 
     if config.keep_temp:

@@ -122,11 +122,24 @@ tts:
   # DeepFilterNet denoising on the speaker reference clip.
   use_deepfilter: true
 
-  # Max atempo ratio for segments that overflow their window. Beyond this
-  # ratio the segment is truncated with an 80 ms fade-out instead of being
-  # sped up further (preserves voice quality).
+  # Max stretch ratio for groups whose audio overflows their window. Beyond
+  # this ratio the group's tail is truncated with a fade-out instead of
+  # being sped up further (preserves voice quality).
   max_stretch: 1.3
   min_stretch: 0.7
+
+  # Grouped tempo smoothing: consecutive segments separated by <= this many
+  # seconds of original silence share one uniform stretch ratio, so
+  # speed-ups/slow-downs are spread evenly across a speech run instead of
+  # falling on a single overflowing segment. Larger values = smoother but
+  # may stretch over short natural pauses; smaller = more local. 0 disables
+  # grouping (each segment treated independently).
+  group_gap: 0.4
+
+  # Time-stretch engine. "rubberband" preserves formants and sounds more
+  # natural at moderate ratios; "atempo" is the legacy ffmpeg filter and
+  # is used as a fallback when rubberband isn't available.
+  stretcher: rubberband
 
   # Merge consecutive Whisper fragments into sentence-scale chunks before TTS.
   # The v3 sub-second fragments caused robotic prosody AND broken SRT timing;

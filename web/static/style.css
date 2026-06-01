@@ -10,6 +10,13 @@
   --err: #e74c3c;
   --border: #2a2f3a;
   --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Status Colors */
+  --status-queued: #8a93a6;
+  --status-running: #4f8cff;
+  --status-completed: #2ecc71;
+  --status-failed: #e74c3c;
+  --status-cancelled: #95a5a6;
 }
 
 * { box-sizing: border-box; }
@@ -165,11 +172,25 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
   font-weight: 600;
   background: var(--border);
 }
-.status-pill[data-status=running]   { background: #1e3a8a; color: #cfe2ff; }
-.status-pill[data-status=queued]    { background: #463c1a; color: #ffe9a1; }
-.status-pill[data-status=completed] { background: #14532d; color: #b4eccd; }
-.status-pill[data-status=failed]    { background: #5b1a1a; color: #ffc1c1; }
-.status-pill[data-status=cancelled] { background: #3a3a3a; color: #cccccc; }
+.status-pill[data-status=running]   { background: var(--status-running); color: white; }
+.status-pill[data-status=queued]    { background: var(--status-queued); color: white; }
+.status-pill[data-status=completed] { background: var(--status-completed); color: white; }
+.status-pill[data-status=failed]    { background: var(--status-failed); color: white; }
+.status-pill[data-status=cancelled] { background: var(--status-cancelled); color: white; }
+
+.job-progress {
+  height: 4px;
+  background: var(--panel-2);
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 8px 0;
+}
+.job-progress-inner {
+  height: 100%;
+  background: var(--accent);
+  width: 0%;
+  transition: width 0.3s ease;
+}
 
 .job-meta { font-family: var(--mono); font-size: 11px; }
 .job-phase { font-family: var(--mono); font-size: 12px; color: var(--accent); min-height: 0; }

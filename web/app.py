@@ -438,6 +438,27 @@ def _download(job: Job, kind: str) -> FileResponse:
     return FileResponse(path, filename=download_name)
 
 
+@app.get("/api/glossary")
+async def get_glossary() -> JSONResponse:
+    try:
+        with open("/workspace/canadian_glossary.yaml", "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return JSONResponse(data.get("terms", []))
+    except Exception as e:
+        raise HTTPException(500, f"failed to read glossary: {e}")
+
+@app.post("/api/glossary")
+async def update_glossary(terms: list) -> JSONResponse:
+    try:
+        with open("/workspace/canadian_glossary.yaml", "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        data["terms"] = terms
+        with open("/workspace/canadian_glossary.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        return JSONResponse({"status": "ok"})
+    except Exception as e:
+        raise HTTPException(500, f"failed to update glossary: {e}")
+
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:
     if kind not in ("audio", "srt", "full"):

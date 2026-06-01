@@ -25,7 +25,8 @@ import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -58,6 +59,10 @@ if _hf_tok:
     os.environ["HF_TOKEN"] = _hf_tok
     os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_tok
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+
 import click
 import librosa
 import numpy as np
@@ -65,7 +70,12 @@ import pysrt
 import requests
 import soundfile as sf
 import torch
+import torchaudio
 import yaml
+
+# Enable TF32 for better performance on Ampere+ GPUs (RTX 30/40)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from pysrt import SubRipItem, SubRipTime
 from tqdm import tqdm
 
@@ -116,6 +126,7 @@ class PipelineConfig:
     # TTS — VoxCPM2 (single engine)
     tts_model: str = "openbmb/VoxCPM2"
     tts_max_stretch: float = 1.25
+    tts_min_stretch: float = 0.8
     tts_cfg_value: float = 2.5
     tts_inference_timesteps: int = 24
     tts_use_prompt_text: bool = False
@@ -208,6 +219,7 @@ def load_config(path: str) -> PipelineConfig:
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
         tts_model=tts.get("model", "openbmb/VoxCPM2"),
         tts_max_stretch=tts.get("max_stretch", 1.25),
+        tts_min_stretch=tts.get("min_stretch", 0.8),
         tts_cfg_value=tts.get("cfg_value", 2.5),
         tts_inference_timesteps=tts.get("inference_timesteps", 24),
         tts_use_prompt_text=tts.get("use_prompt_text", False),
@@ -503,6 +515,7 @@ def transcribe_audio(
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
             word_timestamps=True,
+            initial_prompt="Hello. Welcome to this video. Today we will discuss several important topics.",
         )
         segments = [
             {"id": i, "start": s.start, "end": s.end, "text": s.text.strip()}
@@ -717,7 +730,20 @@ def diarize_audio(
                 diarize_kwargs["max_speakers"] = int(max_speakers)
 
             log.info(f"  Pyannote params: {diarize_kwargs}")
-            result = pipeline(wav_path, **diarize_kwargs)
+
+            # Workaround for pyannote.audio name 'AudioDecoder' is not defined bug:
+            # We inject a mock into the pyannote.audio.core.io module if it's missing.
+            try:
+                import pyannote.audio.core.io as py_io
+                if not hasattr(py_io, "AudioDecoder"):
+                    class MockAudioDecoder:
+                        def __init__(self, *args, **kwargs): pass
+                    py_io.AudioDecoder = MockAudioDecoder
+            except ImportError:
+                pass
+
+            waveform, sample_rate = torchaudio.load(wav_path)
+            result = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **diarize_kwargs)
 
         # pyannote ≥ 3.3 wraps the output in a namedtuple whose annotation field
         # has been renamed across versions — probe known shapes.
@@ -883,14 +909,14 @@ Translate each numbered English segment into natural, conversational {language}
 suitable for a dubbed voice-over.
 
 Each segment includes its duration in seconds [N.Ns].
-Your translation MUST be concise enough to be spoken naturally within that time.
-Aim for approximately 15-18 characters per second of duration.
+Your translation should be natural and match the speaker's pacing.
+Aim for approximately 13-15 characters per second of duration.
 
 RULES:
 - Preserve key technical terms and proper nouns.
 - Adapt idioms naturally; do not translate literally.
 - Use a spoken register (contractions, common phrasing) — not literary French.
-- If the translation is significantly longer than the original, SHORTEN IT.
+- Do NOT excessively shorten the translation; let it flow naturally.
 - Output ONLY the numbered translations, one per line, same numbering as input.
 - Do NOT add character counts, parentheticals, notes, brackets, or explanations.
 {glossary_section}
@@ -1006,6 +1032,8 @@ def _parse_numbered(text: str, count: int) -> List[str]:
             continue
         idx, content = int(m.group(1)), m.group(2).strip()
         content = re.sub(r"^\(MAX\s+\d+\s+chars?\)\s*", "", content, flags=re.IGNORECASE)
+        # Clean leading duration hints [12.3s] the LLM may copy from the prompt
+        content = re.sub(r"^\[\d+(\.\d+)?s\]\s*", "", content)
         content = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", content)
         content = re.sub(r"\s*\[[^\]]*\]\s*$", "", content)
         content = content.strip(" \t\"'")
@@ -1055,29 +1083,38 @@ def translate_segments_qwen(
             return [""] * len(items)
         return _parse_numbered(response, len(items))
 
-    for start in tqdm(range(0, len(segments), batch_size), desc=f"Translating ({target_lang})"):
-        batch = segments[start : start + batch_size]
+    batches = [segments[i : i + batch_size] for i in range(0, len(segments), batch_size)]
+    
+    def _process_batch(batch: List[dict]) -> List[str]:
         translations = _translate(batch)
-
         # Retry the whole batch once if mostly empty.
         missing = sum(1 for t in translations if not t)
         if missing > len(batch) // 2:
-            log.debug(f"  batch {start // batch_size + 1}: {missing}/{len(batch)} missing, retrying")
             translations = _translate(batch)
-
         # Per-segment fallback for stragglers.
         for i, t in enumerate(translations):
-            if t:
-                continue
-            single = _translate([batch[i]])
-            if single and single[0]:
-                translations[i] = single[0]
+            if not t:
+                single = _translate([batch[i]])
+                if single and single[0]:
+                    translations[i] = single[0]
+        return translations
 
-        for i, seg in enumerate(batch):
-            text = translations[i] or seg["text"]
-            out[start + i]["text_fr"] = text
-            # Keep both keys so apply_glossary's defaults still work cleanly.
-            out[start + i]["text_fr_natural"] = text
+    # Parallel processing of batches
+    all_translations = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(tqdm(
+            executor.map(_process_batch, batches),
+            total=len(batches),
+            desc=f"Translating ({target_lang})",
+            leave=False
+        ))
+        for batch_translations in results:
+            all_translations.extend(batch_translations)
+
+    for i, text in enumerate(all_translations):
+        text = text or out[i]["text"]
+        out[i]["text_fr"] = text
+        out[i]["text_fr_natural"] = text
 
     log.info(f"✓ Translation complete ({target_lang})")
     return out
@@ -1337,14 +1374,15 @@ def _atempo_stretch(
     target_samples: int,
     src_rate: int,
     max_ratio: float,
+    min_ratio: float,
     temp_dir: str,
     log: logging.Logger,
 ) -> np.ndarray:
     ratio = len(audio) / max(target_samples, 1)
-    if ratio <= 1.02:
+    if 0.98 <= ratio <= 1.02:
         return audio
 
-    ratio   = min(ratio, max_ratio)
+    ratio   = max(min_ratio, min(max_ratio, ratio))
     tmp_in  = os.path.join(temp_dir, "_at_in.wav")
     tmp_out = os.path.join(temp_dir, "_at_out.wav")
     sf.write(tmp_in, audio, src_rate)
@@ -1410,6 +1448,7 @@ def assemble_and_encode(
     src_rate: int,
     out_rate: int,
     max_stretch: float,
+    min_stretch: float,
     temp_dir: str,
     log: logging.Logger,
     volume_boost_pct: float = 0.0,
@@ -1455,25 +1494,23 @@ def assemble_and_encode(
         else:
             available = max(window_s, total_samples - start_s)
 
-        if len(audio) > available:
-            ratio = len(audio) / max(available, 1)
-            if ratio <= max_stretch:
-                audio = _atempo_stretch(audio, available, src_rate, max_stretch, temp_dir, log)
-                stretched_count += 1
-            else:
-                # If we truncate, apply a longer fade-out
-                audio = _apply_fade_out(audio[:available], fade_out_samples)
-                truncated_count += 1
-                log.debug(
-                    f"  segment {i}: truncated ({ratio:.2f}× over budget, "
-                    f"available={available / src_rate:.2f}s)"
-                )
+        ratio = len(audio) / max(available, 1)
+        if ratio > max_stretch:
+            # Speed up as much as allowed, then truncate
+            audio = _atempo_stretch(audio, int(len(audio) / max_stretch), src_rate, max_stretch, min_stretch, temp_dir, log)
+            audio = _apply_fade_out(audio[:available], fade_out_samples)
+            truncated_count += 1
+            log.debug(f"  segment {i}: truncated ({ratio:.2f}x over budget, available={available / src_rate:.2f}s)")
+        elif ratio > 1.02 or ratio < 0.98:
+            # Stretch to fit (either speed up or slow down)
+            audio = _atempo_stretch(audio, available, src_rate, max_stretch, min_stretch, temp_dir, log)
+            stretched_count += 1
 
         _equal_power_crossfade(assembled, start_s, audio, xfade_samples)
 
     if stretched_count or truncated_count:
         log.info(
-            f"  Overflow handling: {stretched_count} stretched (≤{max_stretch:.2f}×), "
+            f"  Overflow/gap handling: {stretched_count} stretched ({min_stretch:.2f}x\u2013{max_stretch:.2f}x), "
             f"{truncated_count} truncated with fade-out"
         )
 
@@ -1527,12 +1564,12 @@ def remix_with_background(
     # sidechaincompress:
     #   threshold: level above which compression starts (0.1)
     #   ratio: how much to reduce bg (20:1)
-    #   attack/release: timing of ducking (10ms / 200ms)
+    #   attack/release: timing of ducking (15ms / 400ms)
     filt = (
-        f"[0:a]highpass=f=80,compand,volume={voice_gain:.3f}[v];"
+        f"[0:a]highpass=f=80,compand,volume={voice_gain:.3f},asplit=2[v_f][v_s];"
         f"[1:a]volume={bg_gain_db}dB[bg_pre];"
-        "[bg_pre][v]sidechaincompress=threshold=0.1:ratio=20:attack=10:release=200[bg_ducked];"
-        "[v][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0[out]"
+        "[bg_pre][v_s]sidechaincompress=threshold=0.08:ratio=12:attack=15:release=400[bg_ducked];"
+        "[v_f][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0[out]"
     )
     try:
         subprocess.run(
@@ -1633,7 +1670,7 @@ def _wrap_subtitle(text: str, max_chars: int = 42) -> str:
             line.append(word)
     if line:
         lines.append(" ".join(line))
-    return "\n".join(lines[:2])
+    return "\n".join(lines)
 
 
 def create_srt(
@@ -1653,25 +1690,40 @@ def create_srt(
         subs     = pysrt.SubRipFile()
         high_cps_count = 0
 
-        for idx, seg in enumerate(segments, 1):
-            text  = _wrap_subtitle(seg.get("text_fr") or seg["text"])
-            start = max(0.0, seg["start"] + offset_s)
-            end   = max(start + 1.0, seg["end"] + offset_s)
+        global_idx = 1
+        for seg in segments:
+            full_text = _wrap_subtitle(seg.get("text_fr") or seg["text"])
+            lines     = full_text.split("\n")
             
-            # CPS Check
-            dur = end - start
-            if dur > 0:
-                cps = len(text) / dur
-                if cps > 20:
-                    high_cps_count += 1
-                    log.debug(f"  High CPS ({cps:.1f}) at index {idx}: '{text[:30]}...'")
+            # Split into 2-line blocks
+            blocks = ["\n".join(lines[i:i+2]) for i in range(0, len(lines), 2)]
+            n_blocks = len(blocks)
+            
+            seg_start = max(0.0, seg["start"] + offset_s)
+            seg_end   = max(seg_start + 1.0, seg["end"] + offset_s)
+            seg_dur   = seg_end - seg_start
+            
+            block_dur = seg_dur / n_blocks
+            
+            for b_idx, text in enumerate(blocks):
+                start = seg_start + (b_idx * block_dur)
+                end   = start + block_dur
+                
+                # CPS Check
+                dur = end - start
+                if dur > 0:
+                    cps = len(text) / dur
+                    if cps > 20:
+                        high_cps_count += 1
+                        log.debug(f"  High CPS ({cps:.1f}) at index {global_idx}: '{text[:30]}...'")
 
-            subs.append(SubRipItem(
-                index=idx,
-                start=SubRipTime(seconds=start),
-                end=SubRipTime(seconds=end),
-                text=text,
-            ))
+                subs.append(SubRipItem(
+                    index=global_idx,
+                    start=SubRipTime(seconds=start),
+                    end=SubRipTime(seconds=end),
+                    text=text,
+                ))
+                global_idx += 1
         subs.save(output_path, encoding="utf-8")
         log.info(f"✓ SRT: {len(subs)} entries" + (f" (offset {offset_ms:+d} ms)" if offset_ms else ""))
         if high_cps_count > 0:
@@ -1926,6 +1978,7 @@ def process_video(
         src_rate=actual_sr,
         out_rate=config.output_sample_rate,
         max_stretch=config.tts_max_stretch,
+        min_stretch=config.tts_min_stretch,
         temp_dir=temp_dir,
         log=log,
         volume_boost_pct=config.output_volume_boost_pct,

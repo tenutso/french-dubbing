@@ -194,6 +194,21 @@ function renderCard(job) {
 
   $(".job-phase", root).textContent = job.phase || "";
 
+  // Progress Bar
+  const prog = $(".job-progress", root);
+  const progInner = $(".job-progress-inner", root);
+  if (job.status === "running" && job.phase) {
+    prog.hidden = false;
+    const m = job.phase.match(/\[(\d+)\/6\]/);
+    if (m) {
+      const step = parseInt(m[1]);
+      const pct = Math.round((step / 6) * 100);
+      progInner.style.width = `${pct}%`;
+    }
+  } else {
+    prog.hidden = true;
+  }
+
   // Downloads
   const dl = $(".job-downloads", root);
   for (const [kind, label] of [["audio", "Audio"], ["srt", "SRT"], ["full", "Full mix"]]) {

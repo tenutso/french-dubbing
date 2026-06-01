@@ -119,7 +119,8 @@ tts:
   # Max atempo ratio for segments that overflow their window. Beyond this
   # ratio the segment is truncated with an 80 ms fade-out instead of being
   # sped up further (preserves voice quality).
-  max_stretch: 1.25
+  max_stretch: 1.3
+  min_stretch: 0.7
 
   # VoxCPM2 inference quality knobs.
   # cfg_value: LM guidance strength. 2.5 is a good cross-lingual default.
@@ -134,9 +135,9 @@ tts:
 
   # Merge consecutive Whisper fragments into sentence-scale chunks before TTS.
   # The v3 sub-second fragments caused robotic prosody AND broken SRT timing;
-  # 2–12 s chunks give the TTS context and keep subtitles readable.
-  segment_merge_gap: 1.5
-  segment_merge_max_duration: 12.0
+  # 15 s chunks give the TTS context and keep subtitles readable.
+  segment_merge_gap: 2.0
+  segment_merge_max_duration: 15.0
   segment_merge_min_duration: 2.0
 
 # ============================================================

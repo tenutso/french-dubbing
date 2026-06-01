@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/REPLACE_ME/french-dubbing.git}"
+REPO_URL="${REPO_URL:-https://github.com/tenutso/french-dubbing.git}"
 GIT_REF="${GIT_REF:-main}"
 REPO_DIR="/workspace/french-dubbing"
 MARKER="/workspace/.setup_done"

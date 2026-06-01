@@ -15,7 +15,8 @@ pipeline:
 # Audio
 # ============================================================
 audio:
-  # VoxCPM2 native synthesis rate — 48 kHz
+  # Source audio extraction rate (whisper/demucs/diarization input).
+  # TTS output is independent: XTTS-v2 produces 24 kHz, upsampled at assembly.
   synthesis_sample_rate: 48000
   # Vimeo accepts both 44100 and 48000 Hz; 48000 avoids resampling loss
   output_sample_rate: 48000
@@ -101,14 +102,19 @@ translation:
   huggingface_token: ""
 
 # ============================================================
-# Text-to-Speech — VoxCPM2
-# 2B diffusion AR model, Apache 2.0, voice cloning, 48 kHz output.
+# Text-to-Speech — Coqui XTTS-v2 (Idiap fork)
+# Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
 # ============================================================
 tts:
-  model: openbmb/VoxCPM2
+  xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
+  # XTTS sampling. 0.65 is a stable default; lower = more monotone.
+  xtts_temperature: 0.65
+  xtts_repetition_penalty: 2.0
+  xtts_length_penalty: 1.0
+  xtts_top_k: 50
+  xtts_top_p: 0.85
 
   # Speaker reference clip for voice cloning.
-  # 25 s gives VoxCPM2 substantially more voice data than 15 s.
   speaker_profile_duration: 25
   # Skip this many seconds from the start (avoids intro music / titles).
   speaker_profile_skip: 20
@@ -121,17 +127,6 @@ tts:
   # sped up further (preserves voice quality).
   max_stretch: 1.3
   min_stretch: 0.7
-
-  # VoxCPM2 inference quality knobs.
-  # cfg_value: LM guidance strength. 2.5 is a good cross-lingual default.
-  cfg_value: 2.5
-  # inference_timesteps: LocDiT diffusion steps. 24 is the production sweet
-  # spot; 32 for absolute max quality, 10 for fast preview.
-  inference_timesteps: 24
-  # use_prompt_text: Pass the reference audio's transcript ("Ultimate Cloning").
-  # For cross-lingual dubbing (English ref → French output) this bleeds English
-  # phonemes — keep false.
-  use_prompt_text: false
 
   # Merge consecutive Whisper fragments into sentence-scale chunks before TTS.
   # The v3 sub-second fragments caused robotic prosody AND broken SRT timing;

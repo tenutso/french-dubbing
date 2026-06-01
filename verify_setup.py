@@ -239,6 +239,16 @@ def main():
     print(f"\n{BLUE}Translation (EuroLLM){RESET}")
     ok2, ver = pkg("transformers")
     c.check("transformers", ok2, f"v{ver}" if ok2 else ver)
+    # coqui-tts requires transformers <5. Warn if a 5.x is installed.
+    if ok2:
+        try:
+            from packaging.version import Version
+            if Version(ver) >= Version("5.0.0"):
+                c.warn("transformers <5 (required by coqui-tts)",
+                       f"v{ver} — XTTS engine will fail to import. "
+                       f"Run: pip install 'transformers<5'")
+        except Exception:
+            pass
 
     ok2, ver = pkg("bitsandbytes")
     if ok2:
@@ -266,28 +276,28 @@ def main():
             "not cached — will download (~18 GB) on first translation run"
         )
 
-    # ── TTS — VoxCPM2 ─────────────────────────────────────────────────────────
-    print(f"\n{BLUE}TTS — VoxCPM2 (primary){RESET}")
-    ok2, ver = pkg("voxcpm")
-    c.check("voxcpm", ok2, f"v{ver}" if ok2 else "pip install voxcpm")
-
-    voxcpm_cache = hf_cache if hf_cache.exists() else Path("/nonexistent")
-    voxcpm_cached = any(
-        "VoxCPM" in str(p) or "voxcpm" in str(p).lower()
-        for p in voxcpm_cache.rglob("*.safetensors") if voxcpm_cache.exists()
-    )
-    if voxcpm_cached:
-        c.check("VoxCPM2 weights cached", True)
-    else:
-        c.warn("VoxCPM2 weights", "not cached — will download (~4 GB) on first synthesis run")
-
-    # ── TTS — Coqui XTTS v2 (fallback) ───────────────────────────────────────
-    print(f"\n{BLUE}TTS — Coqui XTTS v2 (fallback){RESET}")
+    # ── TTS — Coqui XTTS-v2 (Idiap fork) ─────────────────────────────────────
+    print(f"\n{BLUE}TTS — Coqui XTTS-v2 (Idiap fork, French support){RESET}")
     ok2, ver = pkg("TTS")
     if ok2:
-        c.check("Coqui TTS (XTTS v2 fallback)", True, f"v{ver}")
+        c.check("coqui-tts (XTTS-v2)", True, f"v{ver}")
+        xtts_cached = any(
+            "xtts_v2" in str(p).lower()
+            for p in hf_cache.rglob("*.pth") if hf_cache.exists()
+        ) or any(
+            "xtts" in str(p).lower()
+            for p in (Path.home() / ".local" / "share" / "tts").rglob("*.pth")
+            if (Path.home() / ".local" / "share" / "tts").exists()
+        )
+        if xtts_cached:
+            c.check("XTTS-v2 weights cached", True)
+        else:
+            c.warn("XTTS-v2 weights",
+                   "not cached — will download (~1.9 GB) on first xtts run")
     else:
-        c.warn("Coqui TTS", "not installed — VoxCPM2 must be available")
+        c.warn("coqui-tts (XTTS-v2)",
+               "not installed — xtts engine unavailable. "
+               "Run: pip install 'transformers<5' 'coqui-tts>=0.27.0'")
 
     # ── SRT alignment ─────────────────────────────────────────────────────────
     print(f"\n{BLUE}SRT alignment{RESET}")

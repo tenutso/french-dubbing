@@ -204,16 +204,23 @@ else
     log_warn "Web UI dependency install failed — 05_web.sh will not run"
 fi
 
-# ── Step 8d: VoxCPM2 TTS ──────────────────────────────────────────────────────
+# ── Step 8d: XTTS-v2 TTS (Idiap fork of Coqui TTS) ───────────────────────────
+# Multilingual zero-shot voice cloning with native French support.
 
-log_step "Installing VoxCPM2 (TTS) …"
+log_step "Installing XTTS-v2 (coqui-tts) …"
 
-if $PYTHON -m pip install --no-cache-dir voxcpm \
+# coqui-tts imports transformers symbols removed in 5.x — pin to last 4.x.
+# Install transformers first so coqui-tts doesn't pull 5.x as a transitive.
+if $PYTHON -m pip install --no-cache-dir "transformers<5" "coqui-tts>=0.27.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "VoxCPM2 installed"
+    log_success "coqui-tts (XTTS-v2) installed"
 else
-    log_error "VoxCPM2 install failed — TTS will not work"
+    log_error "coqui-tts install failed — TTS will not work"
 fi
+
+# Auto-accept the XTTS CPML license non-interactively, for setup + runtime.
+export COQUI_TOS_AGREED=1
+echo "export COQUI_TOS_AGREED=1" >> /workspace/.env 2>/dev/null || true
 
 # ── Step 9: Utilities ─────────────────────────────────────────────────────
 
@@ -239,6 +246,13 @@ grep -q "HF_HUB_ENABLE_HF_TRANSFER" /workspace/.env 2>/dev/null \
 
 log_step "Setting up Ollama …"
 
+# Persist model weights on /workspace (the only volume that survives container
+# restarts). Without this, qwen3:14b (~9 GB) re-downloads every boot.
+export OLLAMA_MODELS="${OLLAMA_MODELS:-/workspace/.ollama/models}"
+mkdir -p "$OLLAMA_MODELS"
+grep -q "OLLAMA_MODELS" /workspace/.env 2>/dev/null \
+    || echo "export OLLAMA_MODELS=$OLLAMA_MODELS" >> /workspace/.env
+
 if command -v ollama &>/dev/null; then
     log_success "Ollama already installed: $(ollama --version 2>&1 | head -1)"
 else
@@ -256,7 +270,7 @@ log_step "Starting Ollama service …"
 if pgrep -x ollama > /dev/null 2>&1; then
     log_success "Ollama already running"
 elif command -v ollama &>/dev/null; then
-    nohup ollama serve > /workspace/logs/ollama.log 2>&1 &
+    OLLAMA_MODELS="$OLLAMA_MODELS" nohup ollama serve > /workspace/logs/ollama.log 2>&1 &
     # Wait up to 30 s for readiness
     READY=0
     for i in $(seq 1 15); do
@@ -360,36 +374,37 @@ else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
 
-# ── Step 14: Pre-download VoxCPM2 (~4 GB) ────────────────────────────────────
+# ── Step 14: Pre-download XTTS-v2 (~1.9 GB) ──────────────────────────────────
 
-log_step "Pre-downloading VoxCPM2 model (~4 GB) …"
+log_step "Pre-downloading XTTS-v2 model (~1.9 GB) …"
 
-if $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+if COQUI_TOS_AGREED=1 $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
 try:
-    from voxcpm import VoxCPM
-    print("Downloading VoxCPM2 weights from HuggingFace …")
-    m = VoxCPM.from_pretrained("openbmb/VoxCPM2")
-    del m
-    print("✓ VoxCPM2 cached")
+    from TTS.api import TTS
+    print("Downloading XTTS-v2 weights from HuggingFace …")
+    t = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+    del t
+    print("✓ XTTS-v2 cached")
 except ImportError:
-    print("voxcpm not installed — skipping pre-download")
+    print("coqui-tts not installed — skipping XTTS pre-download")
 except Exception as e:
-    print(f"VoxCPM2 download error: {e}")
+    print(f"XTTS-v2 download error: {e}")
     raise
 PYEOF
-    log_success "VoxCPM2 cached (or not installed)"
+    log_success "XTTS-v2 cached (or not installed)"
 else
-    log_warn "VoxCPM2 pre-download failed — it will download on first use"
+    log_warn "XTTS-v2 pre-download failed — it will download on first use"
 fi
 
 # ── Step 14b: Refresh latest releases for non-pinned packages ────────────────
 # Pulls newest releases of packages without an upper bound. Run after all
-# installs (so transitive deps settle).
+# installs (so transitive deps settle). NOTE: transformers stays pinned <5
+# because coqui-tts uses an internal symbol removed in 5.x.
 
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper voxcpm pyannote.audio deepfilternet noisereduce \
+       faster-whisper pyannote.audio deepfilternet noisereduce \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"

@@ -11,7 +11,7 @@ Stack (single, fixed path):
   Diarization (opt) : pyannote-audio            (per-speaker voice profiles)
   Translation       : Qwen3:14b via Ollama      (single natural pass)
   Speaker denoising : DeepFilterNet             (clean voice reference)
-  TTS               : VoxCPM2 2B at 48 kHz      (voice cloning)
+  TTS               : Coqui XTTS-v2 at 24 kHz   (multilingual voice cloning)
   Assembly          : FFmpeg atempo + crossfade (fit French to original timing)
   Subtitles         : direct from merged spans  (no WhisperX force-align)
   Output            : AAC 192 kbps 48 kHz stereo + UTF-8 SRT
@@ -123,13 +123,15 @@ class PipelineConfig:
     tts_speaker_duration: float = 25.0
     tts_speaker_skip: float = 20.0
 
-    # TTS — VoxCPM2 (single engine)
-    tts_model: str = "openbmb/VoxCPM2"
+    # TTS — Coqui XTTS-v2 (Idiap fork)
     tts_max_stretch: float = 1.25
     tts_min_stretch: float = 0.8
-    tts_cfg_value: float = 2.5
-    tts_inference_timesteps: int = 24
-    tts_use_prompt_text: bool = False
+    xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
+    xtts_temperature: float = 0.65
+    xtts_length_penalty: float = 1.0
+    xtts_repetition_penalty: float = 2.0
+    xtts_top_k: int = 50
+    xtts_top_p: float = 0.85
 
     # Audio
     output_volume_boost_pct: float = 0.0
@@ -217,12 +219,14 @@ def load_config(path: str) -> PipelineConfig:
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
-        tts_model=tts.get("model", "openbmb/VoxCPM2"),
+        xtts_model=tts.get("xtts_model", "tts_models/multilingual/multi-dataset/xtts_v2"),
+        xtts_temperature=tts.get("xtts_temperature", 0.65),
+        xtts_length_penalty=tts.get("xtts_length_penalty", 1.0),
+        xtts_repetition_penalty=tts.get("xtts_repetition_penalty", 2.0),
+        xtts_top_k=tts.get("xtts_top_k", 50),
+        xtts_top_p=tts.get("xtts_top_p", 0.85),
         tts_max_stretch=tts.get("max_stretch", 1.25),
         tts_min_stretch=tts.get("min_stretch", 0.8),
-        tts_cfg_value=tts.get("cfg_value", 2.5),
-        tts_inference_timesteps=tts.get("inference_timesteps", 24),
-        tts_use_prompt_text=tts.get("use_prompt_text", False),
         output_volume_boost_pct=float(aud.get("volume_boost_pct", 0.0)),
         huggingface_token=(
             t.get("huggingface_token", "")
@@ -1254,43 +1258,75 @@ def denoise_audio(
         return audio_path
 
 
-def _get_reference_transcript(
-    segments: List[dict],
-    skip_seconds: float,
-    duration: float,
-) -> str:
-    """Collect the English transcript window matching the speaker reference clip."""
-    ref_end = skip_seconds + duration + 5.0
-    texts = [
-        s["text"]
-        for s in segments
-        if s["start"] >= skip_seconds - 2.0 and s["end"] <= ref_end
-    ]
-    return " ".join(texts).strip()
-
-
 # ============================================================================
-# Step 6: TTS Synthesis — VoxCPM2 (only engine)
+# Step 6: TTS Synthesis — Coqui XTTS-v2 (Idiap fork)
 # ============================================================================
 
 def _seg_text(seg: dict) -> str:
     return (seg.get("text_fr") or seg.get("text") or "").strip()
 
 
+# XTTS-v2 hard per-language character cap. French is 273; we leave headroom.
+_XTTS_CHUNK_LIMITS = {
+    "fr": 250, "en": 240, "es": 230, "de": 240, "it": 210, "pt": 220,
+    "pl": 240, "nl": 240, "ru": 170, "cs": 180, "ar": 160, "tr": 220,
+    "hu": 170, "zh": 80, "ja": 80, "ko": 80, "hi": 240,
+}
+
+
+def _split_for_xtts(text: str, limit: int) -> List[str]:
+    """Break text into ≤limit-char chunks on natural boundaries.
+
+    Tries sentences first (. ! ? …), then clauses (; : ,), then a hard split.
+    Returns chunks that are each ≤ limit chars (with one-char slack for joins).
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+    import re as _re
+
+    pieces = _re.split(r"(?<=[.!?…])\s+", text)
+    out: List[str] = []
+    for piece in pieces:
+        if len(piece) <= limit:
+            out.append(piece)
+            continue
+        # Sub-split on clause punctuation, then accumulate greedily.
+        sub = _re.split(r"(?<=[,;:])\s+", piece)
+        buf = ""
+        for s in sub:
+            if len(s) > limit:  # one clause is itself too long → hard wrap
+                if buf:
+                    out.append(buf.strip()); buf = ""
+                for i in range(0, len(s), limit):
+                    out.append(s[i:i + limit].strip())
+                continue
+            if len(buf) + 1 + len(s) <= limit:
+                buf = f"{buf} {s}".strip()
+            else:
+                if buf:
+                    out.append(buf.strip())
+                buf = s
+        if buf:
+            out.append(buf.strip())
+    return [c for c in out if c]
+
+
 def synthesize_all_segments(
     segments: List[dict],
     speaker_wav: Optional[str],
-    reference_transcript: str,
     config: "PipelineConfig",
     log: logging.Logger,
     speaker_profiles: Optional[dict] = None,
 ) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
-    """Synthesize every French segment with VoxCPM2."""
+    """Synthesize every segment with Coqui XTTS-v2."""
     try:
-        from voxcpm import VoxCPM
+        from TTS.api import TTS
     except ImportError:
-        log.error("voxcpm not installed. Install: pip install voxcpm")
-        return [], 48000
+        log.error("coqui-tts not installed. Install: pip install 'transformers<5' coqui-tts")
+        return [], 24000
+
+    import torch as _torch
 
     def _pick_wav(seg: dict) -> Optional[str]:
         if speaker_profiles:
@@ -1299,13 +1335,37 @@ def synthesize_all_segments(
                 return profile
         return speaker_wav
 
-    log.info(f"Loading VoxCPM2: {config.tts_model} …")
-    model = VoxCPM.from_pretrained(config.tts_model)
-    sr = model.tts_model.sample_rate
-    log.info(f"✓ VoxCPM2 ready (output: {sr} Hz)")
+    lang_code = (config.target_lang or "fr").lower().split("-")[0]
+    log.info(f"Loading XTTS-v2: {config.xtts_model} (lang={lang_code}) …")
+    # Auto-accept the CPML license non-interactively.
+    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    tts = TTS(config.xtts_model).to(device)
+    sr = 24000  # XTTS-v2 native rate
+    log.info(f"✓ XTTS-v2 ready (output: {sr} Hz, device: {device})")
+
+    chunk_limit = _XTTS_CHUNK_LIMITS.get(lang_code, 240)
+    # 80 ms silence between concatenated chunks of the same segment.
+    chunk_gap = np.zeros(int(sr * 0.08), dtype=np.float32)
+
+    def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+        return np.asarray(
+            tts.tts(
+                text=text,
+                speaker_wav=ref_wav,
+                language=lang_code,
+                temperature=config.xtts_temperature,
+                length_penalty=config.xtts_length_penalty,
+                repetition_penalty=config.xtts_repetition_penalty,
+                top_k=config.xtts_top_k,
+                top_p=config.xtts_top_p,
+                split_sentences=True,
+            ),
+            dtype=np.float32,
+        )
 
     synthesized: List[Tuple[np.ndarray, float, float]] = []
-    with tqdm(total=len(segments), desc="Synthesizing (VoxCPM2)") as pbar:
+    with tqdm(total=len(segments), desc="Synthesizing (XTTS-v2)") as pbar:
         for seg in segments:
             text = _seg_text(seg)
             if not text:
@@ -1313,28 +1373,28 @@ def synthesize_all_segments(
                 continue
             try:
                 ref_wav = _pick_wav(seg)
-                kwargs: dict = {
-                    "text": text,
-                    "cfg_value": config.tts_cfg_value,
-                    "inference_timesteps": config.tts_inference_timesteps,
-                    # normalize=False protects French diacritics/digits from
-                    # VoxCPM2's English-centric text normalizer.
-                    "normalize": False,
-                    "retry_badcase": True,
-                    "retry_badcase_max_times": 3,
-                }
-                if ref_wav and os.path.exists(ref_wav):
-                    kwargs["reference_wav_path"] = ref_wav
-                    if config.tts_use_prompt_text and reference_transcript:
-                        kwargs["prompt_text"] = reference_transcript
-                wav = model.generate(**kwargs)
-                synthesized.append((np.array(wav, dtype=np.float32), seg["start"], seg["end"]))
+                if not ref_wav or not os.path.exists(ref_wav):
+                    log.warning(f"Segment {seg['id']}: no speaker reference, skipping")
+                    pbar.update(1)
+                    continue
+                chunks = _split_for_xtts(text, chunk_limit)
+                if len(chunks) > 1:
+                    log.info(
+                        f"Segment {seg['id']}: {len(text)} chars > {chunk_limit} "
+                        f"limit → split into {len(chunks)} chunks"
+                    )
+                parts = [_synth_one(c, ref_wav) for c in chunks]
+                wav = parts[0] if len(parts) == 1 else np.concatenate(
+                    [p for i, part in enumerate(parts) for p in
+                     ((part,) if i == 0 else (chunk_gap, part))]
+                )
+                synthesized.append((wav, seg["start"], seg["end"]))
             except Exception as e:
-                log.warning(f"Segment {seg['id']} VoxCPM2 failed: {e}")
+                log.warning(f"Segment {seg['id']} XTTS-v2 failed: {e}")
             pbar.update(1)
 
     log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
-    del model
+    del tts
     free_vram(log)
     return synthesized, sr
 
@@ -1926,7 +1986,7 @@ def process_video(
         else:
             speaker_wav = raw_speaker_wav
     else:
-        log.warning("Voice cloning disabled — using default VoxCPM2 voice")
+        log.warning("Voice cloning disabled — no speaker reference available")
 
     if config.use_diarization and any("speaker" in s for s in segments):
         speaker_profiles = build_speaker_profiles(
@@ -1941,23 +2001,11 @@ def process_video(
         valid = sum(1 for v in speaker_profiles.values() if v)
         log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
 
-    reference_transcript = _get_reference_transcript(
-        segments,
-        skip_seconds=config.tts_speaker_skip,
-        duration=config.tts_speaker_duration,
-    )
-    if reference_transcript:
-        log.info(
-            f"  Reference transcript ({len(reference_transcript)} chars): "
-            f"{reference_transcript[:80]}…"
-        )
-
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
-    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (VoxCPM2)")
+    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (XTTS-v2)")
     synthesized, actual_sr = synthesize_all_segments(
         segments,
         speaker_wav,
-        reference_transcript,
         config,
         log,
         speaker_profiles=speaker_profiles,

@@ -27,9 +27,12 @@ pyannote.audio>=3.3.0
 deepfilternet
 noisereduce>=3.0.0
 
-# ── TTS — VoxCPM2 ─────────────────────────────────────────────────────────────
-# OpenBMB, Apache 2.0 license. 2B diffusion AR model, 48 kHz output.
-voxcpm
+# ── TTS — XTTS-v2 via Idiap fork of Coqui TTS ────────────────────────────────
+# MPL-2.0; multilingual (17 langs incl. French) zero-shot voice cloning at 24 kHz.
+# Auto-accepts the CPML license via COQUI_TOS_AGREED=1 (set in 04_setup.sh).
+coqui-tts>=0.27.0
+# coqui-tts uses transformers internals removed in 5.x; pin to last 4.x.
+transformers<5
 
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 pysrt>=1.1.2

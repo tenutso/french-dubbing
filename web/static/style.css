@@ -228,6 +228,160 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
 }
 .job-actions { display: flex; gap: 8px; }
 
+/* ── Advanced options ────────────────────────────────────────────────────── */
+#advanced-section details > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+}
+#advanced-section details > summary::-webkit-details-marker { display: none; }
+#advanced-section details > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform 0.15s;
+  display: inline-block;
+}
+#advanced-section details[open] > summary::before { transform: rotate(90deg); }
+#advanced-section summary h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0;
+  font-weight: 600;
+}
+.advanced-help { margin: 10px 0 14px; }
+.advanced-help code {
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.cfg-presets-label { margin: 4px 0 6px; }
+.cfg-presets-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.cfg-preset {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-align: left;
+  padding: 8px 12px;
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  cursor: pointer;
+  font: inherit;
+}
+.cfg-preset:hover { border-color: var(--accent); }
+.cfg-preset strong { font-size: 13px; }
+.cfg-preset .muted { font-size: 11px; line-height: 1.35; }
+.cfg-group { margin-top: 14px; }
+.cfg-group h3 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+.cfg-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px 14px;
+}
+.cfg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  position: relative;
+}
+.cfg-field.dirty {
+  border-color: var(--warn);
+  background: #221d11;
+}
+.cfg-field.dirty::after {
+  content: "●";
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  color: var(--warn);
+  font-size: 10px;
+}
+.cfg-label { color: var(--text); font-weight: 500; }
+.cfg-help { font-size: 11px; line-height: 1.35; }
+.cfg-field input[type=number],
+.cfg-field input[type=text],
+.cfg-field select { width: 100%; }
+.cfg-field.cfg-bool { flex-direction: row; align-items: center; gap: 8px; }
+.cfg-field.cfg-bool .cfg-label { order: 2; flex: 1; }
+.cfg-field.cfg-bool input { order: 1; width: auto; }
+.cfg-field.cfg-bool .cfg-help { order: 3; flex-basis: 100%; }
+#config-status { font-size: 12px; }
+
+/* ── Glossary editor ─────────────────────────────────────────────────────── */
+#glossary-section details > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  user-select: none;
+}
+#glossary-section details > summary::-webkit-details-marker { display: none; }
+#glossary-section details > summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform 0.15s;
+}
+#glossary-section details[open] > summary::before { transform: rotate(90deg); }
+#glossary-section summary h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0;
+  font-weight: 600;
+}
+#glossary-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+  font-size: 12px;
+}
+#glossary-table th, #glossary-table td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+#glossary-table th {
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#glossary-table input, #glossary-table select { width: 100%; }
+#glossary-table td:last-child { width: 32px; text-align: right; }
+#glossary-table td:last-child button { padding: 2px 8px; }
+
 @media (max-width: 600px) {
   main { padding: 12px; }
   header { padding: 10px 14px; flex-direction: column; align-items: flex-start; gap: 4px; }

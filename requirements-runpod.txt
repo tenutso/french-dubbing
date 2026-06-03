@@ -1,0 +1,8 @@
+# RunPod Serverless dependencies
+# Install with: pip install -r requirements-runpod.txt
+#
+# These are in addition to the main requirements.txt and enable
+# serverless deployment to RunPod with S3/R2 cloud storage integration.
+
+runpod>=0.10.0
+boto3>=1.26.0

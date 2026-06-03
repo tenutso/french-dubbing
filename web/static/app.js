@@ -291,11 +291,368 @@ function appendLog(jobId, line) {
   if (wasScrolled) logEl.scrollTop = logEl.scrollHeight;
 }
 
+// ── Advanced options (config.yaml editor) ────────────────────────────────────
+let configSchema = [];
+let configValues = {};   // server-side current values (baseline for "dirty" + revert)
+let configDirty = {};    // path -> value (pending changes)
+let configPresets = [];
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return;
+    const data = await r.json();
+    configSchema = data.schema || [];
+    configValues = data.values || {};
+    configPresets = data.presets || [];
+    configDirty = {};
+    $("#config-path").textContent = data.path || "config.yaml";
+    renderPresets();
+    renderConfigFields();
+    updateAdvancedSummary();
+  } catch (e) {
+    $("#config-status").textContent = "failed to load config: " + e;
+  }
+}
+
+function renderPresets() {
+  const root = $("#advanced-presets");
+  root.innerHTML = "";
+  if (!configPresets.length) return;
+  const label = document.createElement("div");
+  label.className = "cfg-presets-label muted";
+  label.textContent = "Presets — click to stage changes (review below, then Save):";
+  root.appendChild(label);
+  const row = document.createElement("div");
+  row.className = "cfg-presets-row";
+  for (const p of configPresets) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "cfg-preset";
+    btn.innerHTML = `<strong>${p.label}</strong><span class="muted">${p.desc}</span>`;
+    btn.addEventListener("click", () => applyPreset(p));
+    row.appendChild(btn);
+  }
+  root.appendChild(row);
+}
+
+function applyPreset(p) {
+  let staged = 0;
+  for (const [path, val] of Object.entries(p.values || {})) {
+    const baseline = configValues[path];
+    const same = typeof val === "boolean"
+      ? Boolean(baseline) === Boolean(val)
+      : String(baseline ?? "") === String(val ?? "");
+    if (same) {
+      delete configDirty[path];
+    } else {
+      configDirty[path] = val;
+      staged++;
+    }
+  }
+  // Re-render to reflect dirty state on inputs
+  renderConfigFields();
+  updateAdvancedSummary();
+  $("#config-status").textContent = staged
+    ? `preset "${p.label}" staged (${staged} change${staged === 1 ? "" : "s"})`
+    : `preset "${p.label}" matches current config`;
+}
+
+function renderConfigFields() {
+  const root = $("#advanced-fields");
+  root.innerHTML = "";
+  // Group by `group`
+  const groups = new Map();
+  for (const f of configSchema) {
+    if (!groups.has(f.group)) groups.set(f.group, []);
+    groups.get(f.group).push(f);
+  }
+  for (const [name, fields] of groups) {
+    const g = document.createElement("div");
+    g.className = "cfg-group";
+    const h = document.createElement("h3");
+    h.textContent = name;
+    g.appendChild(h);
+    const grid = document.createElement("div");
+    grid.className = "cfg-grid";
+    g.appendChild(grid);
+    for (const f of fields) {
+      grid.appendChild(renderField(f));
+    }
+    root.appendChild(g);
+  }
+}
+
+function renderField(f) {
+  const wrap = document.createElement("label");
+  wrap.className = "cfg-field";
+  wrap.dataset.path = f.path;
+  const head = document.createElement("div");
+  head.className = "cfg-label";
+  head.textContent = f.label;
+  wrap.appendChild(head);
+
+  let input;
+  // Show dirty value if there's a pending change, else the server baseline
+  const current = (f.path in configDirty) ? configDirty[f.path] : configValues[f.path];
+  const isDirty = f.path in configDirty;
+  if (isDirty) wrap.classList.add("dirty");
+
+  if (f.type === "bool") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = !!current;
+    wrap.classList.add("cfg-bool");
+  } else if (f.choices) {
+    input = document.createElement("select");
+    for (const c of f.choices) {
+      const o = document.createElement("option");
+      o.value = String(c);
+      o.textContent = String(c);
+      if (String(c) === String(current)) o.selected = true;
+      input.appendChild(o);
+    }
+  } else if (f.type === "int" || f.type === "float") {
+    input = document.createElement("input");
+    input.type = "number";
+    if (f.min != null) input.min = f.min;
+    if (f.max != null) input.max = f.max;
+    if (f.step != null) input.step = f.step;
+    input.value = current ?? "";
+  } else {
+    input = document.createElement("input");
+    input.type = "text";
+    input.value = current ?? "";
+  }
+
+  input.dataset.path = f.path;
+  input.dataset.type = f.type;
+  input.addEventListener("input", onFieldChange);
+  input.addEventListener("change", onFieldChange);
+  wrap.appendChild(input);
+
+  if (f.help) {
+    const h = document.createElement("div");
+    h.className = "cfg-help muted";
+    h.textContent = f.help;
+    wrap.appendChild(h);
+  }
+  return wrap;
+}
+
+function onFieldChange(ev) {
+  const el = ev.target;
+  const path = el.dataset.path;
+  const type = el.dataset.type;
+  let val;
+  if (type === "bool") val = el.checked;
+  else if (type === "int") val = el.value === "" ? null : parseInt(el.value, 10);
+  else if (type === "float") val = el.value === "" ? null : parseFloat(el.value);
+  else val = el.value;
+
+  // Compare against baseline; only track as dirty if it differs
+  const baseline = configValues[path];
+  const same = type === "bool"
+    ? Boolean(baseline) === Boolean(val)
+    : String(baseline ?? "") === String(val ?? "");
+  if (same) {
+    delete configDirty[path];
+    el.closest(".cfg-field").classList.remove("dirty");
+  } else {
+    configDirty[path] = val;
+    el.closest(".cfg-field").classList.add("dirty");
+  }
+  updateAdvancedSummary();
+}
+
+function updateAdvancedSummary() {
+  const n = Object.keys(configDirty).length;
+  $("#advanced-summary").textContent = n ? `· ${n} unsaved change${n === 1 ? "" : "s"}` : "";
+  $("#config-save").disabled = n === 0;
+  $("#config-revert").disabled = n === 0;
+}
+
+async function saveConfig(force = false) {
+  const status = $("#config-status");
+  if (!Object.keys(configDirty).length) return;
+  status.textContent = "saving…";
+  $("#config-save").disabled = true;
+  try {
+    const url = "/api/config" + (force ? "?force=true" : "");
+    const r = await fetch(url, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: configDirty }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (r.status === 409 && !force) {
+      $("#config-save").disabled = false;
+      const msg = (data.detail || "a job is currently running.") +
+        "\n\nApply changes anyway? (Running job is unaffected; only the next job will pick them up.)";
+      if (confirm(msg)) return saveConfig(true);
+      status.textContent = "save cancelled";
+      return;
+    }
+    if (!r.ok) {
+      status.textContent = "failed: " + (data.detail || r.statusText);
+      $("#config-save").disabled = false;
+      return;
+    }
+    const mirrored = (data.mirrored || []).length;
+    status.textContent = `saved ${Object.keys(data.values || {}).length} field(s)` +
+      (mirrored ? ` (mirrored to ${mirrored} repo cop${mirrored === 1 ? "y" : "ies"})` : "");
+    await loadConfig();
+    // Re-sync the simple form defaults too (locale, volume_boost)
+    await loadOptions();
+  } catch (e) {
+    status.textContent = "network error: " + e;
+    $("#config-save").disabled = false;
+  }
+}
+
+function revertConfig() {
+  configDirty = {};
+  renderConfigFields();
+  updateAdvancedSummary();
+  $("#config-status").textContent = "reverted";
+}
+
+// ── Glossary editor ──────────────────────────────────────────────────────────
+let glossaryBaseline = [];     // server-side terms (for revert)
+let glossaryTerms = [];        // editable working copy
+let glossaryModes = ["always", "suggest"];
+
+async function loadGlossary() {
+  try {
+    const r = await fetch("/api/glossary");
+    if (!r.ok) return;
+    const data = await r.json();
+    glossaryBaseline = JSON.parse(JSON.stringify(data.terms || []));
+    glossaryTerms = JSON.parse(JSON.stringify(data.terms || []));
+    glossaryModes = data.modes || glossaryModes;
+    $("#glossary-path").textContent = data.path || "canadian_glossary.yaml";
+    renderGlossary();
+  } catch (e) {
+    $("#glossary-status").textContent = "load failed: " + e;
+  }
+}
+
+function glossaryDirty() {
+  return JSON.stringify(glossaryBaseline) !== JSON.stringify(glossaryTerms);
+}
+
+function renderGlossary() {
+  const tbody = $("#glossary-table tbody");
+  tbody.innerHTML = "";
+  for (let i = 0; i < glossaryTerms.length; i++) {
+    tbody.appendChild(renderGlossaryRow(glossaryTerms[i], i));
+  }
+  const n = glossaryTerms.length;
+  $("#glossary-summary").textContent =
+    `· ${n} term${n === 1 ? "" : "s"}` + (glossaryDirty() ? " · unsaved" : "");
+}
+
+function renderGlossaryRow(term, idx) {
+  const tr = document.createElement("tr");
+  if (glossaryDirty()) tr.classList.add("maybe-dirty");
+  const fields = [
+    { key: "en", placeholder: "speaker" },
+    { key: "fr_ca", placeholder: "conférencier·ère" },
+    { key: "fr_std", placeholder: "(empty)" },
+  ];
+  for (const f of fields) {
+    const td = document.createElement("td");
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.value = term[f.key] || "";
+    inp.placeholder = f.placeholder;
+    inp.addEventListener("input", e => {
+      glossaryTerms[idx][f.key] = e.target.value;
+      // No full re-render — just update the summary
+      $("#glossary-summary").textContent =
+        `· ${glossaryTerms.length} terms${glossaryDirty() ? " · unsaved" : ""}`;
+    });
+    td.appendChild(inp);
+    tr.appendChild(td);
+  }
+  // Mode select
+  const tdMode = document.createElement("td");
+  const sel = document.createElement("select");
+  for (const m of glossaryModes) {
+    const o = document.createElement("option");
+    o.value = m; o.textContent = m;
+    if ((term.mode || "always") === m) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.addEventListener("change", e => { glossaryTerms[idx].mode = e.target.value; renderGlossary(); });
+  tdMode.appendChild(sel);
+  tr.appendChild(tdMode);
+  // Category + note + delete
+  for (const k of ["category", "note"]) {
+    const td = document.createElement("td");
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.value = term[k] || "";
+    inp.addEventListener("input", e => { glossaryTerms[idx][k] = e.target.value; });
+    td.appendChild(inp);
+    tr.appendChild(td);
+  }
+  const tdDel = document.createElement("td");
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "cancel";
+  del.textContent = "✕";
+  del.title = "Remove term";
+  del.addEventListener("click", () => {
+    glossaryTerms.splice(idx, 1);
+    renderGlossary();
+  });
+  tdDel.appendChild(del);
+  tr.appendChild(tdDel);
+  return tr;
+}
+
+async function saveGlossary() {
+  const status = $("#glossary-status");
+  // Drop empty rows silently
+  const payload = glossaryTerms.filter(t => (t.en || "").trim() && (t.fr_ca || "").trim());
+  status.textContent = "saving…";
+  try {
+    const r = await fetch("/api/glossary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ terms: payload }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = "failed: " + (data.detail || r.statusText); return; }
+    const m = (data.mirrored || []).length;
+    status.textContent = `saved ${data.count} term${data.count === 1 ? "" : "s"}` +
+      (m ? ` (mirrored to ${m} cop${m === 1 ? "y" : "ies"})` : "");
+    await loadGlossary();
+  } catch (e) { status.textContent = "network error: " + e; }
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
   await loadOptions();
+  await loadConfig();
+  await loadGlossary();
   await refreshHealth();
   await refreshJobs();
+  $("#config-save").addEventListener("click", () => saveConfig(false));
+  $("#config-revert").addEventListener("click", revertConfig);
+  $("#glossary-add").addEventListener("click", () => {
+    glossaryTerms.push({ en: "", fr_ca: "", fr_std: "", mode: "always", category: "", note: "" });
+    renderGlossary();
+    const inputs = $$("#glossary-table tbody tr:last-child input");
+    if (inputs.length) inputs[0].focus();
+  });
+  $("#glossary-save").addEventListener("click", saveGlossary);
+  $("#glossary-revert").addEventListener("click", () => {
+    glossaryTerms = JSON.parse(JSON.stringify(glossaryBaseline));
+    renderGlossary();
+    $("#glossary-status").textContent = "reverted";
+  });
   setInterval(refreshJobs, 5000);
   setInterval(refreshHealth, 15000);
 }

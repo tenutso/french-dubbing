@@ -98,6 +98,11 @@ class PipelineConfig:
     whisper_model: str = "large-v3"
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
+    # Anti-hallucination tuning (faster-whisper / CT2)
+    whisper_condition_on_previous_text: bool = False
+    whisper_compression_ratio_threshold: float = 2.2
+    whisper_no_speech_threshold: float = 0.6
+    whisper_log_prob_threshold: float = -1.0
 
     # Source separation
     use_demucs: bool = True
@@ -116,6 +121,10 @@ class PipelineConfig:
     translation_temperature: float = 0.3
     translation_batch_size: int = 20
     translation_review: bool = False
+    # Targeted second pass that compresses only segments still over budget.
+    # Cheap (only over-budget segments are re-prompted) and high-leverage —
+    # eliminates the final ~1–2 stretched segments per dub on info-dense talks.
+    translation_compression_pass: bool = True
     target_lang: str = "fr"
 
     # Speaker reference
@@ -154,6 +163,13 @@ class PipelineConfig:
     segment_merge_max_duration: float = 12.0
     segment_merge_min_duration: float = 2.0
 
+    # CPS guard — split translated segments whose French CPS exceeds this
+    # at a sentence boundary before TTS. 0 disables the split pass.
+    cps_split_threshold: float = 21.0
+    # Character budget per second handed to Qwen as a per-segment limit.
+    # Raise to give the LLM more headroom; lower to force tighter phrasing.
+    translation_budget_cps: int = 17
+
     # SRT
     subtitle_offset_ms: int = 0
 
@@ -165,6 +181,10 @@ class PipelineConfig:
 
     # Debug — keep all temp files and dump intermediate segment JSON
     keep_temp: bool = False
+
+    @property
+    def target_locale(self) -> str:
+        return self.locale
 
 
 @dataclass
@@ -182,10 +202,15 @@ class Glossary:
     entries: List[GlossaryEntry]
     formatting_rules: List[str]
     inclusive_language: List[str]
+    acronyms: Dict[str, str] = None
+
+    def __post_init__(self):
+        if self.acronyms is None:
+            self.acronyms = {}
 
     @property
     def has_content(self) -> bool:
-        return bool(self.entries or self.formatting_rules or self.inclusive_language)
+        return bool(self.entries or self.formatting_rules or self.inclusive_language or self.acronyms)
 
 
 def load_config(path: str) -> PipelineConfig:
@@ -209,6 +234,10 @@ def load_config(path: str) -> PipelineConfig:
         whisper_model=w.get("model", "large-v3"),
         whisper_device=w.get("device", "cuda"),
         whisper_compute_type=w.get("compute_type", "float16"),
+        whisper_condition_on_previous_text=bool(w.get("condition_on_previous_text", False)),
+        whisper_compression_ratio_threshold=float(w.get("compression_ratio_threshold", 2.2)),
+        whisper_no_speech_threshold=float(w.get("no_speech_threshold", 0.6)),
+        whisper_log_prob_threshold=float(w.get("log_prob_threshold", -1.0)),
         use_demucs=sep.get("enabled", True),
         demucs_model=sep.get("model", "htdemucs"),
         preserve_background=sep.get("preserve_background", True),
@@ -221,6 +250,7 @@ def load_config(path: str) -> PipelineConfig:
         translation_temperature=t.get("temperature", 0.3),
         translation_batch_size=t.get("batch_size", 20),
         translation_review=t.get("review_pass", False),
+        translation_compression_pass=bool(t.get("compression_pass", True)),
         target_lang=t.get("target_lang", "fr"),
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
@@ -245,6 +275,8 @@ def load_config(path: str) -> PipelineConfig:
         segment_merge_gap=tts.get("segment_merge_gap", 1.5),
         segment_merge_max_duration=tts.get("segment_merge_max_duration", 12.0),
         segment_merge_min_duration=tts.get("segment_merge_min_duration", 2.0),
+        cps_split_threshold=float(tts.get("cps_split_threshold", 21.0)),
+        translation_budget_cps=int(t.get("budget_cps", 17)),
         subtitle_offset_ms=sub.get("sync_offset_ms", 0),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
@@ -285,7 +317,7 @@ def free_vram(log: Optional[logging.Logger] = None) -> None:
 # ============================================================================
 
 def load_glossary(path: str, log: logging.Logger) -> "Glossary":
-    empty = Glossary(entries=[], formatting_rules=[], inclusive_language=[])
+    empty = Glossary(entries=[], formatting_rules=[], inclusive_language=[], acronyms={})
     if not path:
         return empty
     if not os.path.exists(path):
@@ -294,29 +326,45 @@ def load_glossary(path: str, log: logging.Logger) -> "Glossary":
     try:
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
+
+        # Try new flat format first: glossary: { "speaker": "conférencier·ère", ... }
+        glossary_dict = data.get("glossary") or {}
         entries = [
-            GlossaryEntry(
-                en=str(t.get("en", "")),
-                fr_ca=str(t.get("fr_ca", "")),
-                fr_std=str(t.get("fr_std", "")),
-                mode=str(t.get("mode", "suggest")),
-                category=str(t.get("category", "")),
-                note=str(t.get("note", "")),
-            )
-            for t in (data.get("terms") or [])
-            if t.get("fr_ca")
+            GlossaryEntry(en=en, fr_ca=fr_ca, fr_std="", mode="suggest", category="", note="")
+            for en, fr_ca in glossary_dict.items()
+            if fr_ca and str(en) != str(fr_ca)
         ]
+
+        # Fall back to old terms-list format if no entries found
+        if not entries:
+            entries = [
+                GlossaryEntry(
+                    en=str(t.get("en", "")),
+                    fr_ca=str(t.get("fr_ca", "")),
+                    fr_std=str(t.get("fr_std", "")),
+                    mode=str(t.get("mode", "suggest")),
+                    category=str(t.get("category", "")),
+                    note=str(t.get("note", "")),
+                )
+                for t in (data.get("terms") or [])
+                if t.get("fr_ca")
+            ]
+
         formatting_rules   = [str(r) for r in (data.get("formatting_rules")  or [])]
         inclusive_language = [str(r) for r in (data.get("inclusive_language") or [])]
+        acronyms_dict = {str(k): str(v) for k, v in (data.get("acronyms") or {}).items()}
+
         glossary = Glossary(
             entries=entries,
             formatting_rules=formatting_rules,
             inclusive_language=inclusive_language,
+            acronyms=acronyms_dict,
         )
         log.info(
             f"✓ Glossary loaded: {len(entries)} terms, "
             f"{len(formatting_rules)} formatting rules, "
-            f"{len(inclusive_language)} inclusive language rules ({path})"
+            f"{len(inclusive_language)} inclusive language rules, "
+            f"{len(acronyms_dict)} acronyms ({path})"
         )
         return glossary
     except Exception as e:
@@ -339,6 +387,12 @@ def _build_glossary_section(glossary: "Glossary", locale: str) -> str:
             if e.note:
                 line += f"  [{e.note}]"
             lines.append(line)
+        blocks.append("\n".join(lines))
+
+    if glossary.acronyms:
+        lines = ["ACRONYMS — keep these in English exactly as-is (do not translate):"]
+        for acronym, full_form in sorted(glossary.acronyms.items()):
+            lines.append(f"  {acronym} ({full_form})")
         blocks.append("\n".join(lines))
 
     if glossary.formatting_rules:
@@ -510,6 +564,10 @@ def transcribe_audio(
     compute_type: str,
     models_dir: str,
     log: logging.Logger,
+    condition_on_previous_text: bool = False,
+    compression_ratio_threshold: float = 2.2,
+    no_speech_threshold: float = 0.6,
+    log_prob_threshold: float = -1.0,
 ) -> Optional[List[dict]]:
     log.info(f"Loading faster-whisper {model_name} [{compute_type}] …")
     try:
@@ -520,6 +578,14 @@ def transcribe_audio(
             download_root=os.path.join(models_dir, "whisper"),
         )
         log.info("Transcribing with VAD filter + word timestamps …")
+        # Anti-hallucination posture:
+        #   condition_on_previous_text=False  → don't feed prior (possibly
+        #     looped) output back as conditioning; the single biggest switch
+        #     against runaway repetition.
+        #   compression_ratio_threshold=2.2   → reject segments that are too
+        #     compressible (a classic loop signature: "X. X. X.").
+        #   no_speech_threshold=0.6           → drop silent windows VAD missed.
+        #   log_prob_threshold=-1.0           → keep default, but explicit.
         segments_gen, info = model.transcribe(
             wav_path,
             language="en",
@@ -527,6 +593,10 @@ def transcribe_audio(
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
             word_timestamps=True,
+            condition_on_previous_text=condition_on_previous_text,
+            compression_ratio_threshold=compression_ratio_threshold,
+            no_speech_threshold=no_speech_threshold,
+            log_prob_threshold=log_prob_threshold,
             initial_prompt="Hello. Welcome to this video. Today we will discuss several important topics.",
         )
         segments = [
@@ -621,6 +691,103 @@ def dedupe_whisper_segments(segments: List[dict], log: logging.Logger) -> List[d
         )
     else:
         log.debug("✓ Dedup: no adjacent-segment overlap detected")
+    return out
+
+
+def collapse_intrasegment_loops(
+    segments: List[dict], log: logging.Logger, min_ngram: int = 5, max_ngram: int = 12,
+) -> List[dict]:
+    """Collapse hallucinated phrase loops *within* a single segment.
+
+    Pattern: a contiguous run of ≥ min_ngram words appears twice in a row,
+    optionally separated by a short connector ("and", "then", "but", ",",
+    ".", "I think"). E.g.:
+        "I'm going to be married again. And he was like, okay, I'm going
+         to be married again."
+        "I think that's a really good question. And I think that's a
+         really good"
+
+    Legitimate repetition (the same noun phrase used twice with different
+    surrounding clauses, e.g. "a Hall of Fame speaker") is NOT touched
+    because we require the *entire run* of ≥5 words to match, not just a
+    short phrase. The longer the ngram, the safer the collapse.
+    """
+    out: List[dict] = []
+    collapses = 0
+    for seg in segments:
+        text = seg["text"]
+        tokens = re.findall(r"\S+", text)
+        if len(tokens) < 2 * min_ngram:
+            out.append(seg)
+            continue
+
+        def _norm(words: List[str]) -> List[str]:
+            return [w.strip(".,!?;:\"'()[]…").lower() for w in words]
+
+        norm = _norm(tokens)
+        n = len(tokens)
+
+        # Two collapsible patterns:
+        #   (A) Tail truncation: a ≥ min_ngram ngram appears once mid-segment
+        #       and again at the very end (last ngram), with the second copy
+        #       not followed by ≥ 2 new content words. This is the canonical
+        #       Whisper "cut-off" hallucination.
+        #   (B) Adjacent duplicate: a ≥ min_ngram ngram appears twice with at
+        #       most max_gap tokens between copies. Humans rarely repeat 5+
+        #       words verbatim within ~10 s of speech; Whisper does it often.
+        max_gap = 8
+        i = 0
+        kept_idx: List[int] = []
+        found = False
+        while i < n:
+            collapsed = False
+            kmax = min(max_ngram, (n - i) // 2)
+            for k in range(kmax, min_ngram - 1, -1):
+                # Look for a matching copy starting at j ∈ [i+k, i+k+max_gap]
+                for gap in range(0, max_gap + 1):
+                    j = i + k + gap
+                    if j + k > n:
+                        break
+                    if norm[i:i + k] != norm[j:j + k]:
+                        continue
+                    # Heuristic guard: don't collapse when the duplicate is
+                    # surrounded by clearly distinct content on BOTH sides
+                    # (i.e. legitimate recap). "Distinct" = ≥ 4 content words
+                    # following the second copy.
+                    trailing = n - (j + k)
+                    if gap > 3 and trailing >= 4:
+                        # Both copies embedded — only collapse for tighter loops
+                        continue
+                    # Collapse: keep first occurrence + connector tokens,
+                    # drop only the duplicate copy. The connector is often
+                    # real content (e.g. "question." in "...good question.
+                    # And I think that's a really good") that we'd lose if
+                    # we dropped it.
+                    kept_idx.extend(range(i, i + k))
+                    kept_idx.extend(range(i + k, j))   # keep gap/connector
+                    i = j + k                          # skip duplicate copy
+                    collapsed = True
+                    found = True
+                    collapses += 1
+                    break
+                if collapsed:
+                    break
+            if not collapsed:
+                kept_idx.append(i)
+                i += 1
+
+        if found:
+            new_text = " ".join(tokens[idx] for idx in kept_idx)
+            new_seg = dict(seg)
+            new_seg["text"] = new_text
+            out.append(new_seg)
+        else:
+            out.append(seg)
+
+    if collapses:
+        log.info(f"✓ Intra-segment dedup: collapsed {collapses} phrase loop(s)")
+    else:
+        log.debug("✓ Intra-segment dedup: no hallucinated loops detected")
     return out
 
 
@@ -916,19 +1083,22 @@ _LANG_NAMES = {
 }
 
 _TRANSLATE_PROMPT = """\
-You are a professional {language} dubbing translator.
+You are a professional {language} dubbing translator.{locale_note}
 Translate each numbered English segment into natural, conversational {language}
 suitable for a dubbed voice-over.
 
-Each segment includes its duration in seconds [N.Ns].
-Your translation should be natural and match the speaker's pacing.
-Aim for approximately 13-15 characters per second of duration.
+Each segment is tagged [N.Ns, ≤M chars] — the duration and the maximum
+character budget for the translation. Stay within the budget so the audio
+fits the timing; the budget already accounts for typical {language} expansion.
 
 RULES:
 - Preserve key technical terms and proper nouns.
 - Adapt idioms naturally; do not translate literally.
-- Use a spoken register (contractions, common phrasing) — not literary French.
-- Do NOT excessively shorten the translation; let it flow naturally.
+- Use a spoken register (contractions, common phrasing) — not literary {language}.
+- For info-dense segments, compress to the budget by tightening phrasing —
+  keep the meaning, drop filler ("you know", "I mean" / "vous savez", "je veux dire"),
+  prefer shorter synonyms. Do NOT summarise or omit content.
+- For sparse segments, do NOT pad — match the source length naturally.
 - Output ONLY the numbered translations, one per line, same numbering as input.
 - Do NOT add character counts, parentheticals, notes, brackets, or explanations.
 {glossary_section}
@@ -951,6 +1121,192 @@ Ensure the corrected text remains concise enough to fit the timing.
 {segments}
 
 Corrected {language} subtitles:"""
+
+
+# Maximum sustainable characters-per-second of French speech. Beyond this,
+# even max-stretch can't fit the text — the assembler ends up truncating
+# or speeding past intelligibility. Splitting at a sentence boundary lets
+# the two halves stretch independently within the same total time window.
+_MAX_CPS_BEFORE_SPLIT = 21.0
+
+
+def split_overflowing_segments(
+    segments: List[dict], log: logging.Logger, max_cps: float = _MAX_CPS_BEFORE_SPLIT,
+) -> List[dict]:
+    """Split translated segments whose French text exceeds max_cps.
+
+    For each over-budget segment, find the sentence boundary closest to
+    the character-count midpoint. If one exists between 30% and 70% of
+    the text, split the segment into two halves and prorate the time
+    window by character count. The TTS then synthesises shorter, more
+    stable utterances and the assembler can stretch each half locally.
+    """
+    SENT_END = re.compile(r"[.!?…»\"'\)]\s+")
+    out: List[dict] = []
+    splits = 0
+    for seg in segments:
+        fr = seg.get("text_fr_natural") or seg.get("text_fr") or ""
+        dur = seg.get("end", 0) - seg.get("start", 0)
+        if dur <= 0 or len(fr) < 80:
+            out.append(seg)
+            continue
+        cps = len(fr) / dur
+        if cps <= max_cps:
+            out.append(seg)
+            continue
+
+        # Find sentence boundaries in the middle band [30%, 70%]
+        lo, hi = int(len(fr) * 0.3), int(len(fr) * 0.7)
+        candidates = [m.end() for m in SENT_END.finditer(fr) if lo <= m.end() <= hi]
+        if not candidates:
+            # Fall back to nearest comma in the middle band
+            candidates = [m.end() for m in re.finditer(r",\s+", fr) if lo <= m.end() <= hi]
+        if not candidates:
+            out.append(seg)
+            continue
+
+        mid = len(fr) // 2
+        cut = min(candidates, key=lambda x: abs(x - mid))
+        a_fr = fr[:cut].rstrip()
+        b_fr = fr[cut:].lstrip()
+        if not a_fr or not b_fr:
+            out.append(seg)
+            continue
+
+        # Prorate time window by character share
+        share = len(a_fr) / (len(a_fr) + len(b_fr))
+        cut_t = seg["start"] + dur * share
+
+        # Mirror split on the English source so SRT/translation diagnostics stay coherent
+        en = seg.get("text", "") or ""
+        en_share = max(1, int(len(en) * share))
+        a_en = en[:en_share]
+        b_en = en[en_share:]
+
+        base = {k: v for k, v in seg.items() if k not in ("start", "end", "text", "text_fr", "text_fr_natural", "id")}
+        a = dict(base, id=seg.get("id"), start=seg["start"], end=cut_t, text=a_en)
+        b = dict(base, id=seg.get("id"), start=cut_t, end=seg["end"], text=b_en)
+        for key in ("text_fr", "text_fr_natural"):
+            if key in seg:
+                a[key] = a_fr
+                b[key] = b_fr
+        out.append(a)
+        out.append(b)
+        splits += 1
+
+    if splits:
+        # Re-id sequentially
+        for i, s in enumerate(out):
+            s["id"] = i
+        log.info(f"✓ CPS split: divided {splits} over-budget segment(s) (>{max_cps:.0f} CPS)")
+    else:
+        log.debug(f"✓ CPS split: no segments exceed {max_cps:.0f} CPS")
+    return out
+
+
+_COMPRESS_PROMPT = """\
+You are a {language} editor. Rewrite each numbered {language} segment to fit
+within its character budget WITHOUT losing meaning. Tighten phrasing, drop
+fillers ("vous savez", "je veux dire"), prefer shorter synonyms, remove
+hedges and redundancies. Keep proper nouns, numbers, and key technical
+terms. Keep the same speaker register.
+
+Each line is tagged [≤N chars] — your rewrite must not exceed N characters.
+
+Output ONLY the numbered rewrites, one per line, same numbering. No notes.
+
+{language} segments to compress:
+{segments}
+
+Compressed {language} segments:"""
+
+
+def compress_overflowing_translations(
+    segments: List[dict],
+    model: str,
+    temperature: float,
+    log: logging.Logger,
+    budget_cps: int = 17,
+    target_lang: str = "fr",
+    margin: float = 1.05,
+) -> List[dict]:
+    """Second Qwen pass that only touches segments still over budget.
+
+    After the main translation, some segments will still exceed the per-segment
+    character budget (info-dense English that resists compression in one shot).
+    This pass batches the offenders and re-prompts Qwen with a tighter brief.
+    Compressions that *still* overshoot the budget are kept anyway (better
+    than the original) but logged so they can be inspected.
+
+    margin: a small relaxation factor on the budget. Default 1.05 means
+    "rewrite if FR is >5% over budget" — leaves a buffer for natural variance.
+    """
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
+
+    def _budget(seg: dict) -> int:
+        dur = max(seg["end"] - seg["start"], 0.5)
+        return max(40, int(dur * budget_cps))
+
+    offenders: List[Tuple[int, int]] = []  # (index in segments, budget)
+    for idx, s in enumerate(segments):
+        fr = s.get("text_fr") or ""
+        if not fr:
+            continue
+        b = _budget(s)
+        if len(fr) > int(b * margin):
+            offenders.append((idx, b))
+    if not offenders:
+        log.debug("✓ Compression pass: no segments over budget")
+        return segments
+
+    log.info(
+        f"Compression pass: {len(offenders)} segment(s) over budget — "
+        f"re-prompting (budget={budget_cps} CPS, margin {int((margin-1)*100)}%)"
+    )
+
+    out = [dict(s) for s in segments]
+    # One batch — these are typically a small minority of total segments.
+    BATCH = 15
+    for batch_start in range(0, len(offenders), BATCH):
+        chunk = offenders[batch_start:batch_start + BATCH]
+        numbered = "\n".join(
+            f"{i + 1}. [≤{b} chars] {segments[idx].get('text_fr','')}"
+            for i, (idx, b) in enumerate(chunk)
+        )
+        prompt = think_prefix + _COMPRESS_PROMPT.format(language=language, segments=numbered)
+        response = _ollama_call(prompt, model, temperature, log)
+        if not response:
+            continue
+        rewrites = _parse_numbered(response, len(chunk))
+        applied = 0
+        still_over = 0
+        for i, (idx, b) in enumerate(chunk):
+            new = (rewrites[i] or "").strip()
+            old = segments[idx].get("text_fr", "")
+            if not new:
+                continue
+            # Accept only if strictly shorter than the original — avoids the
+            # LLM "rewriting" into longer prose, which has happened on noisy
+            # inputs. If it's still over budget, keep it anyway iff it's at
+            # least 10% shorter than the original.
+            if len(new) < len(old) and len(new) <= int(b * margin):
+                out[idx]["text_fr"] = new
+                if "text_fr_natural" in out[idx]:
+                    out[idx]["text_fr_natural"] = new
+                applied += 1
+            elif len(new) < int(len(old) * 0.9):
+                out[idx]["text_fr"] = new
+                if "text_fr_natural" in out[idx]:
+                    out[idx]["text_fr_natural"] = new
+                applied += 1
+                still_over += 1
+            # else: leave original — the rewrite didn't help
+        log.info(
+            f"  compressed {applied}/{len(chunk)} segment(s) "
+            f"({still_over} still above budget but shorter)"
+        )
+    return out
 
 
 def check_ollama(model: str, log: logging.Logger) -> bool:
@@ -1026,31 +1382,63 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
 
 
 def _parse_numbered(text: str, count: int) -> List[str]:
-    """Parse numbered LLM output. Strip stray annotations the LLM may emit.
+    """Parse numbered LLM output. Multi-line aware: content lines that don't
+    begin with a "<n>." marker belong to the *previous* numbered item.
+
+    This matters because Qwen sometimes wraps long translations across two
+    lines (especially after punctuation), and the legacy line-by-line parser
+    would silently drop the continuation — causing the next "<n+1>." marker
+    to inherit content from item n and shift all subsequent items.
 
     Cleans:
       - Qwen3 chain-of-thought blocks
-      - leading "(MAX N chars)" budget hints from legacy prompts
-      - trailing "(20)" character-count self-reports — this is the bug that
-        leaked into the v3 SRT
+      - leading "(MAX N chars)" / "[12.3s]" budget hints
+      - trailing "(20)" character-count self-reports
       - trailing "[note]" translator notes
       - surrounding whitespace and stray quotes
     """
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    marker_re = re.compile(r"^[\(\[]?(\d+)[\.\)\]]\s+(.*)")
+
     result: dict = {}
-    for line in text.splitlines():
-        m = re.match(r"^[\(\[]?(\d+)[\.\)\]]\s+(.*)", line.strip())
-        if not m:
-            continue
-        idx, content = int(m.group(1)), m.group(2).strip()
+    cur_idx: int = -1
+    cur_buf: List[str] = []
+
+    def _flush(idx: int, buf: List[str]) -> None:
+        if not (1 <= idx <= count):
+            return
+        content = " ".join(s.strip() for s in buf if s.strip())
         content = re.sub(r"^\(MAX\s+\d+\s+chars?\)\s*", "", content, flags=re.IGNORECASE)
-        # Clean leading duration hints [12.3s] the LLM may copy from the prompt
         content = re.sub(r"^\[\d+(\.\d+)?s\]\s*", "", content)
         content = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", content)
         content = re.sub(r"\s*\[[^\]]*\]\s*$", "", content)
         content = content.strip(" \t\"'")
-        if 1 <= idx <= count and content:
+        if content:
             result[idx] = content
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        m = marker_re.match(stripped)
+        if m:
+            # Heuristic guard: don't treat "2024." or similar bare years as
+            # markers — require the number to be plausible as a 1-based index.
+            idx_candidate = int(m.group(1))
+            if idx_candidate <= count + 5:
+                # New item — flush previous
+                if cur_idx >= 1:
+                    _flush(cur_idx, cur_buf)
+                cur_idx = idx_candidate
+                cur_buf = [m.group(2)]
+                continue
+        # Continuation line (or pre-first-marker preamble we ignore)
+        if cur_idx >= 1:
+            cur_buf.append(stripped)
+
+    if cur_idx >= 1:
+        _flush(cur_idx, cur_buf)
+
     return [result.get(i + 1, "") for i in range(count)]
 
 
@@ -1061,7 +1449,9 @@ def translate_segments_qwen(
     batch_size: int,
     log: logging.Logger,
     target_lang: str = "fr",
+    locale: str = "fr",
     glossary_section: str = "",
+    budget_cps: int = 17,
 ) -> List[dict]:
     """Translate segments via Qwen3 over Ollama. One natural pass.
 
@@ -1075,20 +1465,34 @@ def translate_segments_qwen(
     poison the rest of the batch.
     """
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    locale_note = (
+        "\nUse Québécois/Canadian French register throughout "
+        "(e.g. courriel, fin de semaine, dîner for lunch, souper for supper)."
+        if locale == "fr-ca" else ""
+    )
     out = [dict(s) for s in segments]
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
 
     log.info(f"Translating {len(segments)} segments with {model} (Ollama) …")
 
+    # Char budget per second of audio. 17 CPS is the upper bound of naturally
+    # speakable French; the assembler will still stretch up to max_stretch
+    # for the segments that overshoot, but most segments now arrive at a
+    # speakable rate without any speed-up.
+    def _budget(seg: dict) -> int:
+        dur = max(seg["end"] - seg["start"], 0.5)
+        # Floor at 40 chars so 1-2s segments don't get clipped to nothing.
+        return max(40, int(dur * budget_cps))
+
     def _translate(items: List[dict]) -> List[str]:
         if not items:
             return []
         numbered = "\n".join(
-            f"{i + 1}. [{s['end'] - s['start']:.1f}s] {s['text']}" 
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ≤{_budget(s)} chars] {s['text']}"
             for i, s in enumerate(items)
         )
         prompt = think_prefix + _TRANSLATE_PROMPT.format(
-            language=language, segments=numbered, glossary_section=glossary_section
+            language=language, locale_note=locale_note, segments=numbered, glossary_section=glossary_section
         )
         response = _ollama_call(prompt, model, temperature, log)
         if not response:
@@ -1156,7 +1560,7 @@ def review_translations(
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
         batch    = segments[start : start + batch_size]
         numbered = "\n".join(
-            f"{i + 1}. [{s['end'] - s['start']:.1f}s] {s.get('text_fr', '')}" 
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ≤{max(40, int((s['end']-s['start'])*17))} chars] {s.get('text_fr', '')}"
             for i, s in enumerate(batch)
         )
         prompt = think_prefix + _REVIEW_PROMPT.format(
@@ -1274,11 +1678,15 @@ def _seg_text(seg: dict) -> str:
     return (seg.get("text_fr") or seg.get("text") or "").strip()
 
 
-# XTTS-v2 hard per-language character cap. French is 273; we leave headroom.
+# XTTS-v2 hard per-language character cap. The values below are well under
+# the model's internal token cap (FR: 273, EN: 250, DE/PL: 248, …) — XTTS
+# becomes loop-prone well *before* its hard cap, so we split aggressively
+# on sentence boundaries. Empirically, 180 chars/chunk for Romance languages
+# eliminates almost all internal looping while keeping prosody continuous.
 _XTTS_CHUNK_LIMITS = {
-    "fr": 250, "en": 240, "es": 230, "de": 240, "it": 210, "pt": 220,
-    "pl": 240, "nl": 240, "ru": 170, "cs": 180, "ar": 160, "tr": 220,
-    "hu": 170, "zh": 80, "ja": 80, "ko": 80, "hi": 240,
+    "fr": 180, "en": 200, "es": 180, "de": 200, "it": 170, "pt": 180,
+    "pl": 200, "nl": 200, "ru": 160, "cs": 160, "ar": 150, "tr": 180,
+    "hu": 160, "zh": 80, "ja": 80, "ko": 80, "hi": 200,
 }
 
 
@@ -1980,6 +2388,10 @@ def process_video(
         config.whisper_compute_type,
         config.models_folder,
         log,
+        condition_on_previous_text=config.whisper_condition_on_previous_text,
+        compression_ratio_threshold=config.whisper_compression_ratio_threshold,
+        no_speech_threshold=config.whisper_no_speech_threshold,
+        log_prob_threshold=config.whisper_log_prob_threshold,
     )
     if not segments:
         return False
@@ -1992,6 +2404,11 @@ def process_video(
 
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "02_deduped", log)
+
+    segments = collapse_intrasegment_loops(segments, log)
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "02b_loop_collapsed", log)
 
     segments = merge_segments(
         segments,
@@ -2040,7 +2457,9 @@ def process_video(
         config.translation_batch_size,
         log,
         target_lang=config.target_lang,
+        locale=config.target_locale,
         glossary_section=glossary_section,
+        budget_cps=config.translation_budget_cps,
     )
     _verify_translation_quality(segments, log)
 
@@ -2062,11 +2481,35 @@ def process_video(
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06_reviewed", log)
 
+    # Compression fallback: targeted second pass on segments still over budget.
+    if config.translation_compression_pass:
+        log.info("\n[3d/6] COMPRESSING OVER-BUDGET SEGMENTS")
+        segments = compress_overflowing_translations(
+            segments,
+            config.translation_model,
+            config.translation_temperature,
+            log,
+            budget_cps=config.translation_budget_cps,
+            target_lang=config.target_lang,
+        )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06b_compressed", log)
+
     if glossary.entries:
         log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
         segments = apply_glossary(segments, glossary.entries, log)
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "07_glossary", log)
+
+    # CPS guard: split segments whose final French text would force the
+    # assembler past max_stretch. Splits at sentence boundary; halves
+    # are stretched independently and end up closer to natural rate.
+    if config.cps_split_threshold > 0:
+        segments = split_overflowing_segments(
+            segments, log, max_cps=config.cps_split_threshold,
+        )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "07b_cps_split", log)
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")

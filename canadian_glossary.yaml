@@ -1,348 +1,77 @@
-# Canadian French (Québécois) glossary for the dubbing pipeline
-# Source: CAPS French Language Guidelines + OQLF terminology
+# Canadian French (Québécois) Glossary
+# English → French-Canadian substitutions for CAPS and related organizations
+# Source: CAPS French Language Guidelines + OQLF standards
 #
-# ── Term modes ───────────────────────────────────────────────────────────────
-# mode: always  — deterministic post-processing substitution applied after
-#                 translation. Safe for invariant, OQLF-officialised terms
-#                 and CAPS brand terms where only one French form is correct.
-# mode: suggest — injected into the translation prompt only. Use for terms
-#                 where grammatical context determines gender/number, or where
-#                 the European French form is also acceptable in QC.
-#
-# Fields:
-#   en:     English source term (used in prompt hint + catches untranslated
-#           English in post-processing substitution)
-#   fr_ca:  Québécois / Canadian French target form
-#   fr_std: Standard / European French form to replace in post-processing
-#           (mode: always only). Leave blank when there is no European French
-#           counterpart to substitute.
-#   note:   Optional clarification injected into the translation prompt.
+# Note: Use median dot (·) for inclusive forms — conférencier·ère not conférencier/ère
+# OQLF standards cover general formatting, capitalization, and number/currency conventions.
 
-# ── Formatting rules (CAPS / Canadian French standards) ──────────────────────
-# Injected into every translation prompt as a formatting section.
-formatting_rules:
-  - 'Quotation marks: use French guillemets with non-breaking spaces inside: « texte » — never use straight English double quotes " " in French text'
-  - "Numbers: non-breaking space as thousands separator — 1 000 not 1,000"
-  - "Decimal separator: use comma not period — 3,5 not 3.5"
-  - "Dates: day first, month lowercase, no comma — 17 mars 2026 not March 17, 2026"
-  - "Times: 24-hour format with h abbreviation — 20 h or 20 h 30 not 8:00 PM"
-  - "Currency: dollar sign after number with non-breaking space — 87 $ plus taxes not $87 plus tax"
-  - "Capitalization: job titles, days of the week, and months are lowercase in French — le président, lundi, mars"
+# ── Acronyms ──────────────────────────────────────────────────────────────────
+# Keep these in English exactly as-is (do not translate)
 
-# ── Inclusive language (CAPS standard) ───────────────────────────────────────
-# Injected into every translation and review prompt.
-inclusive_language:
-  - "For 'speaker' or 'speakers', always use conférencier·ère / conférencier·ères (median dot ·, never slash / or parentheses)"
-  - "Use gender-neutral collective nouns where possible: les membres, l'équipe, la communauté"
-  - "For other paired masculine/feminine endings, use median dot: professionnel·le, participant·e, formateur·trice"
-  - "Default to vous (not tu) when addressing members or the audience"
-  - "Translate ideas naturally — the French should sound written in French from the start, not translated"
+acronyms:
+  CAPS: Canadian Association of Professional Speakers
+  CSP: Certified Speaking Professional
+  HoF: Hall of Fame
+  GSF: Global Speakers Federation
 
-# ── Terms ─────────────────────────────────────────────────────────────────────
+# ── Core Speaker Terms ────────────────────────────────────────────────────────
 
-terms:
+glossary:
+  speaker:                            conférencier·ère
+  speakers:                           conférencier·ères
+  Speaker:                            Conférencier·ère
+  Speakers:                           Conférencier·ères
+  keynote speaker:                    conférencier·ère principal·e
+  keynote speakers:                   conférencier·ères principaux·ales
+  professional speaker:               conférencier·ère professionnel·le
+  thought leader:                     leader d'opinion
+  facilitator:                        facilitateur·trice
+  trainer:                            formateur·trice
+  coach:                              coach
 
-  # ── CAPS Brand Lexicon ────────────────────────────────────────────────────
-  # Source: CAPS French Language Guidelines — Brand Lexicon table
-  # CAPS, CSP, HoF, and GSF are kept in English per guidelines and are not listed here.
-  # Brand names with inclusive forms use median dot (·) per CAPS inclusive language standard.
+  # ── CAPS Organization & Events ────────────────────────────────────────────
 
-  - en:     "speaker"
-    fr_ca:  "conférencier·ère"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-    note:   "CAPS standard — always use conférencier·ère with median dot"
+  Canadian Association of Professional Speakers:    Association canadienne des conférencier·ères professionnel·les
+  Canadian Speaking Hall of Fame:                   Temple de la renommée canadien des conférencier·ères
+  Hall of Fame:                                     Temple de la renommée
+  Global Speakers Federation:                       Fédération mondiale des conférencier·ères
+  Speaker Academy:                                  Académie des conférencier·ères
+  CAPS Academy:                                     Académie CAPS
+  CAPS Atlantic:                                    CAPS Atlantique
+  CAPS BC:                                          CAPS Colombie-Britannique
+  CAPS Convention:                                  Convention de CAPS
+  CAPS Foundation:                                  Fondation CAPS
+  CAPS Quebec:                                      CAPS Québec
+  Learn, Share, Grow, Belong:                       Apprendre, Partager, Grandir, Appartenir
 
-  - en:     "speakers"
-    fr_ca:  "conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
+  # ── Speaking & Business Terms ────────────────────────────────────────────
 
-  - en:     "Speaker"
-    fr_ca:  "Conférencier·ère"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
+  speaking engagement:                mandat de conférence
+  speaking business:                  entreprise de conférencier·ères
+  speaker fee:                        honoraires
+  preferred rate:                     tarif préférentiel
+  networking:                         réseautage
+  workshop:                           atelier
+  workshops:                          ateliers
+  onboarding:                         intégration
+  meeting:                            réunion
+  membership:                         adhésion
+  chapter:                            chapitre
+  directory:                          répertoire
+  accountability group:               groupe d'imputabilité
+  accountability groups:              groupes d'imputabilité
 
-  - en:     "Speakers"
-    fr_ca:  "Conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
+  # ── Programs & Events ─────────────────────────────────────────────────────
 
-  - en:     "keynote speaker"
-    fr_ca:  "conférencier·ère principal·e"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "keynote speakers"
-    fr_ca:  "conférencier·ères principaux·ales"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "professional speaker"
-    fr_ca:  "conférencier·ère professionnel·le"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Speaker Academy"
-    fr_ca:  "Académie des conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS Academy"
-    fr_ca:  "Académie CAPS"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Speaker fee"
-    fr_ca:  "Honoraires"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-    note:   "always plural in French per CAPS guidelines"
-
-  - en:     "speaking engagement"
-    fr_ca:  "mandat de conférence"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "speaking business"
-    fr_ca:  "entreprise de conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "networking"
-    fr_ca:  "réseautage"
-    fr_std: "networking"
-    mode:   always
-    category: caps_brand
-    note:   "OQLF + CAPS preferred; 'networking' is an anglicism"
-
-  - en:     "workshop"
-    fr_ca:  "atelier"
-    fr_std: "workshop"
-    mode:   always
-    category: caps_brand
-
-  - en:     "workshops"
-    fr_ca:  "ateliers"
-    fr_std: "workshops"
-    mode:   always
-    category: caps_brand
-
-  - en:     "onboarding"
-    fr_ca:  "intégration"
-    fr_std: "onboarding"
-    mode:   always
-    category: caps_brand
-
-  - en:     "mastermind"
-    fr_ca:  "groupe de réflexion stratégique"
-    fr_std: "mastermind"
-    mode:   always
-    category: caps_brand
-
-  - en:     "Multi-Year Mastermind"
-    fr_ca:  "Groupe de réflexion stratégique pluriannuel"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Main Stage"
-    fr_ca:  "Scène principale"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "early bird"
-    fr_ca:  "inscription anticipée"
-    fr_std: "early bird"
-    mode:   always
-    category: caps_brand
-
-  - en:     "on-demand"
-    fr_ca:  "sur demande"
-    fr_std: "on-demand"
-    mode:   always
-    category: caps_brand
-
-  - en:     "hybrid event"
-    fr_ca:  "événement hybride"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "in-person event"
-    fr_ca:  "événement en présentiel"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "in-person"
-    fr_ca:  "en présentiel"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "learning track"
-    fr_ca:  "parcours d'apprentissage"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "self-guided learning track"
-    fr_ca:  "parcours d'apprentissage autonome"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Learn, Share, Grow, Belong"
-    fr_ca:  "Apprendre, Partager, Grandir, Appartenir"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-    note:   "CAPS brand motto — translate exactly"
-
-  - en:     "Business Starter Track"
-    fr_ca:  "Parcours « Démarrage d'entreprise »"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Canadian Association of Professional Speakers"
-    fr_ca:  "Association canadienne des conférencier·ères professionnel·les"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Canadian Speaking Hall of Fame"
-    fr_ca:  "Temple de la renommée canadien des conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Hall of Fame"
-    fr_ca:  "Temple de la renommée"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "Global Speakers Federation"
-    fr_ca:  "Fédération mondiale des conférencier·ères"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS Atlantic"
-    fr_ca:  "CAPS Atlantique"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS BC"
-    fr_ca:  "CAPS Colombie-Britannique"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS Convention"
-    fr_ca:  "Convention de CAPS"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS Foundation"
-    fr_ca:  "Fondation CAPS"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "CAPS Quebec"
-    fr_ca:  "CAPS Québec"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "preferred rate"
-    fr_ca:  "tarif préférentiel"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "accountability group"
-    fr_ca:  "groupe d'imputabilité"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "accountability groups"
-    fr_ca:  "groupes d'imputabilité"
-    fr_std: ""
-    mode:   always
-    category: caps_brand
-
-  - en:     "membership"
-    fr_ca:  "adhésion"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "chapter"
-    fr_ca:  "chapitre"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "meeting"
-    fr_ca:  "réunion"
-    fr_std: "meeting"
-    mode:   always
-    category: caps_brand
-    note:   "European French often keeps 'meeting' (anglicism); CAPS/QC uses 'réunion'"
-
-  - en:     "directory"
-    fr_ca:  "répertoire"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "audience reach"
-    fr_ca:  "portée auprès de l'auditoire"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "thought leader"
-    fr_ca:  "leader d'opinion"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "facilitator"
-    fr_ca:  "facilitateur·trice"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "trainer"
-    fr_ca:  "formateur·trice"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-
-  - en:     "coach"
-    fr_ca:  "coach"
-    fr_std: ""
-    mode:   suggest
-    category: caps_brand
-    note:   "'coach' is kept in French; 'coachs' for plural per CAPS lexicon"
+  Main Stage:                         Scène principale
+  mastermind:                         groupe de réflexion stratégique
+  Multi-Year Mastermind:              Groupe de réflexion stratégique pluriannuel
+  learning track:                     parcours d'apprentissage
+  self-guided learning track:         parcours d'apprentissage autonome
+  Business Starter Track:             Parcours « Démarrage d'entreprise »
+  hybrid event:                       événement hybride
+  in-person event:                    événement en présentiel
+  in-person:                          en présentiel
+  on-demand:                          sur demande
+  early bird:                         inscription anticipée
+  audience reach:                     portée auprès de l'auditoire

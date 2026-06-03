@@ -43,12 +43,186 @@ LOG_DIR      = WORKSPACE / "logs"
 CONFIG_PATH  = WORKSPACE / "config.yaml"
 PIPELINE_PY  = WORKSPACE / "scripts" / "02_pipeline.py"
 
+# Mirror config writes to the source repo so the two copies stay in sync.
+# Any path that exists is written; missing paths are silently skipped.
+CONFIG_MIRRORS = [
+    Path("/workspace/french-dubbing/config.yaml"),
+]
+
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Choices (mirror Click definitions in 02_pipeline.py) ──────────────────────
 LOCALE_CHOICES = ["fr", "fr-ca"]
+
+# ── Advanced config schema ────────────────────────────────────────────────────
+# Each entry: dotted path → (type, label, help, ui hints).
+# UI hints: {"min", "max", "step", "choices", "group"}.
+# Only paths declared here are writable via /api/config; everything else in
+# config.yaml is preserved verbatim on save.
+CONFIG_SCHEMA: dict = {
+    # Audio
+    "audio.volume_boost_pct":          ("int",   "Volume boost (%)",        "0 = off. Applied after peak normalization; hard-clipped at ±1.0.", {"min": -50, "max": 100, "step": 1, "group": "Audio"}),
+    "audio.output_sample_rate":        ("int",   "Output sample rate (Hz)", "Vimeo accepts 44100 or 48000.", {"choices": [44100, 48000], "group": "Audio"}),
+
+    # Diarization
+    "diarization.enabled":             ("bool",  "Enable diarization",      "Detect speakers and clone a distinct voice per speaker.", {"group": "Diarization"}),
+    "diarization.min_speakers":        ("int",   "Min speakers",            "Set min == max to force an exact count.", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
+    "diarization.max_speakers":        ("int",   "Max speakers",            "", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
+    "diarization.profile_duration":    ("int",   "Profile duration (s)",    "Seconds of per-speaker audio used for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "Diarization"}),
+
+    # Source separation
+    "source_separation.enabled":            ("bool",  "Enable source separation", "Separate vocals from music before transcription/cloning.", {"group": "Source separation"}),
+    "source_separation.model":              ("str",   "Demucs model",           "", {"choices": ["htdemucs", "htdemucs_ft", "mdx_extra"], "group": "Source separation"}),
+    "source_separation.preserve_background":("bool",  "Preserve background",    "Remix original music/ambience under French vocals into *_french_full.m4a.", {"group": "Source separation"}),
+
+    # Whisper
+    "whisper.model":                   ("str",   "Whisper model",           "", {"choices": ["large-v3", "large-v2", "medium", "small", "distil-large-v3"], "group": "Whisper"}),
+    "whisper.language":                ("str",   "Source language",         "ISO code of the source audio.", {"group": "Whisper"}),
+    "whisper.compute_type":            ("str",   "Compute type",            "", {"choices": ["float16", "int8_float16", "int8", "float32"], "group": "Whisper"}),
+    "whisper.condition_on_previous_text": ("bool", "Condition on prev text", "Off = strongest anti-hallucination posture; Whisper won't feed its own (possibly looped) output back as context.", {"group": "Whisper"}),
+    "whisper.compression_ratio_threshold": ("float", "Compression-ratio max", "Reject segments above this ratio (a classic loop signature). Lower = more aggressive. fw default 2.4.", {"min": 1.5, "max": 4.0, "step": 0.05, "group": "Whisper"}),
+    "whisper.no_speech_threshold":     ("float", "No-speech threshold",     "Drop windows whose no-speech probability exceeds this.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "Whisper"}),
+    "whisper.log_prob_threshold":      ("float", "Log-prob threshold",      "Average log-prob floor; lower-scoring segments are dropped.", {"min": -3.0, "max": 0.0, "step": 0.1, "group": "Whisper"}),
+
+    # Translation
+    "translation.model":               ("str",   "Translation model",       "Ollama tag (e.g. qwen3:14b, qwen3:32b).", {"group": "Translation"}),
+    "translation.temperature":         ("float", "Temperature",             "Lower = more literal, higher = more creative.", {"min": 0.0, "max": 1.5, "step": 0.05, "group": "Translation"}),
+    "translation.batch_size":          ("int",   "Batch size",              "Segments per Ollama call. Big batches risk 4096-token budget.", {"min": 1, "max": 60, "step": 1, "group": "Translation"}),
+    "translation.review_pass":         ("bool",  "Self-review pass",        "Qwen rereads and fixes Anglicisms. Roughly doubles translation time.", {"group": "Translation"}),
+    "translation.compression_pass":    ("bool",  "Compression fallback",    "Targeted second Qwen pass that only rewrites segments still over budget after the main translation. Cheap and eliminates most remaining speed-ups.", {"group": "Translation"}),
+    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to Qwen. ~17 is naturally speakable French; raise for more headroom, lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
+    "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
+    "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
+
+    # TTS
+    "tts.xtts_temperature":            ("float", "XTTS temperature",        "Lower = more monotone.", {"min": 0.1, "max": 1.2, "step": 0.05, "group": "TTS"}),
+    "tts.xtts_repetition_penalty":     ("float", "Repetition penalty",      "", {"min": 1.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
+    "tts.xtts_top_p":                  ("float", "Top-p",                   "", {"min": 0.1, "max": 1.0, "step": 0.05, "group": "TTS"}),
+    "tts.xtts_top_k":                  ("int",   "Top-k",                   "", {"min": 1, "max": 200, "step": 1, "group": "TTS"}),
+    "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
+    "tts.speaker_profile_skip":        ("int",   "Speaker clip skip (s)",   "Seconds to skip from start (avoids intro music).", {"min": 0, "max": 600, "step": 1, "group": "TTS"}),
+    "tts.use_deepfilter":              ("bool",  "DeepFilterNet denoise",   "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
+    "tts.max_stretch":                 ("float", "Max stretch ratio",       "Above this, tail is truncated with fade-out instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
+    "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
+    "tts.group_gap":                   ("float", "Group gap (s)",           "Consecutive segments within this gap share one stretch ratio.", {"min": 0.0, "max": 3.0, "step": 0.1, "group": "TTS"}),
+    "tts.stretcher":                   ("str",   "Time-stretch engine",     "rubberband preserves formants; atempo is the ffmpeg fallback.", {"choices": ["rubberband", "atempo"], "group": "TTS"}),
+    "tts.segment_merge_gap":           ("float", "Segment merge gap (s)",   "Whisper fragments closer than this are merged into one TTS chunk.", {"min": 0.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
+    "tts.segment_merge_max_duration":  ("float", "Segment merge max (s)",   "Upper bound on merged-chunk length.", {"min": 3.0, "max": 30.0, "step": 0.5, "group": "TTS"}),
+    "tts.segment_merge_min_duration":  ("float", "Segment merge min (s)",   "Lower bound on merged-chunk length.", {"min": 0.5, "max": 10.0, "step": 0.5, "group": "TTS"}),
+    "tts.cps_split_threshold":         ("float", "CPS split threshold",     "Translated segments above this French CPS get split at a sentence boundary before TTS. Halves are more stable for XTTS and stretch independently. 0 disables.", {"min": 0.0, "max": 40.0, "step": 0.5, "group": "TTS"}),
+
+    # Subtitles
+    "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
+
+    # Processing
+    "processing.keep_temp":            ("bool",  "Keep temp files",         "Dump intermediate segment JSON for inspection.", {"group": "Processing"}),
+}
+
+
+# Curated presets. Each value must also be a valid value per CONFIG_SCHEMA;
+# the PUT validator catches drift if someone edits a preset wrong.
+CONFIG_PRESETS: dict[str, dict] = {
+    "fast_draft": {
+        "label": "Fast draft",
+        "desc": "Quickest turnaround; lower fidelity. Skip diarization, smaller whisper, no review/compression pass.",
+        "values": {
+            "whisper.model": "distil-large-v3",
+            "whisper.compute_type": "int8_float16",
+            "whisper.condition_on_previous_text": False,
+            "whisper.compression_ratio_threshold": 2.4,  # less aggressive — speed over accuracy
+            "diarization.enabled": False,
+            "source_separation.enabled": True,
+            "source_separation.model": "mdx_extra",
+            "translation.review_pass": False,
+            "translation.compression_pass": False,        # skip the extra Qwen call
+            "translation.batch_size": 30,
+            "translation.budget_cps": 19,                 # accept slightly longer FR
+            "tts.use_deepfilter": False,
+            "tts.stretcher": "atempo",
+            "tts.cps_split_threshold": 24.0,              # less aggressive splitting
+        },
+    },
+    "high_quality": {
+        "label": "High quality",
+        "desc": "Best fidelity end-to-end. Strong anti-hallucination, review + compression passes, rubberband stretcher.",
+        "values": {
+            "whisper.model": "large-v3",
+            "whisper.compute_type": "float16",
+            "whisper.condition_on_previous_text": False,
+            "whisper.compression_ratio_threshold": 2.0,   # aggressive loop rejection
+            "whisper.no_speech_threshold": 0.6,
+            "diarization.enabled": True,
+            "source_separation.enabled": True,
+            "source_separation.model": "htdemucs",
+            "source_separation.preserve_background": True,
+            "translation.review_pass": True,
+            "translation.compression_pass": True,         # squeeze out remaining overflows
+            "translation.batch_size": 15,
+            "translation.temperature": 0.25,
+            "translation.budget_cps": 17,
+            "tts.use_deepfilter": True,
+            "tts.stretcher": "rubberband",
+            "tts.max_stretch": 1.25,
+            "tts.cps_split_threshold": 20.0,              # tighter split threshold
+        },
+    },
+    "voice_clone_focus": {
+        "label": "Voice-cloning focus",
+        "desc": "Optimise speaker fidelity: long reference clip, denoise, tight stretch limits, aggressive compression.",
+        "values": {
+            "diarization.enabled": True,
+            "diarization.profile_duration": 40,
+            "translation.compression_pass": True,         # short utterances clone better
+            "translation.budget_cps": 16,                 # tighter to preserve XTTS stability
+            "tts.speaker_profile_duration": 40,
+            "tts.use_deepfilter": True,
+            "tts.xtts_temperature": 0.6,
+            "tts.max_stretch": 1.2,
+            "tts.min_stretch": 0.8,
+            "tts.stretcher": "rubberband",
+            "tts.cps_split_threshold": 19.0,              # split more, helps XTTS stability
+        },
+    },
+}
+
+
+def _get_dotted(obj: dict, dotted: str):
+    cur = obj
+    for k in dotted.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return None
+        cur = cur[k]
+    return cur
+
+
+def _set_dotted(obj: dict, dotted: str, value) -> None:
+    keys = dotted.split(".")
+    cur = obj
+    for k in keys[:-1]:
+        nxt = cur.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[k] = nxt
+        cur = nxt
+    cur[keys[-1]] = value
+
+
+def _coerce(value, typ: str):
+    if typ == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "on", "yes")
+        return bool(value)
+    if typ == "int":
+        return int(value)
+    if typ == "float":
+        return float(value)
+    if typ == "str":
+        return str(value)
+    raise ValueError(f"unknown type {typ}")
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024  # 5 GB
 LOG_BUFFER_LINES = 500
@@ -100,6 +274,16 @@ async def _run_job(job: Job) -> None:
     state.current_job_id = job.id
     state.save()
     state.publish(job.id, f">>> Starting: {job.video_filename}")
+
+    # Snapshot the exact config that will produce this dub. Lets you diff
+    # settings across runs and re-run the same job with identical params.
+    try:
+        snap = Path(job.output_dir) / "config.snapshot.yaml"
+        if CONFIG_PATH.exists():
+            snap.write_bytes(CONFIG_PATH.read_bytes())
+            state.publish(job.id, f"... snapshot: {snap}")
+    except Exception as e:
+        state.publish(job.id, f"!!! snapshot failed: {e}")
 
     cmd = [
         sys.executable, str(PIPELINE_PY),
@@ -264,6 +448,217 @@ async def options() -> JSONResponse:
         "defaults": defaults,
         "config_path": str(CONFIG_PATH),
     })
+
+
+@app.get("/api/config")
+async def get_config() -> JSONResponse:
+    """Return the editable subset of config.yaml plus the schema."""
+    try:
+        cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        raise HTTPException(500, f"failed to read config: {e}")
+    values: dict = {}
+    for dotted in CONFIG_SCHEMA:
+        v = _get_dotted(cfg, dotted)
+        if v is not None:
+            values[dotted] = v
+    schema_out = [
+        {"path": p, "type": t, "label": label, "help": help_, **hints}
+        for p, (t, label, help_, hints) in CONFIG_SCHEMA.items()
+    ]
+    presets_out = [
+        {"id": pid, "label": p["label"], "desc": p["desc"], "values": p["values"]}
+        for pid, p in CONFIG_PRESETS.items()
+    ]
+    return JSONResponse({
+        "values": values,
+        "schema": schema_out,
+        "presets": presets_out,
+        "path": str(CONFIG_PATH),
+        "job_running": state.current_job_id is not None,
+    })
+
+
+@app.put("/api/config")
+async def update_config(payload: dict, force: bool = False) -> JSONResponse:
+    """Update editable keys in config.yaml and mirror to the source repo.
+
+    Body: {"values": {"<dotted.path>": <value>, ...}}.
+    Unknown keys are rejected; values are coerced per schema.
+    NOTE: YAML comments are preserved by an in-place line-rewrite (only the
+    matched leaf lines are touched), so the heavily commented config.yaml
+    keeps its inline documentation intact.
+    """
+    updates = payload.get("values") or {}
+    if not isinstance(updates, dict):
+        raise HTTPException(400, "values must be an object")
+
+    # Hot-reload guard: the pipeline reads config.yaml at job start, so a
+    # mid-run edit would surprise the user (running job uses old values; next
+    # job uses new ones). Refuse unless force=true.
+    if state.current_job_id and not force:
+        raise HTTPException(
+            409,
+            f"a job is currently running ({state.current_job_id}); "
+            f"changes would only apply to the next job. Pass ?force=true to override.",
+        )
+
+    # Validate and coerce
+    coerced: dict = {}
+    for dotted, raw in updates.items():
+        spec = CONFIG_SCHEMA.get(dotted)
+        if not spec:
+            raise HTTPException(400, f"unknown config key: {dotted}")
+        typ, _label, _help, hints = spec
+        try:
+            val = _coerce(raw, typ)
+        except (ValueError, TypeError) as e:
+            raise HTTPException(400, f"{dotted}: {e}")
+        choices = hints.get("choices")
+        if choices and val not in choices:
+            raise HTTPException(400, f"{dotted}: must be one of {choices}")
+        for bound in ("min", "max"):
+            if bound in hints and isinstance(val, (int, float)):
+                if bound == "min" and val < hints["min"]:
+                    raise HTTPException(400, f"{dotted}: must be ≥ {hints['min']}")
+                if bound == "max" and val > hints["max"]:
+                    raise HTTPException(400, f"{dotted}: must be ≤ {hints['max']}")
+        coerced[dotted] = val
+
+    # Cross-field sanity
+    cfg_now = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    merged = yaml.safe_load(yaml.safe_dump(cfg_now)) or {}
+    for k, v in coerced.items():
+        _set_dotted(merged, k, v)
+    dmin = _get_dotted(merged, "diarization.min_speakers")
+    dmax = _get_dotted(merged, "diarization.max_speakers")
+    if isinstance(dmin, int) and isinstance(dmax, int) and dmin > dmax:
+        raise HTTPException(400, "diarization.min_speakers must be ≤ max_speakers")
+    smin = _get_dotted(merged, "tts.min_stretch")
+    smax = _get_dotted(merged, "tts.max_stretch")
+    if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and smin > smax:
+        raise HTTPException(400, "tts.min_stretch must be ≤ tts.max_stretch")
+
+    # Write — comment-preserving line rewrite for known leaves
+    try:
+        written = _rewrite_yaml_leaves(CONFIG_PATH, coerced)
+    except Exception as e:
+        raise HTTPException(500, f"failed to write config: {e}")
+
+    # Mirror to repo copies (best-effort; non-fatal if absent)
+    mirrored: list[str] = []
+    for mp in CONFIG_MIRRORS:
+        try:
+            if mp.exists() and mp.resolve() != CONFIG_PATH.resolve():
+                _rewrite_yaml_leaves(mp, coerced)
+                mirrored.append(str(mp))
+        except Exception as e:
+            log.warning("mirror write failed for %s: %s", mp, e)
+
+    return JSONResponse({
+        "ok": True,
+        "updated": written,
+        "mirrored": mirrored,
+        "values": coerced,
+    })
+
+
+def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
+    """In-place rewrite of `key: value` lines under their parent section.
+
+    Preserves comments, blank lines, and key order. Only top-level mapping
+    sections (translation:, tts:, …) are tracked via indentation depth.
+    For any key not found, the line is appended under its section header
+    (or at end of file if the section is absent).
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    # Group updates by top-level section
+    by_section: dict[str, dict[str, object]] = {}
+    for dotted, val in updates.items():
+        head, _, leaf = dotted.partition(".")
+        by_section.setdefault(head, {})[leaf] = val
+
+    def fmt(v) -> str:
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, (int, float)):
+            return repr(v) if isinstance(v, float) else str(v)
+        if isinstance(v, str):
+            # Quote if it contains chars that YAML would otherwise mis-parse
+            if v == "" or any(c in v for c in ":#'\"\n") or v.strip() != v:
+                return yaml.safe_dump(v).strip()
+            return v
+        return yaml.safe_dump(v, default_flow_style=True).strip()
+
+    out: list[str] = []
+    written: list[str] = []
+    cur_section: Optional[str] = None
+    section_end_idx: dict[str, int] = {}  # last line index inside each section
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Top-level mapping header (indent==0, ends with ':')
+        if indent == 0 and stripped and not stripped.startswith("#") and stripped.rstrip().endswith(":"):
+            cur_section = stripped.rstrip()[:-1].strip()
+        elif indent == 0 and stripped == "":
+            pass  # blank — section unchanged
+        elif indent == 0 and stripped.startswith("#"):
+            pass  # top-level comment
+
+        # If inside a tracked section and this is a `key:` line, see if we update
+        replaced = False
+        if cur_section in by_section and indent > 0 and not stripped.startswith("#"):
+            m = re.match(r"^(\s*)([A-Za-z_][\w-]*)\s*:(.*)$", line)
+            if m:
+                lead, key, rest = m.group(1), m.group(2), m.group(3)
+                if key in by_section[cur_section]:
+                    val = by_section[cur_section].pop(key)
+                    # Preserve any trailing comment
+                    comment = ""
+                    if "#" in rest:
+                        # Only treat as comment if preceded by space or at start
+                        idx = rest.find("#")
+                        comment = "  " + rest[idx:].strip()
+                    out.append(f"{lead}{key}: {fmt(val)}{comment}")
+                    written.append(f"{cur_section}.{key}")
+                    replaced = True
+        if not replaced:
+            out.append(line)
+
+        if cur_section is not None and indent > 0 and stripped and not stripped.startswith("#"):
+            section_end_idx[cur_section] = len(out) - 1
+
+        i += 1
+
+    # Any leftover keys: append under their section, or at EOF as a new section
+    leftovers = {sec: kvs for sec, kvs in by_section.items() if kvs}
+    if leftovers:
+        # Rebuild with insertions at recorded section_end_idx
+        # Easier: append a new block at end for missing keys, with section: header
+        for sec, kvs in leftovers.items():
+            if sec in section_end_idx:
+                insert_at = section_end_idx[sec] + 1
+                block = [f"  {k}: {fmt(v)}" for k, v in kvs.items()]
+                out[insert_at:insert_at] = block
+                # Shift other section_end_idx entries past this point
+                for s2, idx2 in list(section_end_idx.items()):
+                    if idx2 >= insert_at:
+                        section_end_idx[s2] = idx2 + len(block)
+            else:
+                out.append("")
+                out.append(f"{sec}:")
+                for k, v in kvs.items():
+                    out.append(f"  {k}: {fmt(v)}")
+            written.extend(f"{sec}.{k}" for k in kvs)
+
+    path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    return written
 
 
 @app.post("/api/jobs")
@@ -438,26 +833,121 @@ def _download(job: Job, kind: str) -> FileResponse:
     return FileResponse(path, filename=download_name)
 
 
+GLOSSARY_PATH = Path("/workspace/canadian_glossary.yaml")
+GLOSSARY_MIRRORS = [Path("/workspace/french-dubbing/canadian_glossary.yaml")]
+GLOSSARY_TERM_MODES = ["always", "suggest"]
+GLOSSARY_FIELDS = ("en", "fr_ca", "fr_std", "mode", "category", "note")
+
+
 @app.get("/api/glossary")
 async def get_glossary() -> JSONResponse:
     try:
-        with open("/workspace/canadian_glossary.yaml", "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        return JSONResponse(data.get("terms", []))
+        data = yaml.safe_load(GLOSSARY_PATH.read_text(encoding="utf-8")) or {}
     except Exception as e:
         raise HTTPException(500, f"failed to read glossary: {e}")
+    return JSONResponse({
+        "terms": data.get("terms", []) or [],
+        "modes": GLOSSARY_TERM_MODES,
+        "path": str(GLOSSARY_PATH),
+    })
+
 
 @app.post("/api/glossary")
-async def update_glossary(terms: list) -> JSONResponse:
+async def update_glossary(payload: dict) -> JSONResponse:
+    """Replace the `terms:` block in canadian_glossary.yaml.
+
+    Preserves the header comments, `formatting_rules:`, and `inclusive_language:`
+    sections by rewriting only the `terms:` block in place.
+    """
+    terms = payload.get("terms")
+    if not isinstance(terms, list):
+        raise HTTPException(400, "terms must be a list")
+
+    # Validate + normalise each row
+    clean: list[dict] = []
+    for i, raw in enumerate(terms):
+        if not isinstance(raw, dict):
+            raise HTTPException(400, f"terms[{i}] must be an object")
+        en = (raw.get("en") or "").strip()
+        fr_ca = (raw.get("fr_ca") or "").strip()
+        if not en or not fr_ca:
+            raise HTTPException(400, f"terms[{i}]: en and fr_ca are required")
+        mode = (raw.get("mode") or "always").strip()
+        if mode not in GLOSSARY_TERM_MODES:
+            raise HTTPException(400, f"terms[{i}].mode must be one of {GLOSSARY_TERM_MODES}")
+        clean.append({k: (raw.get(k) or "") for k in GLOSSARY_FIELDS} | {"en": en, "fr_ca": fr_ca, "mode": mode})
+
     try:
-        with open("/workspace/canadian_glossary.yaml", "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-        data["terms"] = terms
-        with open("/workspace/canadian_glossary.yaml", "w", encoding="utf-8") as f:
-            yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-        return JSONResponse({"status": "ok"})
+        _rewrite_glossary_terms(GLOSSARY_PATH, clean)
     except Exception as e:
         raise HTTPException(500, f"failed to update glossary: {e}")
+
+    mirrored: list[str] = []
+    for mp in GLOSSARY_MIRRORS:
+        try:
+            if mp.exists() and mp.resolve() != GLOSSARY_PATH.resolve():
+                _rewrite_glossary_terms(mp, clean)
+                mirrored.append(str(mp))
+        except Exception as e:
+            log.warning("glossary mirror failed for %s: %s", mp, e)
+
+    return JSONResponse({"ok": True, "count": len(clean), "mirrored": mirrored})
+
+
+def _rewrite_glossary_terms(path: Path, terms: list[dict]) -> None:
+    """Rewrite only the `terms:` section, preserving the rest of the file verbatim."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    # Find `terms:` line and the next top-level key (or EOF)
+    start = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if start is None and re.match(r"^terms:\s*$", line):
+            start = i
+            continue
+        if start is not None:
+            # Next top-level key ends the block (non-indented, non-blank, non-comment)
+            if line and not line.startswith(" ") and not line.startswith("\t") \
+                    and not line.lstrip().startswith("#"):
+                end = i
+                break
+
+    def q(v):
+        s = "" if v is None else str(v)
+        # Quote when YAML would otherwise misparse: empty, leading/trailing space,
+        # or contains structural chars. Use double quotes with escapes.
+        needs_quote = (
+            s == ""
+            or s != s.strip()
+            or any(c in s for c in ":#'\"\n\t[]{}|>&*!%@`,")
+            or s[:1] in "-?[]{}#&*!|>'\"%@`"
+            or s.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
+        )
+        if not needs_quote:
+            return s
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    block: list[str] = []
+    block.append("terms:")
+    for t in terms:
+        block.append("")
+        block.append(f"  - en:       {q(t.get('en', ''))}")
+        block.append(f"    fr_ca:    {q(t.get('fr_ca', ''))}")
+        block.append(f"    fr_std:   {q(t.get('fr_std', ''))}")
+        block.append(f"    mode:     {t.get('mode', 'always')}")
+        if t.get("category"):
+            block.append(f"    category: {q(t['category'])}")
+        if t.get("note"):
+            block.append(f"    note:     {q(t['note'])}")
+
+    if start is None:
+        # Append a new terms section at end
+        out = lines + [""] + block
+    else:
+        out = lines[:start] + block + lines[end:]
+
+    path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:

@@ -69,14 +69,20 @@ RUN pip install --no-cache-dir \
     "click>=8.1.7" \
     "pyyaml>=6.0.1"
 
+# Phase 7: RunPod Serverless (optional, for serverless deployment)
+RUN pip install --no-cache-dir \
+    "runpod>=0.10.0" \
+    "boto3>=1.26.0"
+
 # Install Ollama
 RUN curl -fsSL https://ollama.ai/install.sh | sh
 
 # Copy application files
-COPY 02_pipeline.py     /workspace/scripts/
-COPY 03_batch_runner.py /workspace/scripts/
-COPY verify_setup.py    /workspace/scripts/
-COPY config.yaml        /workspace/
+COPY 02_pipeline.py       /workspace/scripts/
+COPY 03_batch_runner.py   /workspace/scripts/
+COPY verify_setup.py      /workspace/scripts/
+COPY runpod_handler.py    /workspace/scripts/
+COPY config.yaml          /workspace/
 
 RUN chmod +x /workspace/scripts/*.py
 

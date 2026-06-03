@@ -43,6 +43,58 @@
     </form>
   </section>
 
+  <section class="card" id="advanced-section">
+    <details id="advanced-details">
+      <summary>
+        <h2 style="display:inline">Advanced options</h2>
+        <span class="muted" id="advanced-summary"></span>
+      </summary>
+      <div class="muted advanced-help">
+        Edits <code id="config-path">config.yaml</code> and the mirrored copy in
+        <code>french-dubbing/</code>. Changes apply to the <em>next</em> queued
+        job; running jobs are unaffected.
+      </div>
+      <div id="advanced-presets"></div>
+      <div id="advanced-fields"></div>
+      <div class="actions">
+        <button type="button" id="config-save">Save changes</button>
+        <button type="button" id="config-revert" class="cancel">Revert</button>
+        <span id="config-status" class="muted"></span>
+      </div>
+    </details>
+  </section>
+
+  <section class="card" id="glossary-section">
+    <details>
+      <summary>
+        <h2 style="display:inline">Canadian glossary</h2>
+        <span class="muted" id="glossary-summary"></span>
+      </summary>
+      <div class="muted advanced-help">
+        Active only when locale = <code>fr-ca</code>. Edits
+        <code id="glossary-path">canadian_glossary.yaml</code>; the file's
+        header comments and formatting rules are preserved.
+        <strong>always</strong> = deterministic post-translation substitution;
+        <strong>suggest</strong> = injected into the prompt as a hint.
+      </div>
+      <table id="glossary-table">
+        <thead>
+          <tr>
+            <th>English</th><th>fr-ca</th><th>fr (std)</th>
+            <th>Mode</th><th>Category</th><th>Note</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="actions">
+        <button type="button" id="glossary-add">Add term</button>
+        <button type="button" id="glossary-save">Save glossary</button>
+        <button type="button" id="glossary-revert" class="cancel">Revert</button>
+        <span id="glossary-status" class="muted"></span>
+      </div>
+    </details>
+  </section>
+
   <section class="card">
     <h2>Active &amp; queued</h2>
     <div id="active-list" class="job-list">

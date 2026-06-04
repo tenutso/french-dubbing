@@ -600,7 +600,16 @@ def transcribe_audio(
             initial_prompt="Hello. Welcome to this video. Today we will discuss several important topics.",
         )
         segments = [
-            {"id": i, "start": s.start, "end": s.end, "text": s.text.strip()}
+            {
+                "id": i,
+                "start": s.start,
+                "end": s.end,
+                "text": s.text.strip(),
+                "words": [
+                    {"word": w.word, "start": w.start, "end": w.end}
+                    for w in (getattr(s, "words", None) or [])
+                ],
+            }
             for i, s in enumerate(segments_gen)
             if s.text.strip()
         ]
@@ -677,6 +686,9 @@ def dedupe_whisper_segments(segments: List[dict], log: logging.Logger) -> List[d
         else:
             new_seg = dict(seg)
             new_seg["text"] = trimmed_text
+            seg_words = seg.get("words") or []
+            if seg_words and best_k <= len(seg_words):
+                new_seg["words"] = seg_words[best_k:]
             out.append(new_seg)
             trimmed += 1
 
@@ -780,6 +792,9 @@ def collapse_intrasegment_loops(
             new_text = " ".join(tokens[idx] for idx in kept_idx)
             new_seg = dict(seg)
             new_seg["text"] = new_text
+            seg_words = seg.get("words") or []
+            if seg_words and len(seg_words) == len(tokens):
+                new_seg["words"] = [seg_words[idx] for idx in kept_idx]
             out.append(new_seg)
         else:
             out.append(seg)
@@ -835,6 +850,8 @@ def merge_segments(
         if should_merge:
             current["end"]  = seg["end"]
             current["text"] = current["text"].rstrip() + " " + seg["text"].lstrip()
+            if seg.get("words"):
+                current["words"] = (current.get("words") or []) + seg["words"]
         else:
             merged.append(current)
             current = dict(seg)
@@ -850,6 +867,8 @@ def merge_segments(
             if dur < min_duration and (prev_dur + dur) <= max_duration * 1.25:
                 cleaned[-1]["end"]  = chunk["end"]
                 cleaned[-1]["text"] = cleaned[-1]["text"].rstrip() + " " + chunk["text"].lstrip()
+                if chunk.get("words"):
+                    cleaned[-1]["words"] = (cleaned[-1].get("words") or []) + chunk["words"]
             else:
                 cleaned.append(chunk)
         merged = cleaned
@@ -1183,13 +1202,24 @@ def split_overflowing_segments(
         a_en = en[:en_share]
         b_en = en[en_share:]
 
-        base = {k: v for k, v in seg.items() if k not in ("start", "end", "text", "text_fr", "text_fr_natural", "id")}
+        base = {k: v for k, v in seg.items() if k not in ("start", "end", "text", "text_fr", "text_fr_natural", "id", "words")}
         a = dict(base, id=seg.get("id"), start=seg["start"], end=cut_t, text=a_en)
         b = dict(base, id=seg.get("id"), start=cut_t, end=seg["end"], text=b_en)
         for key in ("text_fr", "text_fr_natural"):
             if key in seg:
                 a[key] = a_fr
                 b[key] = b_fr
+        seg_words = seg.get("words") or []
+        if seg_words:
+            cum = 0
+            cut_w = len(seg_words)
+            for wi, w in enumerate(seg_words):
+                cum += len((w.get("word") or "").strip()) + 1
+                if cum >= en_share:
+                    cut_w = wi + 1
+                    break
+            a["words"] = seg_words[:cut_w]
+            b["words"] = seg_words[cut_w:]
         out.append(a)
         out.append(b)
         splits += 1
@@ -2225,21 +2255,129 @@ def retime_segments_to_audio(
     return kept
 
 
-def _wrap_subtitle(text: str, max_chars: int = 42) -> str:
-    if len(text) <= max_chars:
-        return text
-    words  = text.split()
-    lines: List[str] = []
-    line:  List[str] = []
-    for word in words:
-        if line and sum(len(w) for w in line) + len(line) - 1 + 1 + len(word) > max_chars:
-            lines.append(" ".join(line))
-            line = [word]
-        else:
-            line.append(word)
-    if line:
-        lines.append(" ".join(line))
-    return "\n".join(lines)
+_PHRASE_HARD_RE = re.compile(r"[.!?…]+(?=\s|$)")
+_PHRASE_SOFT_RE = re.compile(r"[,;:](?=\s)")
+
+
+def _split_french_phrases(text: str, max_chars: int = 38) -> List[str]:
+    text = text.strip()
+    if not text:
+        return []
+    sentences: List[str] = []
+    last = 0
+    for m in _PHRASE_HARD_RE.finditer(text):
+        end = m.end()
+        sentences.append(text[last:end].strip())
+        last = end
+    if last < len(text):
+        sentences.append(text[last:].strip())
+    sentences = [s for s in sentences if s]
+
+    cues: List[str] = []
+    for sent in sentences:
+        if len(sent) <= max_chars:
+            cues.append(sent)
+            continue
+        parts: List[str] = []
+        last = 0
+        for m in _PHRASE_SOFT_RE.finditer(sent):
+            end = m.end()
+            parts.append(sent[last:end].strip())
+            last = end
+        if last < len(sent):
+            parts.append(sent[last:].strip())
+        parts = [p for p in parts if p]
+        buf = ""
+        for p in parts:
+            if not buf:
+                buf = p
+            elif len(buf) + 1 + len(p) <= max_chars:
+                buf = buf + " " + p
+            else:
+                cues.append(buf)
+                buf = p
+        if buf:
+            cues.append(buf)
+
+    final: List[str] = []
+    for cue in cues:
+        if len(cue) <= max_chars:
+            final.append(cue)
+            continue
+        line: List[str] = []
+        cur = 0
+        for w in cue.split():
+            add = (1 if line else 0) + len(w)
+            if cur + add > max_chars and line:
+                final.append(" ".join(line))
+                line = [w]
+                cur = len(w)
+            else:
+                line.append(w)
+                cur += add
+        if line:
+            final.append(" ".join(line))
+    return final
+
+
+def _assign_phrase_times(
+    fr_cues: List[str],
+    seg_start: float,
+    seg_end: float,
+    words_en: Optional[List[dict]],
+) -> List[Tuple[float, float]]:
+    if not fr_cues:
+        return []
+    n = len(fr_cues)
+    total_chars = sum(len(c) for c in fr_cues) or 1
+    seg_dur = max(seg_end - seg_start, 0.1)
+
+    if not words_en:
+        cuts = [seg_start]
+        acc = 0
+        for c in fr_cues[:-1]:
+            acc += len(c)
+            cuts.append(seg_start + (acc / total_chars) * seg_dur)
+        cuts.append(seg_end)
+    else:
+        first_s = words_en[0].get("start")
+        last_e = words_en[-1].get("end")
+        orig_start = float(first_s) if first_s is not None else seg_start
+        orig_end_raw = float(last_e) if last_e is not None else seg_end
+        orig_end = max(orig_end_raw, orig_start + 0.1)
+        orig_dur = orig_end - orig_start
+
+        def _scale(t: float) -> float:
+            frac = (t - orig_start) / orig_dur
+            frac = max(0.0, min(1.0, frac))
+            return seg_start + frac * seg_dur
+
+        en_lens = [len((w.get("word") or "").strip()) for w in words_en]
+        en_total = sum(en_lens) or 1
+
+        cuts = [seg_start]
+        cum_fr = 0
+        for c in fr_cues[:-1]:
+            cum_fr += len(c)
+            target = cum_fr / total_chars
+            cum_en = 0
+            anchor = None
+            for w, wl in zip(words_en, en_lens):
+                cum_en += wl
+                if cum_en / en_total >= target:
+                    we = w.get("end")
+                    anchor = float(we) if we is not None else orig_end
+                    break
+            if anchor is None:
+                anchor = orig_end
+            cuts.append(_scale(anchor))
+        cuts.append(seg_end)
+
+    for i in range(1, len(cuts)):
+        if cuts[i] < cuts[i - 1]:
+            cuts[i] = cuts[i - 1]
+
+    return [(cuts[i], cuts[i + 1]) for i in range(n)]
 
 
 def create_srt(
@@ -2247,56 +2385,91 @@ def create_srt(
     output_path: str,
     log: logging.Logger,
     offset_ms: int = 0,
+    max_chars: int = 38,
+    min_dur: float = 0.5,
 ) -> bool:
-    """Write SRT using merged segment timings directly.
+    """Write SRT as phrase-scale single-line cues with word-anchored timing.
 
-    Pick text from: seg["text_fr"] → seg["text"] (English fallback).
-    Enforces a 1 s minimum entry duration so subtitles don't flash by.
-    Includes a CPS (Characters Per Second) check.
+    Each merged segment is re-split into short French phrase cues at
+    punctuation boundaries. Cue boundaries within a segment are anchored
+    to English word timestamps (preserved from Whisper) by character share.
     """
     try:
         offset_s = offset_ms / 1000.0
-        subs     = pysrt.SubRipFile()
+        subs = pysrt.SubRipFile()
         high_cps_count = 0
-
         global_idx = 1
+
         for seg in segments:
-            full_text = _wrap_subtitle(seg.get("text_fr") or seg["text"])
-            lines     = full_text.split("\n")
-            
-            # Split into 2-line blocks
-            blocks = ["\n".join(lines[i:i+2]) for i in range(0, len(lines), 2)]
-            n_blocks = len(blocks)
-            
+            text = (seg.get("text_fr") or seg.get("text") or "").strip()
+            if not text:
+                continue
+            cues = _split_french_phrases(text, max_chars=max_chars)
+            if not cues:
+                continue
+
             seg_start = max(0.0, seg["start"] + offset_s)
-            seg_end   = max(seg_start + 1.0, seg["end"] + offset_s)
-            seg_dur   = seg_end - seg_start
-            
-            block_dur = seg_dur / n_blocks
-            
-            for b_idx, text in enumerate(blocks):
-                start = seg_start + (b_idx * block_dur)
-                end   = start + block_dur
-                
-                # CPS Check
+            seg_end = max(seg_start + 1.0, seg["end"] + offset_s)
+            words_en = seg.get("words") or []
+            times = _assign_phrase_times(cues, seg_start, seg_end, words_en)
+
+            # Cap merge length so we don't reassemble two-line monsters.
+            merge_char_cap = int(max_chars * 1.3)
+            packed_cues: List[str] = []
+            packed_times: List[Tuple[float, float]] = []
+            i = 0
+            while i < len(cues):
+                cue_text = cues[i]
+                start, end = times[i]
+                while (
+                    end - start < min_dur
+                    and i + 1 < len(cues)
+                    and len(cue_text) + 1 + len(cues[i + 1]) <= merge_char_cap
+                ):
+                    i += 1
+                    cue_text = cue_text + " " + cues[i]
+                    end = times[i][1]
+                packed_cues.append(cue_text)
+                packed_times.append((start, end))
+                i += 1
+            if len(packed_cues) >= 2:
+                last_s, last_e = packed_times[-1]
+                if (
+                    last_e - last_s < min_dur
+                    and len(packed_cues[-2]) + 1 + len(packed_cues[-1]) <= merge_char_cap
+                ):
+                    prev_s, _ = packed_times[-2]
+                    packed_cues[-2] = packed_cues[-2] + " " + packed_cues[-1]
+                    packed_times[-2] = (prev_s, last_e)
+                    packed_cues.pop(); packed_times.pop()
+
+            for cue_text, (start, end) in zip(packed_cues, packed_times):
                 dur = end - start
                 if dur > 0:
-                    cps = len(text) / dur
+                    cps = len(cue_text) / dur
                     if cps > 20:
                         high_cps_count += 1
-                        log.debug(f"  High CPS ({cps:.1f}) at index {global_idx}: '{text[:30]}...'")
-
+                        log.debug(
+                            f"  High CPS ({cps:.1f}) at index {global_idx}: "
+                            f"'{cue_text[:30]}...'"
+                        )
                 subs.append(SubRipItem(
                     index=global_idx,
                     start=SubRipTime(seconds=start),
                     end=SubRipTime(seconds=end),
-                    text=text,
+                    text=cue_text,
                 ))
                 global_idx += 1
+
         subs.save(output_path, encoding="utf-8")
-        log.info(f"✓ SRT: {len(subs)} entries" + (f" (offset {offset_ms:+d} ms)" if offset_ms else ""))
+        log.info(
+            f"✓ SRT: {len(subs)} entries"
+            + (f" (offset {offset_ms:+d} ms)" if offset_ms else "")
+        )
         if high_cps_count > 0:
-            log.warning(f"  {high_cps_count} subtitle(s) exceed 20 CPS (Characters Per Second).")
+            log.warning(
+                f"  {high_cps_count} subtitle(s) exceed 20 CPS (Characters Per Second)."
+            )
         return True
     except Exception as e:
         log.error(f"SRT creation failed: {e}")

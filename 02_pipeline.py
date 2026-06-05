@@ -133,7 +133,7 @@ class PipelineConfig:
     tts_speaker_skip: float = 20.0
 
     # TTS — Coqui XTTS-v2 (Idiap fork)
-    tts_max_stretch: float = 1.25
+    tts_max_stretch: float = 1.2
     tts_min_stretch: float = 0.8
     # Overflow policy when a group's dub can't fit its time window:
     #   "no_drop" → never truncate; extend the timeline (push later groups back)
@@ -1527,6 +1527,28 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
         return None
 
 
+# Budget/length tags the translator is told NOT to emit but sometimes echoes,
+# e.g. "[≤92 chars]", "[2.3s, ≤39 chars]", "(MAX 50 chars)", "[≤ 80 caractères]".
+_BUDGET_BRACKET_RE = re.compile(
+    r"^\s*[\(\[][^\]\)]*(?:≤|<=|chars?|caract[èe]res?)[^\]\)]*[\)\]]\s*",
+    re.IGNORECASE,
+)
+_BUDGET_BARE_RE = re.compile(
+    r"^\s*(?:max\s+)?[≤<]=?\s*\d+\s*(?:chars?|caract[èe]res?)\b[\s:.,\-–—]*",
+    re.IGNORECASE,
+)
+
+
+def _strip_budget_tag(s: str) -> str:
+    """Remove a leaked leading character-budget tag from a translated line."""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _BUDGET_BRACKET_RE.sub("", s)
+        s = _BUDGET_BARE_RE.sub("", s)
+    return s.strip()
+
+
 def _parse_numbered(text: str, count: int) -> List[str]:
     """Parse numbered LLM output. Multi-line aware: content lines that don't
     begin with a "<n>." marker belong to the *previous* numbered item.
@@ -1554,8 +1576,9 @@ def _parse_numbered(text: str, count: int) -> List[str]:
         if not (1 <= idx <= count):
             return
         content = " ".join(s.strip() for s in buf if s.strip())
-        content = re.sub(r"^\(MAX\s+\d+\s+chars?\)\s*", "", content, flags=re.IGNORECASE)
-        content = re.sub(r"^\[\d+(\.\d+)?s\]\s*", "", content)
+        content = _strip_budget_tag(content)                  # leading [≤N chars] / [2.3s, ≤N chars]
+        content = re.sub(r"^\[\d+(\.\d+)?s\]\s*", "", content)  # bare leading [12.3s]
+        content = _strip_budget_tag(content)                  # again if a duration tag preceded it
         content = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", content)
         content = re.sub(r"\s*\[[^\]]*\]\s*$", "", content)
         content = content.strip(" \t\"'")
@@ -3128,6 +3151,21 @@ def process_video(
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "07b_cps_split", log)
+
+    # Defensive sweep: strip any leaked "[≤N chars]" budget tag the LLM may have
+    # echoed, so it never reaches the TTS or the SRT. (Root cause is handled in
+    # _parse_numbered; this guarantees it for every path.)
+    _tag_hits = 0
+    for s in segments:
+        for k in ("text_fr", "text_fr_natural"):
+            v = s.get(k)
+            if v:
+                cleaned = _strip_budget_tag(v)
+                if cleaned != v:
+                    s[k] = cleaned
+                    _tag_hits += 1
+    if _tag_hits:
+        log.warning(f"  Stripped {_tag_hits} leaked character-budget tag(s) from translations")
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")

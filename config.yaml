@@ -81,9 +81,9 @@ whisper:
 
 # ============================================================
 # Translation — Qwen3 via Ollama
-# Single backend, single pass. The pipeline no longer micromanages
-# per-segment character budgets; the audio assembler handles overflow
-# with atempo (≤ tts.max_stretch) and gap-borrowing.
+# Single backend, single natural pass + targeted compression. Overflow is
+# handled downstream by the assembler's timing policy (no_drop) rather than by
+# shrinking translations — see tts.timing_policy / reading_cps below.
 # ============================================================
 translation:
   # Qwen3:14b via Ollama. /no_think is sent automatically for qwen3.* tags.
@@ -101,9 +101,10 @@ translation:
   # eliminates most remaining stretched/truncated audio.
   compression_pass: true
   # Character budget per second of audio that Qwen is asked to fit each
-  # segment into. 17 is roughly the upper bound of naturally speakable
-  # French; raising it gives the LLM more headroom (longer translations,
-  # more speed-ups downstream), lowering it forces tighter phrasing.
+  # segment into. 17 is roughly the upper bound of naturally speakable French
+  # (matches subtitles.max_cps). Raising it gives the LLM more headroom (longer
+  # translations, more timeline extension/slow-down); lowering it forces tighter
+  # phrasing. Keep aligned with subtitles.max_cps and tts.reading_cps.
   budget_cps: 17
 
   # Target language for the dub. Drives the prompt language label.
@@ -170,7 +171,7 @@ tts:
   # falling on a single overflowing segment. Larger values = smoother but
   # may stretch over short natural pauses; smaller = more local. 0 disables
   # grouping (each segment treated independently).
-  group_gap: 0.3
+  group_gap: 0.4
 
   # Time-stretch engine. "rubberband" preserves formants and sounds more
   # natural at moderate ratios; "atempo" is the legacy ffmpeg filter and
@@ -178,8 +179,8 @@ tts:
   stretcher: rubberband
 
   # Merge consecutive Whisper fragments into sentence-scale chunks before TTS.
-  # The v3 sub-second fragments caused robotic prosody AND broken SRT timing;
-  # 15 s chunks give the TTS context and keep subtitles readable.
+  # Sub-second fragments cause robotic prosody and unreadable subtitles;
+  # 2–12 s chunks give the TTS context and keep subtitles readable.
   segment_merge_gap: 1.5
   segment_merge_max_duration: 12.0
   segment_merge_min_duration: 2.0

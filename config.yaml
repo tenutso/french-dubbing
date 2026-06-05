@@ -1,4 +1,4 @@
-# French Dubbing Pipeline v4.0 — Configuration
+# French Dubbing Pipeline v1.0 — Configuration
 # Place at /workspace/config.yaml
 
 # ============================================================
@@ -144,10 +144,25 @@ tts:
   use_deepfilter: true
 
   # Max stretch ratio for groups whose audio overflows their window. Beyond
-  # this ratio the group's tail is truncated with a fade-out instead of
-  # being sped up further (preserves voice quality).
-  max_stretch: 1.3
+  # this ratio the group is handled per `timing_policy` below.
+  # With timing_policy=no_drop this is only a *comfort* speed-up cap (audio is
+  # never cut), so keep it gentle for naturalness.
+  max_stretch: 1.2
   min_stretch: 0.7
+
+  # Overflow policy when a dub run is longer than its time window:
+  #   no_drop → never truncate; extend the timeline so no words are lost
+  #             (output may run slightly longer than the source).
+  #   lock    → keep exact source timing; speed up to max_stretch then
+  #             hard-truncate the overflowing tail (legacy behaviour).
+  timing_policy: no_drop
+
+  # Reading-speed coupling (no_drop only): a speech run whose translated text is
+  # denser than reading_cps chars/sec is slowed toward that pace (audio is never
+  # sped up), so the dub AND the subtitles timed to it read comfortably. The
+  # slow-down is capped at max_slowdown so it never sounds sluggish.
+  reading_cps: 16.0
+  max_slowdown: 1.25
 
   # Grouped tempo smoothing: consecutive segments separated by <= this many
   # seconds of original silence share one uniform stretch ratio, so
@@ -182,6 +197,18 @@ subtitles:
   encoding: utf-8
   # Shift all subtitles N ms (positive = later, negative = earlier).
   sync_offset_ms: 0
+
+  # Subtitle shaping standard:
+  #   netflix → ≤42 chars/line, ≤2 lines, 0.833-7s, reading speed ≤17 CPS
+  #   bbc     → ≤37 chars/line (stricter line length), otherwise similar
+  #   kapwing → legacy karaoke single-line fragments (no reading-speed cap)
+  standard: netflix
+  max_chars_per_line: 42
+  max_lines: 2
+  max_cps: 17.0           # reading-speed cap (chars/second)
+  min_duration: 0.833     # 5/6 s minimum cue duration
+  max_duration: 7.0
+  min_gap: 0.083          # ≥2 frames @24fps between cues
 
 # ============================================================
 # Processing

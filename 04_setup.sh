@@ -1,5 +1,5 @@
 #!/bin/bash
-# French Dubbing Pipeline - Setup v4.0
+# French Dubbing Pipeline - Setup v1.0
 # Target: RunPod pytorch:1.0.2-cu1281-torch280-ubuntu2404
 #         (RTX 4090, PyTorch 2.8.0, CUDA 12.8.1, Ubuntu 24.04)
 #
@@ -28,7 +28,7 @@ log_error()   { echo -e "${RED}[$(ts)] ✗ $1${NC}"        | tee -a "$LOGFILE"; 
 die()         { echo -e "${RED}[$(ts)] FATAL: $1${NC}"    | tee -a "$LOGFILE"; exit 1; }
 
 echo "==========================================" | tee -a "$LOGFILE"
-echo "  French Dubbing Pipeline — Setup v4.0"    | tee -a "$LOGFILE"
+echo "  French Dubbing Pipeline — Setup v1.0"    | tee -a "$LOGFILE"
 echo "  $(date)"                                  | tee -a "$LOGFILE"
 echo "==========================================" | tee -a "$LOGFILE"
 
@@ -286,7 +286,7 @@ else
     log_warn "Ollama not installed — skipping service start"
 fi
 
-# ── Step 12: Pull Qwen2.5:14b ─────────────────────────────────────────────
+# ── Step 12: Pull Qwen3:14b ─────────────────────────────────────────────
 
 pull_with_retry() {
     local model="$1"

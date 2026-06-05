@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-French Dubbing Pipeline v3.0 — System Verification
+French Dubbing Pipeline v1.0 — System Verification
 Run after setup.sh to confirm everything is ready before processing videos.
 """
 
@@ -84,7 +84,7 @@ def pkg(import_name: str) -> Tuple[bool, str]:
 
 def main():
     print(f"\n{BLUE}{'=' * 60}")
-    print("French Dubbing Pipeline v3.0 — System Verification")
+    print("French Dubbing Pipeline v1.0 — System Verification")
     print(f"{'=' * 60}{RESET}\n")
 
     c = Checker()
@@ -130,7 +130,7 @@ def main():
     except ImportError:
         c.check("PyTorch import", False, "torch not installed")
 
-    # ── HuggingFace token (required for gated EuroLLM model) ──────────────────
+    # ── HuggingFace token (required for the gated pyannote model) ─────────────
     print(f"\n{BLUE}HuggingFace Access{RESET}")
     hf_token = os.environ.get("HF_TOKEN", "").strip()
     if not hf_token:
@@ -152,9 +152,9 @@ def main():
     else:
         c.check(
             "HF_TOKEN set", False,
-            "Required for EuroLLM-9B-Instruct (gated model).\n"
-            "  1. Request access: https://huggingface.co/utter-project/EuroLLM-9B-Instruct\n"
-            "  2. Get token:      https://huggingface.co/settings/tokens\n"
+            "Required for the gated pyannote diarization model.\n"
+            "  1. Accept the license: https://huggingface.co/pyannote/speaker-diarization-community-1\n"
+            "  2. Get token:          https://huggingface.co/settings/tokens\n"
             "  3. Re-run setup.sh (it will prompt you) or: export HF_TOKEN=hf_xxx"
         )
 
@@ -235,8 +235,9 @@ def main():
     else:
         c.warn("noisereduce (fallback)", "not installed — deepfilternet will be used")
 
-    # ── Translation — EuroLLM ─────────────────────────────────────────────────
-    print(f"\n{BLUE}Translation (EuroLLM){RESET}")
+    # ── transformers (required by coqui-tts XTTS) ─────────────────────────────
+    print(f"\n{BLUE}transformers (XTTS dependency){RESET}")
+    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
     ok2, ver = pkg("transformers")
     c.check("transformers", ok2, f"v{ver}" if ok2 else ver)
     # coqui-tts requires transformers <5. Warn if a 5.x is installed.
@@ -249,32 +250,6 @@ def main():
                        f"Run: pip install 'transformers<5'")
         except Exception:
             pass
-
-    ok2, ver = pkg("bitsandbytes")
-    if ok2:
-        c.check("bitsandbytes (8-bit quant)", True, f"v{ver}")
-    else:
-        c.warn("bitsandbytes", "not installed — EuroLLM will use bfloat16 (~18 GB VRAM)")
-
-    ok2, ver = pkg("accelerate")
-    if ok2:
-        c.check("accelerate", True, f"v{ver}")
-    else:
-        c.warn("accelerate", "not installed — run: pip install accelerate")
-
-    # Check if EuroLLM model weights are cached
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    eurollm_cached = any(
-        "EuroLLM" in str(p) or "eurollm" in str(p).lower()
-        for p in hf_cache.rglob("*.safetensors") if hf_cache.exists()
-    )
-    if eurollm_cached:
-        c.check("EuroLLM-9B weights cached", True)
-    else:
-        c.warn(
-            "EuroLLM-9B weights",
-            "not cached — will download (~18 GB) on first translation run"
-        )
 
     # ── TTS — Coqui XTTS-v2 (Idiap fork) ─────────────────────────────────────
     print(f"\n{BLUE}TTS — Coqui XTTS-v2 (Idiap fork, French support){RESET}")
@@ -299,31 +274,22 @@ def main():
                "not installed — xtts engine unavailable. "
                "Run: pip install 'transformers<5' 'coqui-tts>=0.27.0'")
 
-    # ── SRT alignment ─────────────────────────────────────────────────────────
-    print(f"\n{BLUE}SRT alignment{RESET}")
-    ok2, ver = pkg("whisperx")
-    if ok2:
-        c.check("whisperx", True, f"v{ver}")
-    else:
-        c.warn("whisperx", "not installed — SRT will use Whisper timestamps. "
-               "Run: pip install whisperx")
-
     # ── System tools ──────────────────────────────────────────────────────────
     print(f"\n{BLUE}System tools{RESET}")
     for tool in ("ffmpeg", "ffprobe", "sox", "curl"):
         ok2, _ = run(f"command -v {tool}")
         c.check(f"tool: {tool}", ok2)
 
-    # ── Ollama (Qwen review pass) ─────────────────────────────────────────────
-    print(f"\n{BLUE}Ollama — Qwen2.5 review pass{RESET}")
+    # ── Ollama (primary translator — Qwen3) ───────────────────────────────────
+    print(f"\n{BLUE}Ollama — Qwen3 translation{RESET}")
     ok2, _ = run("command -v ollama")
     if c.check("Ollama installed", ok2):
         ok3, out = run("curl -s http://localhost:11434/api/tags", timeout=5)
         if c.check("Ollama service running", ok3 and "models" in out.lower()):
             ok4, out = run("ollama list 2>/dev/null")
-            has_qwen = ok4 and "qwen2.5" in out
-            c.check("Qwen2.5 model present", has_qwen,
-                    "run: ollama pull qwen2.5:14b" if not has_qwen else "")
+            has_qwen = ok4 and "qwen3" in out
+            c.check("qwen3 model present", has_qwen,
+                    "run: ollama pull qwen3:14b" if not has_qwen else "")
         else:
             c.warn("Ollama not running",
                    "start: nohup ollama serve > /workspace/logs/ollama.log 2>&1 &")

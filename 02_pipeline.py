@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-French Dubbing Pipeline v4.0 — refined & simplified
+French Dubbing Pipeline v1.0
 
 English video → French audio track + SRT subtitles.
 
@@ -9,11 +9,11 @@ Stack (single, fixed path):
   Transcription     : faster-whisper large-v3   (word timestamps, VAD)
   Segment merging   : sentence-scale chunks     (8–12s, no sub-second fragments)
   Diarization (opt) : pyannote-audio            (per-speaker voice profiles)
-  Translation       : Qwen3:14b via Ollama      (single natural pass)
+  Translation       : Qwen3:14b via Ollama      (natural pass + English-echo guard)
   Speaker denoising : DeepFilterNet             (clean voice reference)
   TTS               : Coqui XTTS-v2 at 24 kHz   (multilingual voice cloning)
-  Assembly          : FFmpeg atempo + crossfade (fit French to original timing)
-  Subtitles         : direct from merged spans  (no WhisperX force-align)
+  Assembly          : Rubber Band stretch       (no_drop: never truncate; reading-pace slow-down)
+  Subtitles         : hybrid BBC/Netflix shaper (≤2 lines, ≤42 cpl, ≤17 CPS)
   Output            : AAC 192 kbps 48 kHz stereo + UTF-8 SRT
 """
 
@@ -135,6 +135,17 @@ class PipelineConfig:
     # TTS — Coqui XTTS-v2 (Idiap fork)
     tts_max_stretch: float = 1.25
     tts_min_stretch: float = 0.8
+    # Overflow policy when a group's dub can't fit its time window:
+    #   "no_drop" → never truncate; extend the timeline (push later groups back)
+    #               so no words are lost. Output may run slightly longer than source.
+    #   "lock"    → keep exact source timing; speed up to max_stretch then
+    #               hard-truncate the overflowing tail (legacy behaviour).
+    timing_policy: str = "no_drop"
+    # Reading-speed coupling (no_drop only): groups whose text is denser than
+    # this many chars/sec are *slowed* (audio never sped up) so the dub — and
+    # the subtitles timed to it — read comfortably. Bounded by tts_max_slowdown.
+    tts_reading_cps: float = 16.0
+    tts_max_slowdown: float = 1.25   # a group may be stretched at most this much longer
     # Grouped tempo smoothing: segments separated by ≤ this many seconds of
     # original silence share a single uniform stretch ratio, so speed-ups/
     # slow-downs are spread across the group instead of hitting one segment.
@@ -170,8 +181,17 @@ class PipelineConfig:
     # Raise to give the LLM more headroom; lower to force tighter phrasing.
     translation_budget_cps: int = 17
 
-    # SRT
+    # SRT — hybrid BBC/Netflix subtitle shaping
     subtitle_offset_ms: int = 0
+    # "netflix" (≤42 cpl, ≤17 cps, 0.833-7s), "bbc" (≤37 cpl), or "kapwing"
+    # (legacy karaoke single-line fragments, no reading-speed cap).
+    subtitle_standard: str = "netflix"
+    subtitle_max_cpl: int = 42
+    subtitle_max_lines: int = 2
+    subtitle_max_cps: float = 17.0
+    subtitle_min_dur: float = 0.833
+    subtitle_max_dur: float = 7.0
+    subtitle_min_gap: float = 0.083
 
     # Sample rates
     synthesis_sample_rate: int = 48000
@@ -265,6 +285,9 @@ def load_config(path: str) -> PipelineConfig:
         tts_min_stretch=tts.get("min_stretch", 0.8),
         tts_group_gap=tts.get("group_gap", 0.4),
         tts_stretcher=tts.get("stretcher", "rubberband"),
+        timing_policy=tts.get("timing_policy", "no_drop"),
+        tts_reading_cps=float(tts.get("reading_cps", 16.0)),
+        tts_max_slowdown=float(tts.get("max_slowdown", 1.25)),
         output_volume_boost_pct=float(aud.get("volume_boost_pct", 0.0)),
         huggingface_token=(
             t.get("huggingface_token", "")
@@ -278,6 +301,13 @@ def load_config(path: str) -> PipelineConfig:
         cps_split_threshold=float(tts.get("cps_split_threshold", 21.0)),
         translation_budget_cps=int(t.get("budget_cps", 17)),
         subtitle_offset_ms=sub.get("sync_offset_ms", 0),
+        subtitle_standard=sub.get("standard", "netflix"),
+        subtitle_max_cpl=int(sub.get("max_chars_per_line", 42)),
+        subtitle_max_lines=int(sub.get("max_lines", 2)),
+        subtitle_max_cps=float(sub.get("max_cps", 17.0)),
+        subtitle_min_dur=float(sub.get("min_duration", 0.833)),
+        subtitle_max_dur=float(sub.get("max_duration", 7.0)),
+        subtitle_min_gap=float(sub.get("min_gap", 0.083)),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
         timeout_seconds=proc.get("timeout_seconds", 7200),
@@ -349,6 +379,17 @@ def load_glossary(path: str, log: logging.Logger) -> "Glossary":
                 for t in (data.get("terms") or [])
                 if t.get("fr_ca")
             ]
+
+        # 'always' section: {find_form: fr_ca_form} — deterministically rewritten
+        # in the output by apply_glossary (find_form may be standard French OR an
+        # English term that leaked through). These enforce must-win FR-CA forms.
+        always_dict = data.get("always") or {}
+        for find_form, fr_ca in always_dict.items():
+            if fr_ca and str(find_form) != str(fr_ca):
+                entries.append(GlossaryEntry(
+                    en="", fr_ca=str(fr_ca), fr_std=str(find_form),
+                    mode="always", category="", note="",
+                ))
 
         formatting_rules   = [str(r) for r in (data.get("formatting_rules")  or [])]
         inclusive_language = [str(r) for r in (data.get("inclusive_language") or [])]
@@ -1380,6 +1421,81 @@ def _verify_translation_quality(segments: List[dict], log: logging.Logger) -> No
         log.warning(f"{unchanged} segment(s) could not be translated — kept in English")
 
 
+# English-only function words used to spot segments the LLM left untranslated
+# (stochastic Qwen failures occasionally echo the source instead of translating;
+# the silent fallback would otherwise dub English with the French voice).
+# English-only tokens (deliberately excluding French homographs like "a", "on",
+# "son", "par", "si", "ou", "des"…) so the ratio is a clean English signal.
+_EN_ECHO_WORDS = {
+    "the", "that", "you", "your", "with", "and", "have", "has", "had", "this",
+    "they", "them", "what", "when", "would", "could", "should", "about", "there",
+    "their", "from", "which", "been", "were", "was", "will", "just", "like",
+    "don't", "i'm", "we're", "it's", "that's", "you're", "going", "really",
+    "because", "something", "people", "into", "to", "of", "is", "are", "it",
+    "we", "he", "she", "want", "get", "got", "do", "did", "does", "can", "not",
+    "but", "all", "out", "who", "how", "then", "here", "more", "much", "two",
+    "know", "think", "said", "where", "why", "well", "his", "her", "our",
+    "these", "those", "very", "over", "after", "before", "while", "yeah",
+}
+
+
+def _looks_untranslated(text: str) -> bool:
+    toks = re.findall(r"[a-zA-Z']+", text.lower())
+    if len(toks) < 4:
+        return False
+    hits = sum(1 for t in toks if t in _EN_ECHO_WORDS)
+    return hits >= 3 and hits / len(toks) >= 0.18
+
+
+def _retranslate_leftover_english(
+    segments: List[dict], model: str, log: logging.Logger,
+    target_lang: str = "fr", locale: str = "fr", glossary_section: str = "",
+) -> List[dict]:
+    """Catch and re-translate any segment the batch pass left in English.
+
+    A line is suspect if it equals its English source or reads as English by the
+    function-word heuristic. Each suspect is re-translated individually with a
+    strict single-line prompt; unrecoverable ones are warned about loudly."""
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    locale_note = (" Use Québécois/Canadian French." if locale == "fr-ca" else "")
+    think = "/no_think\n" if "qwen3" in model.lower() else ""
+    # A segment needs rescue when its OUTPUT still reads as English, or when the
+    # LLM returned the source verbatim AND that source was English to begin with
+    # (don't touch already-French source — some clips are partly in French).
+    def _suspect(s: dict) -> bool:
+        out = s.get("text_fr", "")
+        if _looks_untranslated(out):
+            return True
+        return (out.strip() == s["text"].strip() and _looks_untranslated(s["text"]))
+
+    suspects = [s for s in segments if _suspect(s)]
+    if not suspects:
+        return segments
+    log.info(f"  Re-translating {len(suspects)} segment(s) that came back in English …")
+    fixed = 0
+    for s in suspects:
+        prompt = (
+            f"{think}Translate this single line into natural, spoken {language}."
+            f"{locale_note}\nOutput ONLY the {language} translation — no quotes, "
+            f"no notes.\n\nEnglish: {s['text']}\n{language}:"
+        )
+        out = _ollama_call(prompt, model, 0.2, log)
+        if not out:
+            continue
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+        cand = next((ln.strip().strip('"') for ln in out.splitlines() if ln.strip()), "")
+        if cand and cand != s["text"].strip() and not _looks_untranslated(cand):
+            s["text_fr"] = cand
+            s["text_fr_natural"] = cand
+            fixed += 1
+    still = sum(1 for s in suspects if _looks_untranslated(s.get("text_fr", "")))
+    log.info(f"  ✓ Recovered {fixed}/{len(suspects)} segment(s)")
+    if still:
+        log.warning(f"  {still} segment(s) still not in {language} after retry — "
+                    f"will be dubbed as-is")
+    return segments
+
+
 def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logger) -> Optional[str]:
     # keep_alive=30m pins the model in VRAM between batches.
     try:
@@ -1980,6 +2096,10 @@ def assemble_and_encode(
     group_gap: float = 0.4,
     stretcher: str = "rubberband",
     placements_out: Optional[Dict[int, Tuple[float, float]]] = None,
+    timing_policy: str = "no_drop",
+    seg_text_chars: Optional[Dict[int, int]] = None,
+    read_cps: float = 16.0,
+    max_slowdown: float = 1.25,
 ) -> bool:
     """Place synthesized segments into the timeline with grouped tempo smoothing.
 
@@ -2000,8 +2120,6 @@ def assemble_and_encode(
         f"engine {stretcher}, crossfade {_CROSSFADE_MS:.0f}ms) ..."
     )
 
-    total_samples = int((total_duration + 2) * src_rate)
-    assembled     = np.zeros(total_samples, dtype=np.float32)
     ordered       = [(a, s, e) for (a, s, e) in sorted(synthesized, key=lambda x: x[1]) if len(a) > 0]
 
     if not ordered:
@@ -2014,6 +2132,14 @@ def assemble_and_encode(
     xfade_s          = _CROSSFADE_MS / 1000.0
 
     trimmed = [_trim_silence(a) for a, _, _ in ordered]
+
+    # In no_drop mode the timeline can extend past the source, so size the
+    # buffer for the worst case (everything placed back-to-back after the
+    # source end). In lock mode the legacy bound is enough.
+    no_drop = (timing_policy or "no_drop").lower() == "no_drop"
+    headroom = sum(len(a) for a in trimmed) if no_drop else 0
+    total_samples = int((total_duration + 2) * src_rate) + headroom
+    assembled     = np.zeros(total_samples, dtype=np.float32)
 
     # Build groups: consecutive segments whose original inter-gap <= group_gap.
     groups: List[List[int]] = []
@@ -2031,6 +2157,9 @@ def assemble_and_encode(
     stretched_groups = 0
     truncated_groups = 0
     natural_groups   = 0
+    extended_groups  = 0
+    slowed_groups    = 0
+    write_cursor_s   = 0   # furthest sample written (no_drop: prevents overlap)
 
     for g_i, group in enumerate(groups):
         group_start    = ordered[group[0]][1]
@@ -2048,7 +2177,23 @@ def assemble_and_encode(
         W = max(window_end - group_start, 1e-3)
         A = sum(len(trimmed[idx]) for idx in group) / src_rate
 
-        if A <= W * 1.02:
+        if no_drop:
+            # Never speed up (extend the timeline instead). Additionally, when
+            # the group's TEXT is denser than read_cps, slow the audio toward
+            # the reading pace (bounded by max_slowdown) so the dub — and the
+            # subtitles timed to it — read comfortably. speed ≤ 1.0 always.
+            group_chars = (
+                sum(seg_text_chars.get(round(ordered[idx][1] * 1000), 0) for idx in group)
+                if seg_text_chars else 0
+            )
+            t_read = group_chars / read_cps if (group_chars and read_cps > 0) else 0.0
+            t_target = min(max(A, t_read), A * max_slowdown) if A > 0 else A
+            speed = A / t_target if t_target > 0 else 1.0
+            if speed < 0.995:
+                slowed_groups += 1
+            else:
+                natural_groups += 1
+        elif A <= W * 1.02:
             speed = 1.0
             natural_groups += 1
         else:
@@ -2071,7 +2216,36 @@ def assemble_and_encode(
             a = _apply_fade_out(a, fade_in_samples)
             audios.append(a)
 
-        if speed == 1.0:
+        if no_drop:
+            # Follow the write cursor so an earlier overrun pushes this group
+            # later (timeline extends) instead of overwriting it. When nothing
+            # upstream ran long and the group fits, segments keep their natural
+            # onsets; otherwise they play back-to-back from the cursor.
+            group_floor_s = max(int(group_start * src_rate), write_cursor_s)
+            delayed = group_floor_s > int(group_start * src_rate)
+            if speed == 1.0 and not delayed:
+                for j, idx in enumerate(group):
+                    orig_start = ordered[idx][1]
+                    start_s = max(int(orig_start * src_rate), write_cursor_s)
+                    _equal_power_crossfade(assembled, start_s, audios[j], xfade_samples)
+                    if placements_out is not None:
+                        placements_out[round(orig_start * 1000)] = (
+                            start_s / src_rate, len(audios[j]) / src_rate
+                        )
+                    write_cursor_s = max(write_cursor_s, start_s + len(audios[j]))
+            else:
+                cursor_s = group_floor_s
+                for j, idx in enumerate(group):
+                    a = audios[j]
+                    _equal_power_crossfade(assembled, cursor_s, a, xfade_samples)
+                    if placements_out is not None:
+                        orig_start = ordered[idx][1]
+                        placements_out[round(orig_start * 1000)] = (
+                            cursor_s / src_rate, len(a) / src_rate
+                        )
+                    cursor_s += len(a)
+                write_cursor_s = max(write_cursor_s, cursor_s)
+        elif speed == 1.0:
             for j, idx in enumerate(group):
                 orig_start = ordered[idx][1]
                 start_s = int(orig_start * src_rate)
@@ -2098,7 +2272,14 @@ def assemble_and_encode(
                     )
                 cursor_s += len(a)
 
-    if stretched_groups or truncated_groups:
+    if no_drop:
+        total_out = (write_cursor_s / src_rate) if write_cursor_s else 0.0
+        log.info(
+            f"  Grouped smoothing [no_drop]: {natural_groups} natural, "
+            f"{slowed_groups} slowed for reading (≥ {1/max_slowdown:.2f}x), "
+            f"0 truncated — output {total_out:.1f}s"
+        )
+    elif stretched_groups or truncated_groups:
         log.info(
             f"  Grouped smoothing: {natural_groups} natural, "
             f"{stretched_groups} stretched (<= {max_stretch:.2f}x), "
@@ -2106,6 +2287,12 @@ def assemble_and_encode(
         )
     else:
         log.info(f"  Grouped smoothing: all {natural_groups} groups fit naturally")
+
+    # The no_drop buffer is over-allocated; trim trailing silence so the WAV
+    # ends shortly after the last placed sample.
+    nz = np.nonzero(np.abs(assembled) > 1e-5)[0]
+    if len(nz):
+        assembled = assembled[: min(len(assembled), int(nz[-1] + 0.2 * src_rate))]
 
     peak = np.max(np.abs(assembled))
     if peak > 0:
@@ -2258,6 +2445,168 @@ def retime_segments_to_audio(
 _PHRASE_HARD_RE = re.compile(r"[.!?…]+(?=\s|$)")
 _PHRASE_SOFT_RE = re.compile(r"[,;:](?=\s)")
 
+# French function words that should not be stranded at the end of line 1 of a
+# two-line cue (BBC/Netflix: break at the highest syntactic node, never split a
+# determiner/preposition from what it governs).
+_FR_ORPHANS = {
+    "le", "la", "les", "un", "une", "des", "du", "de", "au", "aux", "et", "ou",
+    "mais", "donc", "car", "ni", "que", "qui", "à", "dans", "sur", "sous", "par",
+    "pour", "avec", "sans", "vers", "chez", "en", "ce", "cette", "ces", "mon",
+    "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses", "notre", "votre", "nos",
+    "vos", "leur", "leurs", "je", "tu", "il", "elle", "on", "nous", "vous", "ils",
+    "elles", "ne", "se", "me", "te", "y", "l", "d", "qu", "n", "s", "c", "j",
+}
+
+
+def _split_into_chunks(text: str, char_cap: int) -> List[str]:
+    """Split French text into cue-sized chunks (≤ char_cap chars each).
+
+    Breaks at sentence boundaries first, then clause punctuation, then on word
+    boundaries as a last resort. Consecutive pieces are greedily packed up to
+    char_cap, and a chunk is closed early at a sentence end so cues align with
+    sentences when they fit."""
+    text = text.strip()
+    if not text:
+        return []
+
+    # 1. hard sentence pieces
+    pieces: List[str] = []
+    last = 0
+    for m in _PHRASE_HARD_RE.finditer(text):
+        pieces.append(text[last:m.end()].strip()); last = m.end()
+    if last < len(text):
+        pieces.append(text[last:].strip())
+    pieces = [p for p in pieces if p]
+
+    # 2. split any over-long piece at clause punctuation, then by words
+    units: List[Tuple[str, bool]] = []   # (text, ends_sentence)
+    for p in pieces:
+        ends_sent = bool(_PHRASE_HARD_RE.search(p[-2:])) or p[-1:] in ".!?…"
+        if len(p) <= char_cap:
+            units.append((p, ends_sent)); continue
+        sub: List[str] = []
+        l2 = 0
+        for m in _PHRASE_SOFT_RE.finditer(p):
+            sub.append(p[l2:m.end()].strip()); l2 = m.end()
+        if l2 < len(p):
+            sub.append(p[l2:].strip())
+        for k, s in enumerate(sub):
+            s = s.strip()
+            if not s:
+                continue
+            last_in_p = (k == len(sub) - 1)
+            if len(s) <= char_cap:
+                units.append((s, ends_sent and last_in_p))
+            else:  # word-level fallback
+                cur = ""
+                for w in s.split():
+                    if cur and len(cur) + 1 + len(w) > char_cap:
+                        units.append((cur, False)); cur = w
+                    else:
+                        cur = f"{cur} {w}".strip()
+                if cur:
+                    units.append((cur, ends_sent and last_in_p))
+
+    # 3. greedily pack units into chunks; close a chunk at a sentence end
+    chunks: List[str] = []
+    buf = ""
+    for u_text, ends_sent in units:
+        if not buf:
+            buf = u_text
+        elif len(buf) + 1 + len(u_text) <= char_cap:
+            buf = f"{buf} {u_text}"
+        else:
+            chunks.append(buf); buf = u_text
+        if ends_sent:
+            chunks.append(buf); buf = ""
+    if buf:
+        chunks.append(buf)
+    return [c for c in chunks if c]
+
+
+def _wrap_two_lines(text: str, max_cpl: int, max_lines: int = 2) -> str:
+    """Wrap a cue into ≤ max_lines balanced lines at a logical break.
+
+    Prefers a break near the middle, after punctuation if available, and avoids
+    leaving a French function word stranded at the end of a line."""
+    text = text.strip()
+    if len(text) <= max_cpl or max_lines <= 1:
+        return text
+    words = text.split()
+    # candidate break points (after word i, 0-based) with the length of line 1
+    best = None
+    cum = 0
+    target = len(text) / 2
+    for i in range(len(words) - 1):
+        cum += len(words[i]) + (1 if i else 0)
+        line1_len = cum
+        line2_len = len(text) - cum - 1
+        if line1_len > max_cpl or line2_len > max_cpl * (max_lines - 1):
+            continue
+        w = words[i].strip(".,;:!?…").lower()
+        penalty = abs(line1_len - target)
+        if w in _FR_ORPHANS:
+            penalty += max_cpl        # discourage breaking after a function word
+        if words[i][-1] in ",;:.!?…":
+            penalty -= max_cpl * 0.5   # reward breaking after punctuation
+        if best is None or penalty < best[0]:
+            best = (penalty, i)
+    if best is None:
+        # No split keeps both lines ≤ max_cpl. Break at the last word boundary
+        # that fits line 1 (accept an over-long line 2 — never split a word).
+        cum, idx = 0, None
+        for k in range(len(words) - 1):
+            cum += len(words[k]) + (1 if k else 0)
+            if cum <= max_cpl:
+                idx = k
+            else:
+                break
+        if idx is None:  # pathological: first word alone exceeds max_cpl
+            return text
+        return " ".join(words[: idx + 1]) + "\n" + " ".join(words[idx + 1:])
+    i = best[1]
+    return " ".join(words[: i + 1]) + "\n" + " ".join(words[i + 1:])
+
+
+def _enforce_subtitle_timing(cues: List[dict], min_dur: float, max_dur: float,
+                             max_cps: float, min_gap: float) -> List[dict]:
+    """Polish cue timings to satisfy reading-speed / duration / gap rules.
+
+    Extends a cue's end into the following silence (never past the next cue) to
+    honour min duration and the reading-speed cap, caps at max_dur, and removes
+    overlaps / sub-frame gaps. Cue starts stay locked to the audio."""
+    n = len(cues)
+    LEAD_IN_MAX = 0.5   # how far a cue may appear before its audio (broadcast lead-in)
+
+    def _need(c):
+        nchars = len(c["text"].replace("\n", " "))
+        return max(min_dur, nchars / max_cps if max_cps > 0 else 0.0)
+
+    # Pass 1 — lead-out: extend each cue's end into the following silence.
+    for i, c in enumerate(cues):
+        next_start = cues[i + 1]["start"] if i + 1 < n else c["end"] + 1e9
+        ceiling = max(c["start"] + 0.1, next_start - min_gap)
+        c["end"] = min(max(c["end"], c["start"] + min(_need(c), max_dur)), ceiling)
+
+    # Pass 2 — lead-in: for cues still under their reading-time need, pull the
+    # start earlier into the preceding silence (bounded, never past prev cue).
+    for i, c in enumerate(cues):
+        if c["end"] - c["start"] >= _need(c):
+            continue
+        prev_end = cues[i - 1]["end"] if i > 0 else 0.0
+        floor = max(prev_end + min_gap, c["start"] - LEAD_IN_MAX)
+        c["start"] = min(c["start"], max(floor, c["end"] - min(_need(c), max_dur)))
+
+    # Pass 3 — cap duration and remove overlaps / sub-gap spacing.
+    for c in cues:
+        if c["end"] - c["start"] > max_dur:
+            c["end"] = c["start"] + max_dur
+    for i in range(n - 1):
+        if cues[i]["end"] > cues[i + 1]["start"] - min_gap:
+            cues[i]["end"] = max(cues[i]["start"] + 0.1,
+                                 cues[i + 1]["start"] - min_gap)
+    return cues
+
 
 def _split_french_phrases(text: str, max_chars: int = 38) -> List[str]:
     text = text.strip()
@@ -2381,6 +2730,97 @@ def _assign_phrase_times(
 
 
 def create_srt(
+    segments: List[dict],
+    output_path: str,
+    log: logging.Logger,
+    offset_ms: int = 0,
+    *,
+    standard: str = "netflix",
+    max_cpl: int = 42,
+    max_lines: int = 2,
+    max_cps: float = 17.0,
+    min_dur: float = 0.833,
+    max_dur: float = 7.0,
+    min_gap: float = 0.083,
+) -> bool:
+    """Write broadcast-grade subtitles (hybrid BBC/Netflix) from the dub segments.
+
+    Each segment's French text is split into cue-sized chunks (≤ max_cpl×max_lines
+    chars) at sentence→clause→word boundaries, timed to the audio via English
+    word anchors, then polished so every cue meets the reading-speed cap, min/max
+    duration and inter-cue gap, and is wrapped onto ≤max_lines logical lines.
+
+    standard="kapwing" falls back to the legacy karaoke single-line behaviour.
+    """
+    if standard == "kapwing":
+        return _create_srt_legacy(segments, output_path, log, offset_ms=offset_ms)
+    try:
+        offset_s = offset_ms / 1000.0
+        char_cap = max_cpl * max_lines
+        raw: List[dict] = []
+        for seg in segments:
+            text = (seg.get("text_fr") or seg.get("text") or "").strip()
+            if not text:
+                continue
+            chunks = _split_into_chunks(text, char_cap)
+            if not chunks:
+                continue
+            seg_start = max(0.0, seg["start"] + offset_s)
+            seg_end = max(seg_start + 0.1, seg["end"] + offset_s)
+            times = _assign_phrase_times(chunks, seg_start, seg_end, seg.get("words") or [])
+            for ctext, (s, e) in zip(chunks, times):
+                raw.append({"text": ctext, "start": s, "end": e})
+
+        raw.sort(key=lambda c: c["start"])
+
+        # Merge a too-short cue into a contiguous neighbour when the combined
+        # text still fits two lines — removes sub-minimum-duration fragments and
+        # the zero-gaps between them.
+        merged: List[dict] = []
+        for c in raw:
+            if merged:
+                prev = merged[-1]
+                gap = c["start"] - prev["end"]
+                combined = len(prev["text"]) + 1 + len(c["text"])
+                too_short = (prev["end"] - prev["start"] < min_dur
+                             or c["end"] - c["start"] < min_dur)
+                if combined <= char_cap and gap < 0.4 and too_short:
+                    prev["text"] = f"{prev['text']} {c['text']}"
+                    prev["end"] = c["end"]
+                    continue
+            merged.append(dict(c))
+        raw = merged
+
+        _enforce_subtitle_timing(raw, min_dur, max_dur, max_cps, min_gap)
+
+        subs = pysrt.SubRipFile()
+        over_cps = 0
+        for idx, c in enumerate(raw, 1):
+            wrapped = _wrap_two_lines(c["text"], max_cpl, max_lines)
+            dur = c["end"] - c["start"]
+            if dur > 0 and len(c["text"].replace("\n", " ")) / dur > max_cps + 0.5:
+                over_cps += 1
+            subs.append(SubRipItem(
+                index=idx,
+                start=SubRipTime(seconds=c["start"]),
+                end=SubRipTime(seconds=c["end"]),
+                text=wrapped,
+            ))
+        subs.save(output_path, encoding="utf-8")
+        log.info(
+            f"✓ SRT: {len(subs)} entries [{standard}, ≤{max_cpl}cpl/{max_lines}ln, "
+            f"≤{max_cps:.0f}cps]" + (f" (offset {offset_ms:+d} ms)" if offset_ms else "")
+        )
+        if over_cps:
+            log.warning(f"  {over_cps} cue(s) still exceed {max_cps:.0f} CPS "
+                        f"(speaker speech too dense to slow within timing).")
+        return True
+    except Exception as e:
+        log.error(f"SRT creation failed: {e}")
+        return False
+
+
+def _create_srt_legacy(
     segments: List[dict],
     output_path: str,
     log: logging.Logger,
@@ -2510,7 +2950,7 @@ def process_video(
         log.info(f"SKIP {name} — outputs exist (use --force to reprocess)")
         return True
 
-    log.info(f"\n{'=' * 60}\nPipeline v4.0: {name}\n{'=' * 60}")
+    log.info(f"\n{'=' * 60}\nPipeline v1.0: {name}\n{'=' * 60}")
 
     # Ollama required for translation.
     if not check_ollama(config.translation_model, log):
@@ -2635,6 +3075,11 @@ def process_video(
         budget_cps=config.translation_budget_cps,
     )
     _verify_translation_quality(segments, log)
+    segments = _retranslate_leftover_english(
+        segments, config.translation_model, log,
+        target_lang=config.target_lang, locale=config.locale,
+        glossary_section=glossary_section,
+    )
 
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "05_translated", log)
@@ -2736,6 +3181,10 @@ def process_video(
     interim_wav = os.path.join(temp_dir, f"{name}_french.wav")
 
     placements: Dict[int, Tuple[float, float]] = {}
+    seg_text_chars = {
+        round(s["start"] * 1000): len((s.get("text_fr") or "").replace("\n", " "))
+        for s in segments
+    }
     if not assemble_and_encode(
         synthesized,
         total_duration,
@@ -2751,6 +3200,10 @@ def process_video(
         group_gap=config.tts_group_gap,
         stretcher=config.tts_stretcher,
         placements_out=placements,
+        timing_policy=config.timing_policy,
+        seg_text_chars=seg_text_chars,
+        read_cps=config.tts_reading_cps,
+        max_slowdown=config.tts_max_slowdown,
     ):
         return False
 
@@ -2770,7 +3223,17 @@ def process_video(
     if config.keep_temp:
         _dump_segments(srt_segments, temp_dir, "08_retimed", log)
 
-    create_srt(srt_segments, final_srt, log, offset_ms=config.subtitle_offset_ms)
+    create_srt(
+        srt_segments, final_srt, log,
+        offset_ms=config.subtitle_offset_ms,
+        standard=config.subtitle_standard,
+        max_cpl=config.subtitle_max_cpl,
+        max_lines=config.subtitle_max_lines,
+        max_cps=config.subtitle_max_cps,
+        min_dur=config.subtitle_min_dur,
+        max_dur=config.subtitle_max_dur,
+        min_gap=config.subtitle_min_gap,
+    )
 
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")

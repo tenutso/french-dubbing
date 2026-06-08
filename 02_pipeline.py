@@ -133,17 +133,23 @@ class PipelineConfig:
     tts_speaker_skip: float = 20.0
 
     # TTS — Coqui XTTS-v2 (Idiap fork)
-    tts_max_stretch: float = 1.2
+    # In "anchored" mode tts_max_stretch is the per-group *speed-up* cap used to
+    # keep the dub inside the source timeline (1.30 ≈ inaudible on speech).
+    tts_max_stretch: float = 1.3
     tts_min_stretch: float = 0.8
-    # Overflow policy when a group's dub can't fit its time window:
-    #   "no_drop" → never truncate; extend the timeline (push later groups back)
-    #               so no words are lost. Output may run slightly longer than source.
-    #   "lock"    → keep exact source timing; speed up to max_stretch then
-    #               hard-truncate the overflowing tail (legacy behaviour).
-    timing_policy: str = "no_drop"
-    # Reading-speed coupling (no_drop only): groups whose text is denser than
-    # this many chars/sec are *slowed* (audio never sped up) so the dub — and
-    # the subtitles timed to it — read comfortably. Bounded by tts_max_slowdown.
+    # Timing policy when a group's dub can't fit its time window:
+    #   "anchored" → hold the source timeline: speed dense groups up (≤ max_stretch)
+    #                and re-anchor drift at each pause, so audio length ≈ source.
+    #                Slows a group only when it already fits and has spare room.
+    #   "no_drop"  → never speed up; extend the timeline (push later groups back).
+    #                No words lost, but output runs progressively longer than source.
+    #   "lock"     → keep exact source timing; speed up to max_stretch then
+    #                hard-truncate the overflowing tail (legacy behaviour).
+    timing_policy: str = "anchored"
+    # Reading-speed coupling: groups whose text is denser than this many chars/sec
+    # are *slowed* toward this pace so the dub — and the subtitles timed to it —
+    # read comfortably. In "anchored" mode the slow-down is capped by the window
+    # edge (never pushes past the slot); bounded by tts_max_slowdown.
     tts_reading_cps: float = 16.0
     tts_max_slowdown: float = 1.25   # a group may be stretched at most this much longer
     # Grouped tempo smoothing: segments separated by ≤ this many seconds of
@@ -178,8 +184,12 @@ class PipelineConfig:
     # at a sentence boundary before TTS. 0 disables the split pass.
     cps_split_threshold: float = 21.0
     # Character budget per second handed to Qwen as a per-segment limit.
-    # Raise to give the LLM more headroom; lower to force tighter phrasing.
-    translation_budget_cps: int = 17
+    # Raise to give the LLM more headroom; lower to force tighter phrasing
+    # (tighter = less French expansion = better sync against the fixed timeline).
+    translation_budget_cps: int = 15
+    # Max iterative compression rounds for segments still over budget. Each round
+    # re-prompts only the remaining offenders against their latest text.
+    translation_compression_rounds: int = 3
 
     # SRT — hybrid BBC/Netflix subtitle shaping
     subtitle_offset_ms: int = 0
@@ -196,6 +206,12 @@ class PipelineConfig:
     # Sample rates
     synthesis_sample_rate: int = 48000
     output_sample_rate: int = 48000
+
+    # Final muxed video — original video stream + dubbed audio (+ subtitles),
+    # so sync is verifiable in a single file. Held to the source video length.
+    mux_video: bool = True
+    burn_subs: bool = False   # True = burn subtitles into the picture (re-encode);
+                              # False = soft-embed the SRT track (mov_text, copy video).
 
     timeout_seconds: int = 7200
 
@@ -245,6 +261,7 @@ def load_config(path: str) -> PipelineConfig:
     sep  = c.get("source_separation", {})
     sub  = c.get("subtitles", {})
     dia  = c.get("diarization", {})
+    out  = c.get("output", {})
     return PipelineConfig(
         input_folder=p.get("input_folder", "/workspace/videos/input"),
         output_folder=p.get("output_folder", "/workspace/outputs"),
@@ -281,11 +298,11 @@ def load_config(path: str) -> PipelineConfig:
         xtts_repetition_penalty=tts.get("xtts_repetition_penalty", 2.0),
         xtts_top_k=tts.get("xtts_top_k", 50),
         xtts_top_p=tts.get("xtts_top_p", 0.85),
-        tts_max_stretch=tts.get("max_stretch", 1.25),
+        tts_max_stretch=tts.get("max_stretch", 1.3),
         tts_min_stretch=tts.get("min_stretch", 0.8),
         tts_group_gap=tts.get("group_gap", 0.4),
         tts_stretcher=tts.get("stretcher", "rubberband"),
-        timing_policy=tts.get("timing_policy", "no_drop"),
+        timing_policy=tts.get("timing_policy", "anchored"),
         tts_reading_cps=float(tts.get("reading_cps", 16.0)),
         tts_max_slowdown=float(tts.get("max_slowdown", 1.25)),
         output_volume_boost_pct=float(aud.get("volume_boost_pct", 0.0)),
@@ -299,7 +316,8 @@ def load_config(path: str) -> PipelineConfig:
         segment_merge_max_duration=tts.get("segment_merge_max_duration", 12.0),
         segment_merge_min_duration=tts.get("segment_merge_min_duration", 2.0),
         cps_split_threshold=float(tts.get("cps_split_threshold", 21.0)),
-        translation_budget_cps=int(t.get("budget_cps", 17)),
+        translation_budget_cps=int(t.get("budget_cps", 15)),
+        translation_compression_rounds=int(t.get("compression_rounds", 3)),
         subtitle_offset_ms=sub.get("sync_offset_ms", 0),
         subtitle_standard=sub.get("standard", "netflix"),
         subtitle_max_cpl=int(sub.get("max_chars_per_line", 42)),
@@ -310,6 +328,8 @@ def load_config(path: str) -> PipelineConfig:
         subtitle_min_gap=float(sub.get("min_gap", 0.083)),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
+        mux_video=bool(out.get("mux_video", True)),
+        burn_subs=bool(out.get("burn_subs", False)),
         timeout_seconds=proc.get("timeout_seconds", 7200),
         keep_temp=bool(proc.get("keep_temp", False)),
     )
@@ -1300,17 +1320,21 @@ def compress_overflowing_translations(
     budget_cps: int = 17,
     target_lang: str = "fr",
     margin: float = 1.05,
+    rounds: int = 3,
 ) -> List[dict]:
-    """Second Qwen pass that only touches segments still over budget.
+    """Iterative Qwen pass that only touches segments still over budget.
 
     After the main translation, some segments will still exceed the per-segment
     character budget (info-dense English that resists compression in one shot).
-    This pass batches the offenders and re-prompts Qwen with a tighter brief.
-    Compressions that *still* overshoot the budget are kept anyway (better
-    than the original) but logged so they can be inspected.
+    Each round batches the *remaining* offenders and re-prompts Qwen with a
+    tighter brief, compressing against the latest text, so a segment that needs
+    several passes to fit gets them. The loop stops early once every segment
+    fits or a whole round makes no further progress. Compressions that still
+    overshoot are kept iff strictly shorter (better than the original).
 
     margin: a small relaxation factor on the budget. Default 1.05 means
     "rewrite if FR is >5% over budget" — leaves a buffer for natural variance.
+    rounds: maximum number of compression passes (length-aware iteration).
     """
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
@@ -1319,64 +1343,78 @@ def compress_overflowing_translations(
         dur = max(seg["end"] - seg["start"], 0.5)
         return max(40, int(dur * budget_cps))
 
-    offenders: List[Tuple[int, int]] = []  # (index in segments, budget)
-    for idx, s in enumerate(segments):
-        fr = s.get("text_fr") or ""
-        if not fr:
-            continue
-        b = _budget(s)
-        if len(fr) > int(b * margin):
-            offenders.append((idx, b))
-    if not offenders:
-        log.debug("✓ Compression pass: no segments over budget")
-        return segments
-
-    log.info(
-        f"Compression pass: {len(offenders)} segment(s) over budget — "
-        f"re-prompting (budget={budget_cps} CPS, margin {int((margin-1)*100)}%)"
-    )
-
     out = [dict(s) for s in segments]
-    # One batch — these are typically a small minority of total segments.
     BATCH = 15
-    for batch_start in range(0, len(offenders), BATCH):
-        chunk = offenders[batch_start:batch_start + BATCH]
-        numbered = "\n".join(
-            f"{i + 1}. [≤{b} chars] {segments[idx].get('text_fr','')}"
-            for i, (idx, b) in enumerate(chunk)
-        )
-        prompt = think_prefix + _COMPRESS_PROMPT.format(language=language, segments=numbered)
-        response = _ollama_call(prompt, model, temperature, log)
-        if not response:
-            continue
-        rewrites = _parse_numbered(response, len(chunk))
-        applied = 0
-        still_over = 0
-        for i, (idx, b) in enumerate(chunk):
-            new = (rewrites[i] or "").strip()
-            old = segments[idx].get("text_fr", "")
-            if not new:
+
+    for rnd in range(1, max(1, rounds) + 1):
+        # Recompute offenders from the *current* text so converged segments drop
+        # out and stubborn ones get another, tighter attempt.
+        offenders: List[Tuple[int, int]] = []  # (index, budget)
+        for idx, s in enumerate(out):
+            fr = s.get("text_fr") or ""
+            if not fr:
                 continue
-            # Accept only if strictly shorter than the original — avoids the
-            # LLM "rewriting" into longer prose, which has happened on noisy
-            # inputs. If it's still over budget, keep it anyway iff it's at
-            # least 10% shorter than the original.
-            if len(new) < len(old) and len(new) <= int(b * margin):
-                out[idx]["text_fr"] = new
-                if "text_fr_natural" in out[idx]:
-                    out[idx]["text_fr_natural"] = new
-                applied += 1
-            elif len(new) < int(len(old) * 0.9):
-                out[idx]["text_fr"] = new
-                if "text_fr_natural" in out[idx]:
-                    out[idx]["text_fr_natural"] = new
-                applied += 1
-                still_over += 1
-            # else: leave original — the rewrite didn't help
+            b = _budget(s)
+            if len(fr) > int(b * margin):
+                offenders.append((idx, b))
+        if not offenders:
+            if rnd == 1:
+                log.debug("✓ Compression pass: no segments over budget")
+            else:
+                log.info(f"✓ Compression converged after {rnd - 1} round(s)")
+            break
+
         log.info(
-            f"  compressed {applied}/{len(chunk)} segment(s) "
-            f"({still_over} still above budget but shorter)"
+            f"Compression round {rnd}/{rounds}: {len(offenders)} segment(s) over "
+            f"budget — re-prompting (budget={budget_cps} CPS, margin {int((margin-1)*100)}%)"
         )
+
+        round_applied = 0
+        for batch_start in range(0, len(offenders), BATCH):
+            chunk = offenders[batch_start:batch_start + BATCH]
+            numbered = "\n".join(
+                f"{i + 1}. [≤{b} chars] {out[idx].get('text_fr','')}"
+                for i, (idx, b) in enumerate(chunk)
+            )
+            prompt = think_prefix + _COMPRESS_PROMPT.format(language=language, segments=numbered)
+            response = _ollama_call(prompt, model, temperature, log)
+            if not response:
+                continue
+            rewrites = _parse_numbered(response, len(chunk))
+            applied = 0
+            still_over = 0
+            for i, (idx, b) in enumerate(chunk):
+                new = (rewrites[i] or "").strip()
+                old = out[idx].get("text_fr", "")
+                if not new:
+                    continue
+                # Accept only if strictly shorter than the current text — avoids
+                # the LLM "rewriting" into longer prose, which has happened on
+                # noisy inputs. If it's still over budget, keep it anyway iff
+                # it's at least 10% shorter than the current text.
+                if len(new) < len(old) and len(new) <= int(b * margin):
+                    out[idx]["text_fr"] = new
+                    if "text_fr_natural" in out[idx]:
+                        out[idx]["text_fr_natural"] = new
+                    applied += 1
+                elif len(new) < int(len(old) * 0.9):
+                    out[idx]["text_fr"] = new
+                    if "text_fr_natural" in out[idx]:
+                        out[idx]["text_fr_natural"] = new
+                    applied += 1
+                    still_over += 1
+                # else: leave current — the rewrite didn't help
+            round_applied += applied
+            log.info(
+                f"  round {rnd}: compressed {applied}/{len(chunk)} segment(s) "
+                f"({still_over} still above budget but shorter)"
+            )
+
+        # A whole round that changed nothing won't improve on the next — stop.
+        if round_applied == 0:
+            log.info(f"  round {rnd}: no further compression possible — stopping")
+            break
+
     return out
 
 
@@ -2159,7 +2197,13 @@ def assemble_and_encode(
     # In no_drop mode the timeline can extend past the source, so size the
     # buffer for the worst case (everything placed back-to-back after the
     # source end). In lock mode the legacy bound is enough.
-    no_drop = (timing_policy or "no_drop").lower() == "no_drop"
+    policy   = (timing_policy or "anchored").lower()
+    anchored = policy == "anchored"
+    # Both "anchored" and "no_drop" use cursor-following placement (never
+    # truncate); they differ only in how per-group speed is computed below.
+    # "anchored" speeds dense groups up (capped at max_stretch) to hold the
+    # source timeline; "no_drop" only ever slows, so its timeline can grow.
+    no_drop  = policy in ("anchored", "no_drop")
     headroom = sum(len(a) for a in trimmed) if no_drop else 0
     total_samples = int((total_duration + 2) * src_rate) + headroom
     assembled     = np.zeros(total_samples, dtype=np.float32)
@@ -2200,15 +2244,39 @@ def assemble_and_encode(
         W = max(window_end - group_start, 1e-3)
         A = sum(len(trimmed[idx]) for idx in group) / src_rate
 
-        if no_drop:
+        group_chars = (
+            sum(seg_text_chars.get(round(ordered[idx][1] * 1000), 0) for idx in group)
+            if seg_text_chars else 0
+        )
+        if anchored:
+            # Hold the source timeline: fit each group into its window W with
+            # *bidirectional* stretch. Dense groups are sped up (capped at
+            # max_stretch) instead of extending the timeline — this is what
+            # stops drift accumulating across a long talk. A group is only
+            # *slowed* when it already fits AND there is spare room, so the
+            # subtitle reads at ≤ read_cps; the slow-down is bounded by the
+            # window edge (W) and max_slowdown so it can never push past its slot.
+            if A <= W * 1.02:
+                t_read = group_chars / read_cps if (group_chars and read_cps > 0) else 0.0
+                t_target = min(max(A, t_read), W, A * max_slowdown) if A > 0 else A
+                speed = A / t_target if t_target > 0 else 1.0
+                if speed < 0.995:
+                    slowed_groups += 1
+                else:
+                    natural_groups += 1
+            else:
+                ideal_speed = A / W
+                speed = min(ideal_speed, max_stretch)
+                stretched_groups += 1
+                if ideal_speed > max_stretch:
+                    # Can't fully fit even at the cap; the small residual
+                    # overrun is absorbed by re-anchoring at the next silence.
+                    extended_groups += 1
+        elif no_drop:
             # Never speed up (extend the timeline instead). Additionally, when
             # the group's TEXT is denser than read_cps, slow the audio toward
             # the reading pace (bounded by max_slowdown) so the dub — and the
             # subtitles timed to it — read comfortably. speed ≤ 1.0 always.
-            group_chars = (
-                sum(seg_text_chars.get(round(ordered[idx][1] * 1000), 0) for idx in group)
-                if seg_text_chars else 0
-            )
             t_read = group_chars / read_cps if (group_chars and read_cps > 0) else 0.0
             t_target = min(max(A, t_read), A * max_slowdown) if A > 0 else A
             speed = A / t_target if t_target > 0 else 1.0
@@ -2260,13 +2328,20 @@ def assemble_and_encode(
                 cursor_s = group_floor_s
                 for j, idx in enumerate(group):
                     a = audios[j]
-                    _equal_power_crossfade(assembled, cursor_s, a, xfade_samples)
+                    orig_start = ordered[idx][1]
+                    # Isochrony: never start a line before its original onset.
+                    # If the dub is running ahead (its French compressed shorter
+                    # than the source run), wait for the real onset — a natural
+                    # pause — instead of racing ahead of the picture. If it is
+                    # running behind, play back-to-back from the cursor to catch
+                    # up. This keeps every line anchored to the speaker on screen.
+                    place_s = max(cursor_s, int(orig_start * src_rate))
+                    _equal_power_crossfade(assembled, place_s, a, xfade_samples)
                     if placements_out is not None:
-                        orig_start = ordered[idx][1]
                         placements_out[round(orig_start * 1000)] = (
-                            cursor_s / src_rate, len(a) / src_rate
+                            place_s / src_rate, len(a) / src_rate
                         )
-                    cursor_s += len(a)
+                    cursor_s = place_s + len(a)
                 write_cursor_s = max(write_cursor_s, cursor_s)
         elif speed == 1.0:
             for j, idx in enumerate(group):
@@ -2295,7 +2370,16 @@ def assemble_and_encode(
                     )
                 cursor_s += len(a)
 
-    if no_drop:
+    if anchored:
+        total_out = (write_cursor_s / src_rate) if write_cursor_s else 0.0
+        drift = total_out - total_duration
+        log.info(
+            f"  Grouped smoothing [anchored]: {natural_groups} natural, "
+            f"{slowed_groups} slowed, {stretched_groups} sped up "
+            f"(≤ {max_stretch:.2f}x), {extended_groups} over-cap — output "
+            f"{total_out:.1f}s vs source {total_duration:.1f}s (drift {drift:+.1f}s)"
+        )
+    elif no_drop:
         total_out = (write_cursor_s / src_rate) if write_cursor_s else 0.0
         log.info(
             f"  Grouped smoothing [no_drop]: {natural_groups} natural, "
@@ -2392,6 +2476,61 @@ def remix_with_background(
         return True
     except Exception as e:
         log.error(f"Background re-mix failed: {e}")
+        return False
+
+
+def mux_final_video(
+    video_path: str,
+    audio_path: str,
+    srt_path: str,
+    output_path: str,
+    log: logging.Logger,
+    burn_subs: bool = False,
+) -> bool:
+    """Mux the original video stream with the dubbed audio (+ subtitles).
+
+    The dubbed audio is now held to the source length (anchored timing), so
+    ``-shortest`` only trims the sub-second epsilon. With ``burn_subs`` the SRT
+    is rendered into the picture (video is re-encoded); otherwise it is
+    soft-embedded as a selectable ``mov_text`` track and the video is copied.
+    """
+    if burn_subs:
+        # Escape the SRT path for the subtitles filter (\, :, ' are special).
+        esc = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", audio_path,
+            "-vf", f"subtitles='{esc}'",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k", "-shortest", output_path,
+        ]
+    else:
+        # No -shortest here: a soft subtitle track whose last cue ends before the
+        # video (trailing no-speech footage) would otherwise truncate the video.
+        # The source video length stays authoritative; the dubbed audio is already
+        # held to ~that length by the anchored timing policy.
+        cmd = [
+            "ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-i", srt_path,
+            "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-c:s", "mov_text", "-metadata:s:s:0", "language=fra",
+            output_path,
+        ]
+    mode = "burned-in" if burn_subs else "soft"
+    log.info(f"Muxing final video ({mode} subtitles) …")
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=1800)
+        log.info(
+            f"✓ Final video: {Path(output_path).name} "
+            f"({os.path.getsize(output_path) / 1e6:.1f} MB)"
+        )
+        return True
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", "ignore")[-500:]
+        log.error(f"Final video mux failed: {err}")
+        return False
+    except Exception as e:
+        log.error(f"Final video mux failed: {e}")
         return False
 
 
@@ -3132,6 +3271,7 @@ def process_video(
             log,
             budget_cps=config.translation_budget_cps,
             target_lang=config.target_lang,
+            rounds=config.translation_compression_rounds,
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06b_compressed", log)
@@ -3245,6 +3385,7 @@ def process_video(
     ):
         return False
 
+    mux_audio = final_aac   # voice-only by default; full mix preferred when made
     if config.preserve_background and no_vocals_wav and os.path.exists(no_vocals_wav):
         remixed_aac = os.path.join(output_dir, f"{name}_french_full.m4a")
         if remix_with_background(
@@ -3252,6 +3393,7 @@ def process_video(
             volume_boost_pct=config.output_volume_boost_pct,
         ):
             log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
+            mux_audio = remixed_aac
 
     srt_segments = retime_segments_to_audio(
         segments, synthesized, actual_sr, total_duration, log,
@@ -3273,6 +3415,15 @@ def process_video(
         min_gap=config.subtitle_min_gap,
     )
 
+    final_mp4: Optional[str] = None
+    if config.mux_video:
+        candidate = os.path.join(output_dir, f"{name}_french.mp4")
+        if mux_final_video(
+            video_path, mux_audio, final_srt, candidate, log,
+            burn_subs=config.burn_subs,
+        ):
+            final_mp4 = candidate
+
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
     else:
@@ -3282,6 +3433,8 @@ def process_video(
     log.info(f"DONE: {name}")
     log.info(f"  Audio : {final_aac}")
     log.info(f"  Subs  : {final_srt}")
+    if final_mp4:
+        log.info(f"  Video : {final_mp4}")
     log.info(f"{'=' * 60}\n")
     return True
 

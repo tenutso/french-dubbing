@@ -26,8 +26,9 @@ MP4
  │
  ├─▶ 7. TTS                      Coqui XTTS-v2 zero-shot cloning (24 kHz)
  │
- └─▶ 8. Assembly + subtitles     timeline placement (no_drop), Rubber Band stretch,
-          background re-mix, hybrid BBC/Netflix SRT  →  _french.m4a / _full.m4a / .srt
+ └─▶ 8. Assembly + subtitles     timeline placement (anchored), Rubber Band stretch,
+          background re-mix, hybrid BBC/Netflix SRT, optional video mux
+            →  _french.m4a / _full.m4a / .srt / _french.mp4
 ```
 
 ---
@@ -82,7 +83,8 @@ A single natural pass over the merged segments, called over Ollama's HTTP API in
   (English‑looking output from an English source) are re‑translated individually with a strict
   prompt. Bilingual source clips (already‑French segments) are left untouched.
 - **Compression pass**: only the segments still over `budget_cps` are re‑prompted to tighten
-  phrasing — cheap, and it eliminates most stretched audio downstream.
+  phrasing, iterated up to `compression_rounds` times (re‑compressing against the latest text
+  until they fit) — cheap, and it keeps the French short enough to stay in sync downstream.
 - **Always‑substitute glossary** (`apply_glossary`): deterministic, post‑translation rewrite of
   must‑win Québécois forms (`always:` section), gender‑ and elision‑aware
   (e.g. *le week‑end → la fin de semaine*, *la newsletter → l'infolettre*).
@@ -112,11 +114,24 @@ one stretch ratio so speed changes are spread across a run, not dumped on one se
 
 **Timing policy (`tts.timing_policy`):**
 
-- `no_drop` (default) — audio is **never sped up or truncated**. Dense runs whose translated
-  text exceeds `tts.reading_cps` are *slowed* toward that pace (capped at `tts.max_slowdown`),
-  and if a run still overruns its slot the timeline simply **extends**, pushing later groups
-  back. Nothing is ever cut; output may run slightly longer than the source.
+- `anchored` (default) — **holds the source timeline** so the dub stays in sync over a
+  full‑length program. Each group is fit into its slot bidirectionally: dense runs are sped up
+  (capped at `tts.max_stretch`, ~1.30×) instead of extending the timeline, and any small residual
+  overrun is **re‑anchored** to the original timeline at the next pause, so drift can't accumulate.
+  Crucially, **every line is floored at its own original onset** (isochrony): if the French for a
+  run is shorter than the source speech, the dub waits for each line's real onset (a natural pause)
+  rather than racing ahead of the picture — so a line can lag briefly in a dense burst and catch up,
+  but **never leads** the speaker on screen. A group is only *slowed* toward `tts.reading_cps` when
+  it already fits and has spare room in the slot (never past the slot edge). Best paired with a tight
+  `translation.budget_cps`. The assembly log reports `output Xs vs source Ys (drift ±Zs)`.
+- `no_drop` — audio is **never sped up**: dense runs are only slowed, and overruns **extend** the
+  timeline, pushing later groups back. Nothing is cut, but on a dense long talk the output drifts
+  progressively longer than the source (the original cause of end‑of‑video desync).
 - `lock` — legacy exact‑timing mode: speed up to `max_stretch`, then truncate the overflow tail.
+
+Length‑aware translation is the upstream half of staying in sync: `compress_overflowing_translations`
+re‑prompts only the segments still over `translation.budget_cps`, iterating up to
+`translation.compression_rounds` times, so the French is short enough to fit before assembly even runs.
 
 **Subtitles (`subtitles.standard`)** are shaped to broadcast convention by `create_srt`:
 text is split into cue‑sized chunks at sentence → clause → word boundaries, timed to the audio
@@ -127,8 +142,11 @@ gap rules. Lines wrap at logical points (never mid‑word, never stranding an ar
 
 **Output:** peak‑normalised AAC 192 kbps / 48 kHz stereo — `_french.m4a` (dub only) and, when
 the background was preserved, `_french_full.m4a` (dub side‑chain‑ducked over the original bed) —
-plus the UTF‑8 `.srt`. Subtitle timings follow the actual audio placement, so they stay in sync
-even after slowdown/extension.
+plus the UTF‑8 `.srt`. Subtitle timings follow the actual audio placement (`placements`), so they
+stay in sync even after speed‑up/slowdown. When `output.mux_video` is set, `mux_final_video` also
+produces `_french.mp4` — the original video stream (copied) with the dubbed audio and subtitles
+(soft `mov_text` track by default, or burned in with `output.burn_subs`) — for one‑file sync
+verification; because the dub is held to the source length, the streams end together.
 
 ---
 
@@ -147,5 +165,6 @@ translation models (e.g. `gemma3:27b`, ~17 GB) also fit but leave less headroom.
 | Translation + guards | `translate_segments_qwen`, `_retranslate_leftover_english`, `compress_overflowing_translations`, `apply_glossary` |
 | Diarization / profiles | `diarize_audio`, `assign_speakers`, `build_speaker_profiles` |
 | TTS | `synthesize_all_segments` |
-| Timeline / no_drop / slowdown | `assemble_and_encode` |
+| Timeline / anchored / drift re‑anchoring | `assemble_and_encode` |
+| Video mux | `mux_final_video` |
 | Subtitles | `create_srt`, `_split_into_chunks`, `_wrap_two_lines`, `_enforce_subtitle_timing` |

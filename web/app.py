@@ -92,11 +92,13 @@ CONFIG_SCHEMA: dict = {
     "translation.batch_size":          ("int",   "Batch size",              "Segments per Ollama call. Big batches risk 4096-token budget.", {"min": 1, "max": 60, "step": 1, "group": "Translation"}),
     "translation.review_pass":         ("bool",  "Self-review pass",        "Qwen rereads and fixes Anglicisms. Roughly doubles translation time.", {"group": "Translation"}),
     "translation.compression_pass":    ("bool",  "Compression fallback",    "Targeted second Qwen pass that only rewrites segments still over budget after the main translation. Cheap and eliminates most remaining speed-ups.", {"group": "Translation"}),
-    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to Qwen. ~17 is naturally speakable French; raise for more headroom, lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
+    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to Qwen. ~15 keeps French tight enough to fit the source timeline; raise for more headroom (reintroduces drift), lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
+    "translation.compression_rounds":  ("int",   "Compression rounds",      "Max iterative passes that re-compress only the segments still over budget. More rounds = tighter timing fit, slightly more LLM calls.", {"min": 1, "max": 6, "step": 1, "group": "Translation"}),
     "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
     "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
 
     # TTS
+    "tts.timing_policy":               ("str",   "Timing policy",           "anchored holds the source timeline (speed dense runs up, re-anchor drift at pauses) so the dub stays in sync over a full program. no_drop never speeds up and drifts longer than the video. lock truncates overflow.", {"choices": ["anchored", "no_drop", "lock"], "group": "TTS"}),
     "tts.xtts_temperature":            ("float", "XTTS temperature",        "Lower = more monotone.", {"min": 0.1, "max": 1.2, "step": 0.05, "group": "TTS"}),
     "tts.xtts_repetition_penalty":     ("float", "Repetition penalty",      "", {"min": 1.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
     "tts.xtts_top_p":                  ("float", "Top-p",                   "", {"min": 0.1, "max": 1.0, "step": 0.05, "group": "TTS"}),
@@ -104,7 +106,7 @@ CONFIG_SCHEMA: dict = {
     "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
     "tts.speaker_profile_skip":        ("int",   "Speaker clip skip (s)",   "Seconds to skip from start (avoids intro music).", {"min": 0, "max": 600, "step": 1, "group": "TTS"}),
     "tts.use_deepfilter":              ("bool",  "DeepFilterNet denoise",   "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
-    "tts.max_stretch":                 ("float", "Max stretch ratio",       "Above this, tail is truncated with fade-out instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
+    "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
     "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
     "tts.group_gap":                   ("float", "Group gap (s)",           "Consecutive segments within this gap share one stretch ratio.", {"min": 0.0, "max": 3.0, "step": 0.1, "group": "TTS"}),
     "tts.stretcher":                   ("str",   "Time-stretch engine",     "rubberband preserves formants; atempo is the ffmpeg fallback.", {"choices": ["rubberband", "atempo"], "group": "TTS"}),
@@ -115,6 +117,10 @@ CONFIG_SCHEMA: dict = {
 
     # Subtitles
     "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
+
+    # Output
+    "output.mux_video":                ("bool",  "Mux final video",         "Also emit {name}_french.mp4 (original video + dubbed audio + subtitles). Audio is held to the source length so they end together.", {"group": "Output"}),
+    "output.burn_subs":                ("bool",  "Burn-in subtitles",       "On = render subtitles into the picture (re-encodes video). Off = soft-embed the SRT track and copy the video stream.", {"group": "Output"}),
 
     # Processing
     "processing.keep_temp":            ("bool",  "Keep temp files",         "Dump intermediate segment JSON for inspection.", {"group": "Processing"}),
@@ -159,12 +165,14 @@ CONFIG_PRESETS: dict[str, dict] = {
             "source_separation.preserve_background": True,
             "translation.review_pass": True,
             "translation.compression_pass": True,         # squeeze out remaining overflows
+            "translation.compression_rounds": 3,          # iterate until segments fit
             "translation.batch_size": 15,
             "translation.temperature": 0.25,
-            "translation.budget_cps": 17,
+            "translation.budget_cps": 15,                 # tight FR → fits the source timeline
             "tts.use_deepfilter": True,
+            "tts.timing_policy": "anchored",              # hold sync over long programs
             "tts.stretcher": "rubberband",
-            "tts.max_stretch": 1.25,
+            "tts.max_stretch": 1.3,
             "tts.cps_split_threshold": 20.0,              # tighter split threshold
         },
     },

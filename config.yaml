@@ -25,6 +25,19 @@ audio:
   volume_boost_pct: 0
 
 # ============================================================
+# Final output — muxed video
+# ============================================================
+output:
+  # Also emit a ready-to-watch {name}_french.mp4 (original video + dubbed audio
+  # + subtitles), so sync is verifiable in a single file. The dubbed audio is
+  # held to the source length (anchored timing), so video and audio end together.
+  mux_video: true
+  # false = soft-embed the SRT as a selectable track and copy the video stream
+  #         (fast, no quality loss).
+  # true  = burn the subtitles into the picture (re-encodes the video).
+  burn_subs: false
+
+# ============================================================
 # Speaker Diarization — pyannote.audio (optional)
 # Detects who is speaking when and builds a separate voice-clone
 # reference for each speaker, so every voice is dubbed distinctly.
@@ -100,12 +113,15 @@ translation:
   # preserve meaning" brief. Cheap (operates on a minority of segments) and
   # eliminates most remaining stretched/truncated audio.
   compression_pass: true
-  # Character budget per second of audio that Qwen is asked to fit each
-  # segment into. 17 is roughly the upper bound of naturally speakable French
-  # (matches subtitles.max_cps). Raising it gives the LLM more headroom (longer
-  # translations, more timeline extension/slow-down); lowering it forces tighter
-  # phrasing. Keep aligned with subtitles.max_cps and tts.reading_cps.
-  budget_cps: 17
+  # Max iterative compression rounds. Each round re-prompts only the segments
+  # still over budget, compressing against their latest text, until they fit or
+  # no further progress is made. More rounds = tighter fit, slightly more calls.
+  compression_rounds: 3
+  # Character budget per second of audio that Qwen is asked to fit each segment
+  # into. Lowered to 15 so the French is tight enough to fit the source timeline
+  # (less expansion → less speed-up needed → better sync). Raising it gives the
+  # LLM more headroom but reintroduces drift. Keep ≤ subtitles.max_cps / reading_cps.
+  budget_cps: 15
 
   # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
@@ -144,24 +160,27 @@ tts:
   # DeepFilterNet denoising on the speaker reference clip.
   use_deepfilter: true
 
-  # Max stretch ratio for groups whose audio overflows their window. Beyond
-  # this ratio the group is handled per `timing_policy` below.
-  # With timing_policy=no_drop this is only a *comfort* speed-up cap (audio is
-  # never cut), so keep it gentle for naturalness.
-  max_stretch: 1.2
+  # Per-group speed-up cap. In timing_policy=anchored this is how much a dense
+  # run may be sped up to stay inside the source timeline (1.30 ≈ inaudible on
+  # speech). Keep it gentle for naturalness.
+  max_stretch: 1.3
   min_stretch: 0.7
 
-  # Overflow policy when a dub run is longer than its time window:
-  #   no_drop → never truncate; extend the timeline so no words are lost
-  #             (output may run slightly longer than the source).
-  #   lock    → keep exact source timing; speed up to max_stretch then
-  #             hard-truncate the overflowing tail (legacy behaviour).
-  timing_policy: no_drop
+  # Timing policy when a dub run is longer than its time window:
+  #   anchored → hold the source timeline: speed dense runs up (≤ max_stretch)
+  #              and re-anchor drift at each pause, so the dub stays in sync with
+  #              the video over a full-length program. Recommended.
+  #   no_drop  → never speed up; extend the timeline so no words are lost. On a
+  #              dense 1-hour talk the audio/subs drift progressively LONGER than
+  #              the video — this is the cause of end-of-video desync.
+  #   lock     → keep exact source timing; speed up to max_stretch then
+  #              hard-truncate the overflowing tail (legacy behaviour).
+  timing_policy: anchored
 
-  # Reading-speed coupling (no_drop only): a speech run whose translated text is
-  # denser than reading_cps chars/sec is slowed toward that pace (audio is never
-  # sped up), so the dub AND the subtitles timed to it read comfortably. The
-  # slow-down is capped at max_slowdown so it never sounds sluggish.
+  # Reading-speed coupling: a speech run whose translated text is denser than
+  # reading_cps chars/sec is slowed toward that pace so the dub AND the subtitles
+  # timed to it read comfortably. In anchored mode the slow-down only uses spare
+  # room in the window (never pushes past the slot); capped at max_slowdown.
   reading_cps: 16.0
   max_slowdown: 1.25
 

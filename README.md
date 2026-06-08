@@ -18,14 +18,14 @@ The pipeline does everything from source separation through translation, voice�
 | English‑echo guard | automatic re‑translation | Detects segments the LLM left in English and re‑translates them individually |
 | TTS | **Coqui XTTS‑v2** (Idiap fork, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; native French |
 | Speaker denoising | DeepFilterNet → noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
-| Assembly | numpy timeline + Rubber Band time‑stretch + crossfade | **Never drops words** (see timing policy); upsamples 24 kHz → 48 kHz |
+| Assembly | numpy timeline + Rubber Band time‑stretch + crossfade | **Holds the source timeline** (see timing policy); upsamples 24 kHz → 48 kHz |
 | Subtitles | **Hybrid BBC/Netflix shaper** | ≤2 lines, ≤42 cpl, ≤17 CPS reading speed, logical line breaks |
-| Output | AAC 192 kbps / 48 kHz stereo (+ optional full‑mix with background) + UTF‑8 SRT | Vimeo‑ready |
+| Output | AAC 192 kbps / 48 kHz stereo (+ optional full‑mix with background) + UTF‑8 SRT + optional muxed MP4 | Vimeo‑ready |
 
 ### Two features worth calling out
 
-- **Never‑drop‑words timing (`timing_policy: no_drop`, default).** When a translated run is longer than its slot, the assembler *extends the timeline* instead of speeding up and truncating the tail — so no sentence is ever cut. Output may run slightly longer than the source. A `lock` mode preserves exact source timing for lip‑sync‑sensitive work.
-- **Reading‑speed coupling.** Speech runs whose translated text is denser than `tts.reading_cps` (16) are gently *slowed* (never sped up), capped at `tts.max_slowdown` (1.25×). This de‑rushes the dub and keeps subtitles under the 17 CPS reading‑speed limit.
+- **Timeline‑anchored timing (`timing_policy: anchored`, default).** Each translated run is fit into its original slot — dense runs are sped up a touch (capped at `tts.max_stretch`, ~1.30×, inaudible on speech) and accumulated drift is re‑anchored at every pause — so the dub stays in sync with the video over a full‑length program. Pairs with length‑aware translation (`translation.budget_cps`, iterated over `translation.compression_rounds`) that keeps the French tight enough to fit. A `no_drop` mode never speeds up (timeline extends, so it drifts longer than the source on dense talks); `lock` preserves exact source timing and truncates overflow for lip‑sync‑sensitive work.
+- **Reading‑speed coupling.** Speech runs whose translated text is denser than `tts.reading_cps` (16) are gently *slowed* toward that pace (capped at `tts.max_slowdown`, 1.25×, and never past the slot edge under `anchored`). This de‑rushes the dub and keeps subtitles under the 17 CPS reading‑speed limit.
 
 ### Localisation
 
@@ -121,7 +121,7 @@ A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in
 - Drag‑drop MP4 upload with progress bar.
 - Pre‑fills locale + volume‑boost from `config.yaml`.
 - Single‑job FIFO queue; live log via Server‑Sent Events.
-- Download buttons for `_french.m4a`, `_french.srt`, and the optional `_french_full.m4a`.
+- Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
 - Crash‑safe: a job interrupted by a server restart is recovered as `failed`; queued jobs resume.
 - Footer shows live GPU / VRAM / disk / Ollama / HF‑token status.
 
@@ -147,15 +147,22 @@ translation:
   model: qwen3:14b
   review_pass: false       # optional self‑review pass (~2× slower)
   compression_pass: true   # tighten only the over‑budget segments
+  compression_rounds: 3    # iterate the compression pass until segments fit
+  budget_cps: 15           # char/sec budget per segment — tighter = better sync
   target_lang: fr          # fr es de it pt nl pl ru ja ko zh ar tr hi vi
   locale: fr-ca            # loads canadian_glossary.yaml
 
 tts:
   xtts_temperature: 0.65
   stretcher: rubberband
-  timing_policy: no_drop    # no_drop = never truncate (default) | lock = exact timing
-  reading_cps: 16.0         # slow speech runs denser than this (no_drop only)
+  timing_policy: anchored   # anchored = hold source timeline (default) | no_drop = never speed up | lock = exact timing + truncate
+  max_stretch: 1.3          # per‑group speed‑up cap used to hold the timeline (anchored)
+  reading_cps: 16.0         # slow speech runs denser than this toward this pace
   max_slowdown: 1.25        # cap on that slow‑down
+
+output:
+  mux_video: true           # also emit _french.mp4 (video + dub audio + subs)
+  burn_subs: false          # false = soft SRT track (copy video) | true = burn in (re‑encode)
 
 subtitles:
   standard: netflix         # netflix (≤42 cpl) | bbc (≤37 cpl) | kapwing (legacy karaoke)
@@ -173,8 +180,9 @@ For each `webinar.mp4`, in `/workspace/outputs/`:
 - `webinar_french.m4a` — French dub only, AAC 192 kbps / 48 kHz stereo
 - `webinar_french.srt` — UTF‑8 SRT, BBC/Netflix‑shaped cues
 - `webinar_french_full.m4a` — full mix: French vocals + original background bed (when Demucs separation succeeded and `source_separation.preserve_background: true`)
+- `webinar_french.mp4` — original video + dubbed audio + subtitles, muxed for one‑file review (when `output.mux_video: true`). The dub is held to the source length, so audio, subs, and picture stay in sync end‑to‑end.
 
-For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file.
+For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
 
 ---
 
@@ -209,7 +217,8 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + XTTS‑v2 + Q
 | `TRANSLATION FAILURE: N/N segments still in English` | Ollama unreachable or wrong model name | `ollama list`; `ollama pull qwen3:14b` |
 | A few words sound English in the dub | Rare stochastic LLM echo | The English‑echo guard re‑translates these automatically; check the log for "Re‑translating … Recovered" |
 | Output too quiet | 0.95 peak‑normalise | `--volume-boost 20` |
-| Dub runs longer than the source | `timing_policy: no_drop` is extending dense passages | Expected; switch to `lock` for exact timing, or raise `tts.reading_cps` |
+| Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
+| A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
 | `ImportError: ... isin_mps_friendly` at synth | `transformers>=5` pulled in | `pip install 'transformers<5'` |
 | `qwen3:14b` re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 

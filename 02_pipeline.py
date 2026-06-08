@@ -202,6 +202,12 @@ class PipelineConfig:
     subtitle_min_dur: float = 0.833
     subtitle_max_dur: float = 7.0
     subtitle_min_gap: float = 0.083
+    # Fix #1: max seconds a subtitle may lag its audio to gain reading time in
+    # dense speech (re-syncs at pauses). 0 keeps cues locked to the audio.
+    subtitle_max_lag: float = 3.0
+    # Fix #2: lightly LLM-shorten only the cues still over the reading-speed cap
+    # after #1, so dense subtitles become readable with minimal divergence.
+    subtitle_condense: bool = True
 
     # Sample rates
     synthesis_sample_rate: int = 48000
@@ -326,6 +332,8 @@ def load_config(path: str) -> PipelineConfig:
         subtitle_min_dur=float(sub.get("min_duration", 0.833)),
         subtitle_max_dur=float(sub.get("max_duration", 7.0)),
         subtitle_min_gap=float(sub.get("min_gap", 0.083)),
+        subtitle_max_lag=float(sub.get("max_lag", 3.0)),
+        subtitle_condense=bool(sub.get("condense", True)),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
         mux_video=bool(out.get("mux_video", True)),
@@ -2731,42 +2739,43 @@ def _wrap_two_lines(text: str, max_cpl: int, max_lines: int = 2) -> str:
 
 
 def _enforce_subtitle_timing(cues: List[dict], min_dur: float, max_dur: float,
-                             max_cps: float, min_gap: float) -> List[dict]:
-    """Polish cue timings to satisfy reading-speed / duration / gap rules.
+                             max_cps: float, min_gap: float,
+                             max_lag: float = 3.0) -> List[dict]:
+    """Allocate readable on-screen time to each cue (fix #1).
 
-    Extends a cue's end into the following silence (never past the next cue) to
-    honour min duration and the reading-speed cap, caps at max_dur, and removes
-    overlaps / sub-frame gaps. Cue starts stay locked to the audio."""
-    n = len(cues)
-    LEAD_IN_MAX = 0.5   # how far a cue may appear before its audio (broadcast lead-in)
+    The dub holds the *source* timeline by speeding up dense speech, which
+    shortens the audio span of those segments and would otherwise starve their
+    subtitles (high CPS, flashing by). This forward cursor pass instead gives
+    every cue its reading-time *need* (chars / max_cps, floored at min_dur,
+    capped at max_dur) and at least enough time to cover its own audio. A cue
+    appears when its audio starts; in dense back-to-back speech it may run past
+    the next line's audio onset, so later cues *lag* the audio by a bounded
+    amount (`max_lag`) and re-sync wherever a pause lets the cursor catch up —
+    the subtitle analogue of the audio anchoring. Cues never overlap and never
+    appear before their audio. Cues still too dense after this are handed to the
+    condensation pass."""
+    if not cues:
+        return cues
 
     def _need(c):
         nchars = len(c["text"].replace("\n", " "))
-        return max(min_dur, nchars / max_cps if max_cps > 0 else 0.0)
+        reading = nchars / max_cps if max_cps > 0 else min_dur
+        return min(max(min_dur, reading), max_dur)
 
-    # Pass 1 — lead-out: extend each cue's end into the following silence.
-    for i, c in enumerate(cues):
-        next_start = cues[i + 1]["start"] if i + 1 < n else c["end"] + 1e9
-        ceiling = max(c["start"] + 0.1, next_start - min_gap)
-        c["end"] = min(max(c["end"], c["start"] + min(_need(c), max_dur)), ceiling)
-
-    # Pass 2 — lead-in: for cues still under their reading-time need, pull the
-    # start earlier into the preceding silence (bounded, never past prev cue).
-    for i, c in enumerate(cues):
-        if c["end"] - c["start"] >= _need(c):
-            continue
-        prev_end = cues[i - 1]["end"] if i > 0 else 0.0
-        floor = max(prev_end + min_gap, c["start"] - LEAD_IN_MAX)
-        c["start"] = min(c["start"], max(floor, c["end"] - min(_need(c), max_dur)))
-
-    # Pass 3 — cap duration and remove overlaps / sub-gap spacing.
+    cursor = 0.0
     for c in cues:
-        if c["end"] - c["start"] > max_dur:
-            c["end"] = c["start"] + max_dur
-    for i in range(n - 1):
-        if cues[i]["end"] > cues[i + 1]["start"] - min_gap:
-            cues[i]["end"] = max(cues[i]["start"] + 0.1,
-                                 cues[i + 1]["start"] - min_gap)
+        audio_start = c["start"]
+        audio_end = c["end"]
+        start = max(audio_start, cursor)
+        # Cover the spoken audio AND the reading-time need, capped at max_dur.
+        end = min(max(start + _need(c), audio_end), start + max_dur)
+        lag = start - audio_start
+        if lag > max_lag:
+            # Lagged too far behind the audio — trim this cue's tail so the
+            # cursor catches up (it gets denser; condensation will shorten it).
+            end = max(start + min_dur, end - (lag - max_lag))
+        c["start"], c["end"] = start, end
+        cursor = end + min_gap
     return cues
 
 
@@ -2891,6 +2900,78 @@ def _assign_phrase_times(
     return [(cuts[i], cuts[i + 1]) for i in range(n)]
 
 
+_SUB_CONDENSE_PROMPT = """\
+You are editing {language} video subtitles for on-screen readability.
+Each numbered line is a subtitle that is too long to read in the time it is shown.
+Shorten each line to AT MOST its [≤N chars] budget while keeping the full meaning,
+in natural spoken {language}. Drop fillers and redundancy, prefer shorter
+synonyms; keep proper nouns, numbers and key technical terms. Do NOT merge or
+reorder lines, add notes/brackets, or translate to another language.
+Output ONLY the numbered shortened lines, one per line, same numbering.
+
+Subtitles to shorten:
+{lines}
+
+Shortened {language} subtitles:"""
+
+
+def condense_overlong_cues(
+    cues: List[dict],
+    model: str,
+    temperature: float,
+    max_cps: float,
+    min_dur: float,
+    log: logging.Logger,
+    target_lang: str = "fr",
+    margin: float = 1.08,
+) -> List[dict]:
+    """Fix #2 — lightly shorten only the cues still over the reading-speed cap.
+
+    Runs after the timing pass, so it touches the *fewest* cues possible: those
+    whose French is still denser than `max_cps` even with the bounded lag. Each
+    offender is rewritten to fit `floor(duration × max_cps)` characters, keeping
+    meaning. Rewrites are accepted only when strictly shorter, so a cue can never
+    get longer. Timing is left untouched (the cue already covers its audio)."""
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
+
+    def _cps(c) -> float:
+        d = c["end"] - c["start"]
+        return (len(c["text"].replace("\n", " ")) / d) if d > 0 else 0.0
+
+    offenders = [(i, c) for i, c in enumerate(cues) if _cps(c) > max_cps * margin]
+    if not offenders:
+        log.debug("✓ Subtitle condensation: all cues within reading speed")
+        return cues
+
+    log.info(
+        f"Subtitle condensation: {len(offenders)} cue(s) over {max_cps:.0f} CPS "
+        f"— shortening to fit reading speed"
+    )
+    BATCH = 15
+    applied = 0
+    for bs in range(0, len(offenders), BATCH):
+        chunk = offenders[bs:bs + BATCH]
+        numbered = "\n".join(
+            f"{j + 1}. [≤{max(8, int((c['end'] - c['start']) * max_cps))} chars] "
+            f"{c['text'].replace(chr(10), ' ')}"
+            for j, (_i, c) in enumerate(chunk)
+        )
+        prompt = think_prefix + _SUB_CONDENSE_PROMPT.format(language=language, lines=numbered)
+        resp = _ollama_call(prompt, model, temperature, log)
+        if not resp:
+            continue
+        rewrites = _parse_numbered(resp, len(chunk))
+        for j, (i, c) in enumerate(chunk):
+            new = (rewrites[j] or "").strip()
+            old = c["text"].replace("\n", " ")
+            if new and len(new) < len(old):
+                cues[i]["text"] = new
+                applied += 1
+    log.info(f"  condensed {applied}/{len(offenders)} over-speed cue(s)")
+    return cues
+
+
 def create_srt(
     segments: List[dict],
     output_path: str,
@@ -2904,13 +2985,18 @@ def create_srt(
     min_dur: float = 0.833,
     max_dur: float = 7.0,
     min_gap: float = 0.083,
+    max_lag: float = 3.0,
+    condense_model: Optional[str] = None,
+    condense_temperature: float = 0.3,
+    target_lang: str = "fr",
 ) -> bool:
     """Write broadcast-grade subtitles (hybrid BBC/Netflix) from the dub segments.
 
     Each segment's French text is split into cue-sized chunks (≤ max_cpl×max_lines
     chars) at sentence→clause→word boundaries, timed to the audio via English
-    word anchors, then polished so every cue meets the reading-speed cap, min/max
-    duration and inter-cue gap, and is wrapped onto ≤max_lines logical lines.
+    word anchors, then (fix #1) given readable on-screen time with a bounded
+    subtitle lag (`max_lag`), and finally — when `condense_model` is set (fix #2)
+    — any cue still above the reading-speed cap is lightly shortened by the LLM.
 
     standard="kapwing" falls back to the legacy karaoke single-line behaviour.
     """
@@ -2953,7 +3039,17 @@ def create_srt(
             merged.append(dict(c))
         raw = merged
 
-        _enforce_subtitle_timing(raw, min_dur, max_dur, max_cps, min_gap)
+        # Fix #1 — allocate readable on-screen time (bounded subtitle lag).
+        _enforce_subtitle_timing(raw, min_dur, max_dur, max_cps, min_gap, max_lag)
+
+        # Fix #2 — only the cues that are *still* too dense after #1 are lightly
+        # shortened by the LLM, so the subtitle stays as close to the spoken dub
+        # as readability allows.
+        if condense_model:
+            raw = condense_overlong_cues(
+                raw, condense_model, condense_temperature, max_cps, min_dur, log,
+                target_lang=target_lang,
+            )
 
         subs = pysrt.SubRipFile()
         over_cps = 0
@@ -3413,6 +3509,10 @@ def process_video(
         min_dur=config.subtitle_min_dur,
         max_dur=config.subtitle_max_dur,
         min_gap=config.subtitle_min_gap,
+        max_lag=config.subtitle_max_lag,
+        condense_model=(config.translation_model if config.subtitle_condense else None),
+        condense_temperature=config.translation_temperature,
+        target_lang=config.target_lang,
     )
 
     final_mp4: Optional[str] = None

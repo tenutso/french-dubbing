@@ -229,6 +229,13 @@ subtitles:
   min_duration: 0.833     # 5/6 s minimum cue duration
   max_duration: 7.0
   min_gap: 0.083          # ≥2 frames @24fps between cues
+  # Fix #1 — max seconds a subtitle may lag its audio to earn reading time in
+  # dense speech (it re-syncs at the next pause). 0 locks cues to the audio.
+  max_lag: 3.0
+  # Fix #2 — after #1, lightly LLM-shorten only the cues still above max_cps so
+  # dense subtitles become readable while staying close to the spoken dub.
+  # Adds a few minutes (one Qwen pass over the over-speed cues). false disables.
+  condense: true
 
 # ============================================================
 # Processing

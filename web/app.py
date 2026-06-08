@@ -117,6 +117,8 @@ CONFIG_SCHEMA: dict = {
 
     # Subtitles
     "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
+    "subtitles.max_lag":               ("float", "Max subtitle lag (s)",    "How long a subtitle may lag its audio to earn reading time in dense speech (re-syncs at pauses). 0 locks cues to the audio.", {"min": 0.0, "max": 6.0, "step": 0.5, "group": "Subtitles"}),
+    "subtitles.condense":              ("bool",  "Condense dense cues",     "After timing, lightly LLM-shorten only the cues still over the reading-speed cap so they're readable. Adds a few minutes per video.", {"group": "Subtitles"}),
 
     # Output
     "output.mux_video":                ("bool",  "Mux final video",         "Also emit {name}_french.mp4 (original video + dubbed audio + subtitles). Audio is held to the source length so they end together.", {"group": "Output"}),

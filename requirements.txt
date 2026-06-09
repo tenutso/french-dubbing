@@ -49,6 +49,8 @@ hf_transfer>=0.1.6
 fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9
+# Vimeo URL ingestion in the web UI (downloads the source video before dubbing).
+yt-dlp>=2024.1.0
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0

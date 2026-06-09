@@ -36,6 +36,7 @@ class Job:
     outputs: dict = field(default_factory=dict)
     phase: str = ""
     returncode: Optional[int] = None
+    source_url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)

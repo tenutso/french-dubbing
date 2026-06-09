@@ -79,18 +79,50 @@ function updateDropText() {
   }
 }
 
+// ── Source toggle: upload file vs. Vimeo URL ──────────────────────────────────
+const vimeoField = $("#vimeo-field");
+const vimeoInput = $("#vimeo_url");
+function sourceMode() {
+  const checked = document.querySelector('input[name="source"]:checked');
+  return checked ? checked.value : "file";
+}
+function updateSourceMode() {
+  const url = sourceMode() === "vimeo";
+  dropEl.hidden = url;
+  vimeoField.hidden = !url;
+  // Only the active input is required so the form doesn't block the other mode.
+  fileInput.required = !url;
+  vimeoInput.required = url;
+}
+document.querySelectorAll('input[name="source"]').forEach(r =>
+  r.addEventListener("change", updateSourceMode)
+);
+updateSourceMode();
+
 $("#submit-form").addEventListener("submit", e => {
   e.preventDefault();
-  if (!fileInput.files.length) return;
-  const fd = new FormData($("#submit-form"));
+  const isUrl = sourceMode() === "vimeo";
+  const status = $("#upload-status");
+  if (isUrl) {
+    if (!vimeoInput.value.trim()) { status.textContent = "enter a Vimeo URL"; return; }
+  } else if (!fileInput.files.length) {
+    return;
+  }
+
+  // Send only the fields for the active mode (skip the empty other input).
+  const fd = new FormData();
+  if (isUrl) fd.append("vimeo_url", vimeoInput.value.trim());
+  else fd.append("video", fileInput.files[0]);
+  fd.append("locale", $("#locale").value);
+  fd.append("volume_boost", $("#volume_boost").value);
+  if ($("#force").checked) fd.append("force", "on");
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
   const prog = $("#upload-progress");
-  prog.hidden = false;
+  prog.hidden = isUrl;  // upload progress is meaningless for a URL submit
   prog.value = 0;
-  const status = $("#upload-status");
-  status.textContent = "uploading…";
+  status.textContent = isUrl ? "submitting…" : "uploading…";
   $("#submit-btn").disabled = true;
 
   xhr.upload.onprogress = e => {
@@ -107,6 +139,7 @@ $("#submit-form").addEventListener("submit", e => {
       status.textContent = `queued as ${data.id} (position ${data.position || 1})`;
       $("#submit-form").reset();
       updateDropText();
+      updateSourceMode();
       refreshJobs();
     } else {
       let err = xhr.responseText;
@@ -211,7 +244,7 @@ function renderCard(job) {
 
   // Downloads
   const dl = $(".job-downloads", root);
-  for (const [kind, label] of [["audio", "Audio"], ["srt", "SRT"], ["full", "Full mix"]]) {
+  for (const [kind, label] of [["video", "Video (MP4)"], ["audio", "Audio"], ["srt", "SRT"], ["full", "Full mix"]]) {
     if (job.outputs && job.outputs[kind]) {
       const a = document.createElement("a");
       a.href = `/api/jobs/${job.id}/download/${kind}`;

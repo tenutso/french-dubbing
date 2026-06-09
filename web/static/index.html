@@ -16,10 +16,20 @@
   <section id="submit-section" class="card">
     <h2>New job</h2>
     <form id="submit-form">
+      <div class="source-toggle" id="source-toggle">
+        <label><input type="radio" name="source" value="file" checked> Upload file</label>
+        <label><input type="radio" name="source" value="vimeo"> Vimeo URL</label>
+      </div>
+
       <label class="drop" id="drop">
         <input type="file" id="video" name="video"
                accept=".mp4,.mov,.mkv,.webm,video/*" required>
         <span id="drop-text">Drop a video file here or click to choose</span>
+      </label>
+
+      <label class="vimeo-field" id="vimeo-field" hidden>Vimeo URL
+        <input type="url" id="vimeo_url" name="vimeo_url"
+               placeholder="https://vimeo.com/123456789">
       </label>
 
       <div class="grid">

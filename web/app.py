@@ -18,6 +18,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -295,6 +296,11 @@ async def _run_job(job: Job) -> None:
     except Exception as e:
         state.publish(job.id, f"!!! snapshot failed: {e}")
 
+    # Pending Vimeo job — fetch the video before running the pipeline.
+    if not job.video_path and job.source_url:
+        if not await _download_vimeo(job):
+            return  # _download_vimeo marked the job failed and saved state
+
     cmd = [
         sys.executable, str(PIPELINE_PY),
         "--video",      job.video_path,
@@ -373,14 +379,97 @@ async def _run_job(job: Job) -> None:
     state.save()
 
 
+async def _download_vimeo(job: Job) -> bool:
+    """Fetch a Vimeo video into UPLOAD_DIR via yt-dlp, streaming progress to the
+    job log. On success sets job.video_path / video_filename and returns True.
+    On failure marks the job failed, saves state, and returns False."""
+    url = job.source_url
+    out_tmpl = str(UPLOAD_DIR / f"{job.id}__%(title).80s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--no-playlist", "--newline", "--restrict-filenames",
+        "-f", "bv*+ba/b",
+        "--remux-video", "mp4",
+        "-o", out_tmpl,
+        url,
+    ]
+    # [0/6] so the existing PHASE_RE renders it as a phase in the UI.
+    state.publish(job.id, "[0/6] Downloading from Vimeo…")
+    state.publish(job.id, "$ " + " ".join(cmd))
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return _fail_job(job, "yt-dlp not installed on the server")
+    except Exception as e:
+        return _fail_job(job, f"failed to launch yt-dlp: {e}")
+
+    state.current_proc = proc
+    try:
+        assert proc.stdout is not None
+        while True:
+            line_bytes = await proc.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip()
+            if line:
+                state.publish(job.id, line)
+    except Exception as e:
+        state.publish(job.id, f"!!! download-stream error: {e}")
+
+    rc = await proc.wait()
+    if job.status == STATUS_CANCELLED:
+        return False
+    if rc != 0:
+        return _fail_job(job, f"yt-dlp exited with code {rc}")
+
+    # yt-dlp names the file from the title; find what it produced for this job.
+    produced = sorted(UPLOAD_DIR.glob(f"{job.id}__*"))
+    if not produced:
+        return _fail_job(job, "download finished but no file was produced")
+    dest = produced[0]
+    job.video_path = str(dest)
+    job.video_filename = dest.name
+    state.publish(job.id, f"... downloaded: {dest.name}")
+    state.save()
+    return True
+
+
+def _fail_job(job: Job, msg: str) -> bool:
+    """Mark a job failed with a message; returns False for convenient early-return."""
+    job.status = STATUS_FAILED
+    job.error = msg
+    job.ended_at = time.time()
+    state.publish(job.id, f"!!! {msg}")
+    state.publish(job.id, f"<<< {job.status.upper()}")
+    # Signal SSE subscribers to close cleanly (mirrors _run_job's terminal handling)
+    for q in state.subscribers.get(job.id, []):
+        try:
+            q.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+    state.current_job_id = None
+    state.current_proc = None
+    state.save()
+    return False
+
+
 def _collect_outputs(job: Job) -> None:
     """Populate job.outputs by globbing the per-job output directory."""
     od = Path(job.output_dir)
     if not od.exists():
         return
+    video = sorted(od.glob("*_french.mp4"))
     audio = sorted(od.glob("*_french.m4a"))
     srt   = sorted(od.glob("*_french.srt"))
     full  = sorted(od.glob("*_french_full.m4a"))
+    if video:
+        job.outputs["video"] = str(video[0])
     if audio:
         job.outputs["audio"] = str(audio[0])
     if srt:
@@ -415,6 +504,17 @@ async def _queue_worker() -> None:
 # ── Lifecycle ────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def _startup() -> None:
+    # Backfill outputs for completed jobs so newly-recognized artifacts
+    # (e.g. the muxed *_french.mp4) appear for jobs finished before this build.
+    dirty = False
+    for j in state.jobs.values():
+        if j.status == STATUS_COMPLETED and j.output_dir:
+            before = dict(j.outputs)
+            _collect_outputs(j)
+            if j.outputs != before:
+                dirty = True
+    if dirty:
+        state.save()
     # Re-enqueue any queued jobs (preserved across restarts)
     for j in sorted(state.jobs.values(), key=lambda j: j.queued_at):
         if j.status == STATUS_QUEUED:
@@ -673,7 +773,8 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
 
 @app.post("/api/jobs")
 async def submit(
-    video: UploadFile = File(...),
+    video: UploadFile = File(None),
+    vimeo_url: str = Form(""),
     locale: str = Form(""),
     volume_boost: str = Form(""),
     force: str = Form(""),
@@ -688,44 +789,64 @@ async def submit(
         except ValueError:
             raise HTTPException(400, "volume_boost must be a number")
 
-    if not video.filename:
-        raise HTTPException(400, "no file uploaded")
+    # Exactly one source: an uploaded file OR a Vimeo URL.
+    has_file = bool(video and video.filename)
+    vimeo_url = vimeo_url.strip()
+    if has_file and vimeo_url:
+        raise HTTPException(400, "provide either a file or a Vimeo URL, not both")
+    if not has_file and not vimeo_url:
+        raise HTTPException(400, "no file uploaded and no Vimeo URL provided")
 
     job_id = new_job_id()
-    stem = safe_stem(video.filename) or "video"
-    dest = UPLOAD_DIR / f"{job_id}__{stem}.mp4"
-
-    # Stream upload to disk with a hard size cap
-    written = 0
-    with dest.open("wb") as out:
-        while True:
-            chunk = await video.read(1024 * 1024)
-            if not chunk:
-                break
-            written += len(chunk)
-            if written > MAX_UPLOAD_BYTES:
-                out.close()
-                dest.unlink(missing_ok=True)
-                raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // 1024**3} GB cap")
-            out.write(chunk)
-
+    options = {
+        "locale": locale or None,
+        "volume_boost": vb,
+        "force": force.lower() in ("1", "true", "on", "yes"),
+    }
     output_dir = OUTPUT_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    log_path = LOG_DIR / f"{dest.stem}.log"
+    if vimeo_url:
+        # URL branch — defer the download to the worker so the request stays fast.
+        host = (urlparse(vimeo_url).hostname or "").lower()
+        if host not in ("vimeo.com", "www.vimeo.com", "player.vimeo.com"):
+            raise HTTPException(400, "URL must be a vimeo.com link")
+        log_path = LOG_DIR / f"{job_id}.log"
+        job = Job(
+            id=job_id,
+            video_filename=vimeo_url,  # replaced with the real title after download
+            video_path="",             # pending — set once downloaded
+            output_dir=str(output_dir),
+            log_path=str(log_path),
+            options=options,
+            source_url=vimeo_url,
+        )
+    else:
+        # File branch — stream upload to disk with a hard size cap.
+        stem = safe_stem(video.filename) or "video"
+        dest = UPLOAD_DIR / f"{job_id}__{stem}.mp4"
+        written = 0
+        with dest.open("wb") as out:
+            while True:
+                chunk = await video.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    out.close()
+                    dest.unlink(missing_ok=True)
+                    raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // 1024**3} GB cap")
+                out.write(chunk)
+        log_path = LOG_DIR / f"{dest.stem}.log"
+        job = Job(
+            id=job_id,
+            video_filename=video.filename,
+            video_path=str(dest),
+            output_dir=str(output_dir),
+            log_path=str(log_path),
+            options=options,
+        )
 
-    job = Job(
-        id=job_id,
-        video_filename=video.filename,
-        video_path=str(dest),
-        output_dir=str(output_dir),
-        log_path=str(log_path),
-        options={
-            "locale": locale or None,
-            "volume_boost": vb,
-            "force": force.lower() in ("1", "true", "on", "yes"),
-        },
-    )
     state.jobs[job_id] = job
     state.save()
     await state.queue.put(job_id)
@@ -838,7 +959,7 @@ def _download(job: Job, kind: str) -> FileResponse:
         raise HTTPException(404, f"no {kind} output for this job")
     stem = safe_stem(job.video_filename) or "dub"
     ext = Path(path).suffix
-    base = {"audio": "_french", "srt": "_french", "full": "_french_full"}[kind]
+    base = {"video": "_french", "audio": "_french", "srt": "_french", "full": "_french_full"}[kind]
     download_name = f"{stem}{base}{ext}"
     return FileResponse(path, filename=download_name)
 
@@ -961,8 +1082,8 @@ def _rewrite_glossary_terms(path: Path, terms: list[dict]) -> None:
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:
-    if kind not in ("audio", "srt", "full"):
-        raise HTTPException(400, "kind must be audio|srt|full")
+    if kind not in ("video", "audio", "srt", "full"):
+        raise HTTPException(400, "kind must be video|audio|srt|full")
     job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")

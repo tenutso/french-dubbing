@@ -27,12 +27,12 @@ pyannote.audio>=3.3.0
 deepfilternet
 noisereduce>=3.0.0
 
-# ── TTS — XTTS-v2 via Idiap fork of Coqui TTS ────────────────────────────────
-# MPL-2.0; multilingual (17 langs incl. French) zero-shot voice cloning at 24 kHz.
-# Auto-accepts the CPML license via COQUI_TOS_AGREED=1 (set in 04_setup.sh).
-coqui-tts>=0.27.0
-# coqui-tts uses transformers internals removed in 5.x; pin to last 4.x.
-transformers<5
+# ── TTS — runs OUT-OF-PROCESS in its own venv ────────────────────────────────
+# The TTS engine (XTTS, Chatterbox, …) is NOT installed in this env. It runs via
+# tts/tts_worker.py inside /workspace/venvs/<engine>, built from the matching
+# requirements-<engine>.txt (e.g. requirements-xtts.txt). This keeps each
+# engine's conflicting pins (transformers/numpy/torch) out of the main env, so
+# the main env below is free to track modern transformers and numpy.
 
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 pysrt>=1.1.2

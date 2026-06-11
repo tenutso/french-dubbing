@@ -62,7 +62,11 @@ cd french-dubbing
 bash 04_setup.sh
 ```
 
-`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `DeepFilterNet`, `noisereduce`, `coqui-tts`, `transformers<5`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + XTTS‑v2 weights, and copies the pipeline into `/workspace/scripts/`.
+`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the main stack (`faster-whisper`, `demucs`, `pyannote.audio`, `DeepFilterNet`, `noisereduce`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls the translation model, pre‑downloads the Whisper weights, and copies the pipeline into `/workspace/scripts/`. The **TTS engine is not installed in the main env** — it runs out‑of‑process in its own venv at `/workspace/venvs/<engine>`, built from `requirements-<engine>.txt` for whichever engine `config.yaml`'s `tts.engine` selects (the engine's model weights are pre‑downloaded into that venv).
+
+#### Choosing / adding a TTS engine
+
+`tts.engine` in `config.yaml` picks the engine (default `xtts`; `chatterbox` also ships). Engine‑specific knobs go under `tts.engine_params`. To trial a new TTS tool, drop a `tts/engines/<name>.py` adapter (see `tts/engines/base.py`) plus a `requirements-<name>.txt`, set `tts.engine: <name>`, and re‑run `04_setup.sh` — no changes to the pipeline are needed. Because each engine lives in its own venv, its (often conflicting) `transformers`/`numpy`/`torch` pins never touch the rest of the stack.
 
 ### 3. Verify
 
@@ -219,7 +223,8 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + XTTS‑v2 + Q
 | Output too quiet | 0.95 peak‑normalise | `--volume-boost 20` |
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
 | A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
-| `ImportError: ... isin_mps_friendly` at synth | `transformers>=5` pulled in | `pip install 'transformers<5'` |
+| `ResolutionImpossible` / `TTS worker ... exited` / no audio | engine venv missing or its deps failed to resolve | `python /workspace/scripts/verify_setup.py` checks the engine venv; rebuild with `rm -rf /workspace/venvs/<engine> && bash 04_setup.sh` (pins live in `requirements-<engine>.txt`) |
+| Setup builds the wrong engine | `/workspace/config.yaml` (the runtime config) and your edited repo copy disagree on `tts.engine` | Edit `tts.engine` in **`/workspace/config.yaml`** — that's the file setup and the pipeline read; the repo copy only seeds it on first run |
 | `qwen3:14b` re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.

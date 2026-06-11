@@ -1,0 +1,21 @@
+# TTS engine venv — XTTS-v2 (Coqui / Idiap fork).
+# Installed into /workspace/venvs/xtts by 04_setup.sh; driven by tts/engines/xtts.py.
+# Kept separate from the main env because coqui-tts still requires numpy<2.
+#
+# torch/torchaudio match the RunPod CUDA 12.8 base. Install with:
+#   pip install -r requirements-xtts.txt --extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.8.0
+torchaudio==2.8.0
+
+# NOTE: do NOT pin transformers<4.41 here. That ceiling belonged to the original
+# coqui-ai/TTS; the idiap `coqui-tts` fork we use supports transformers 5.x and
+# pins its own floor (a <4.41 cap makes the resolve impossible). Let it choose.
+# coqui-tts still requires numpy 1.x.
+numpy>=1.26.4,<2.0.0
+
+coqui-tts>=0.27.0
+
+# Audio I/O used by the worker (sf.read/write) and the model.
+soundfile>=0.12.1
+librosa>=0.10.2

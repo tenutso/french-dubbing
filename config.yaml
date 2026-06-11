@@ -79,7 +79,7 @@ whisper:
   device: cuda
   # float16       → best quality on RTX 4090
   # int8_float16  → lower VRAM, marginal accuracy loss
-  compute_type: float16
+  compute_type: float32
   # Anti-hallucination tuning. condition_on_previous_text=false prevents
   # Whisper from feeding (potentially looped) prior output as context for
   # the next window — the single biggest switch against runaway repetition.
@@ -100,7 +100,7 @@ whisper:
 # ============================================================
 translation:
   # Qwen3:14b via Ollama. /no_think is sent automatically for qwen3.* tags.
-  model: qwen3:14b
+  model: qwen3:32b
   temperature: 0.3
   # 20 segments per Ollama call. Bigger batches save calls but risk hitting
   # the 4096-token output budget if segments are long.
@@ -140,10 +140,21 @@ translation:
   huggingface_token: ""
 
 # ============================================================
-# Text-to-Speech — Coqui XTTS-v2 (Idiap fork)
-# Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
+# Text-to-Speech
+# The engine runs out-of-process in its own venv (/workspace/venvs/<engine>),
+# so each engine's dependencies stay isolated. Add a new engine by dropping a
+# tts/engines/<name>.py adapter + requirements-<name>.txt — no pipeline edits.
 # ============================================================
 tts:
+  # Adapter name in tts/engines/. "xtts" (default) reads the xtts_* keys below.
+  engine: chatterbox            # xtts | chatterbox | <your-adapter>
+  # Opaque, engine-specific knobs handed verbatim to the adapter. Ignored by
+  # xtts (which uses the xtts_* keys). Example for chatterbox:
+  #   engine_params: { exaggeration: 0.5, cfg_weight: 0.5, temperature: 0.8 }
+  engine_params: {}
+
+  # ── XTTS-v2 (Coqui / Idiap fork) settings — used when engine: xtts ──────────
+  # Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
   xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
   # XTTS sampling. 0.65 is a stable default; lower = more monotone.
   xtts_temperature: 0.65

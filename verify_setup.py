@@ -82,6 +82,19 @@ def pkg(import_name: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
+def _config_engine() -> str:
+    """Read tts.engine from config.yaml (live /workspace copy preferred)."""
+    for cfg in ("/workspace/config.yaml", str(Path(__file__).resolve().parent / "config.yaml")):
+        if os.path.exists(cfg):
+            try:
+                import yaml
+                data = yaml.safe_load(open(cfg)) or {}
+                return (data.get("tts", {}) or {}).get("engine", "xtts") or "xtts"
+            except Exception:
+                break
+    return "xtts"
+
+
 def main():
     print(f"\n{BLUE}{'=' * 60}")
     print("French Dubbing Pipeline v1.0 — System Verification")
@@ -160,27 +173,8 @@ def main():
 
     # ── Core Python packages ──────────────────────────────────────────────────
     print(f"\n{BLUE}Core packages{RESET}")
-
-    # Apply transformers compatibility patch so XTTS import check works
-    try:
-        import importlib as _il, torch as _t
-        from packaging.version import Version as _V
-
-        _pu = _il.import_module("transformers.pytorch_utils")
-        if not hasattr(_pu, "isin_mps_friendly"):
-            _pu.isin_mps_friendly = _t.isin
-
-        _iu = _il.import_module("transformers.utils.import_utils")
-        if not hasattr(_iu, "is_torch_greater_or_equal"):
-            def _gte(version, revision=None):
-                v = f"{version}.{revision}" if revision else version
-                return _V(_t.__version__.split("+")[0]) >= _V(v)
-            _iu.is_torch_greater_or_equal = _gte
-            _tu = _il.import_module("transformers.utils")
-            if not hasattr(_tu, "is_torch_greater_or_equal"):
-                _tu.is_torch_greater_or_equal = _gte
-    except Exception:
-        pass
+    # NOTE: TTS (coqui/chatterbox + their transformers/numpy pins) is NOT checked
+    # here — it lives in its own venv. See the "TTS engine" section below.
 
     required = [
         ("faster_whisper", "faster-whisper (transcription)"),
@@ -198,18 +192,10 @@ def main():
         ok2, ver = pkg(import_name)
         c.check(label, ok2, f"v{ver}" if ok2 else ver)
 
+    # Main env is unpinned (modern numpy is fine here); the numpy<2 constraint
+    # only applies inside the TTS engine venv, which carries its own.
     ok2, ver = pkg("numpy")
-    if ok2:
-        try:
-            from packaging.version import Version
-            v = Version(ver)
-            if Version("1.26.4") <= v < Version("2.0.0"):
-                c.check("numpy <2.0.0", True, ver)
-            else:
-                c.warn("numpy <2.0.0",
-                       f"{ver} — run: pip install --force-reinstall 'numpy>=1.26.4,<2.0.0'")
-        except Exception:
-            c.warn("numpy version", f"could not parse {ver}")
+    c.check("numpy", ok2, f"v{ver}" if ok2 else ver)
 
     # ── Source separation ─────────────────────────────────────────────────────
     print(f"\n{BLUE}Source separation{RESET}")
@@ -235,44 +221,34 @@ def main():
     else:
         c.warn("noisereduce (fallback)", "not installed — deepfilternet will be used")
 
-    # ── transformers (required by coqui-tts XTTS) ─────────────────────────────
-    print(f"\n{BLUE}transformers (XTTS dependency){RESET}")
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
-    ok2, ver = pkg("transformers")
-    c.check("transformers", ok2, f"v{ver}" if ok2 else ver)
-    # coqui-tts requires transformers <5. Warn if a 5.x is installed.
-    if ok2:
-        try:
-            from packaging.version import Version
-            if Version(ver) >= Version("5.0.0"):
-                c.warn("transformers <5 (required by coqui-tts)",
-                       f"v{ver} — XTTS engine will fail to import. "
-                       f"Run: pip install 'transformers<5'")
-        except Exception:
-            pass
+    # ── TTS engine (out-of-process, own venv) ────────────────────────────────
+    # The engine named in config.tts.engine runs from $VENV_ROOT/<engine>. We
+    # verify that venv exists and can import its adapter — not the main env.
+    engine = _config_engine()
+    venv_root = os.environ.get("TTS_VENV_ROOT", "/workspace/venvs")
+    venv_py = Path(venv_root) / engine / "bin" / "python"
+    tts_dir = Path(__file__).resolve().parent / "tts"
+    print(f"\n{BLUE}TTS engine — '{engine}' (own venv at {venv_root}/{engine}){RESET}")
 
-    # ── TTS — Coqui XTTS-v2 (Idiap fork) ─────────────────────────────────────
-    print(f"\n{BLUE}TTS — Coqui XTTS-v2 (Idiap fork, French support){RESET}")
-    ok2, ver = pkg("TTS")
-    if ok2:
-        c.check("coqui-tts (XTTS-v2)", True, f"v{ver}")
-        xtts_cached = any(
-            "xtts_v2" in str(p).lower()
-            for p in hf_cache.rglob("*.pth") if hf_cache.exists()
-        ) or any(
-            "xtts" in str(p).lower()
-            for p in (Path.home() / ".local" / "share" / "tts").rglob("*.pth")
-            if (Path.home() / ".local" / "share" / "tts").exists()
-        )
-        if xtts_cached:
-            c.check("XTTS-v2 weights cached", True)
-        else:
-            c.warn("XTTS-v2 weights",
-                   "not cached — will download (~1.9 GB) on first xtts run")
+    if not (tts_dir / "engines" / f"{engine}.py").exists():
+        c.check(f"engine adapter tts/engines/{engine}.py", False,
+                "adapter file missing — synthesis will fail")
+    elif not venv_py.exists():
+        c.check(f"{engine} venv", False,
+                f"{venv_py} missing — run 04_setup.sh with tts.engine={engine}")
     else:
-        c.warn("coqui-tts (XTTS-v2)",
-               "not installed — xtts engine unavailable. "
-               "Run: pip install 'transformers<5' 'coqui-tts>=0.27.0'")
+        c.check(f"{engine} venv", True, str(venv_py))
+        # Import the adapter inside the venv (proves the engine deps load).
+        ok2, out = run(
+            f'PYTHONPATH="{tts_dir}" "{venv_py}" -c '
+            f'"import engines.{engine} as e; assert hasattr(e, \'Adapter\')"',
+            timeout=120,
+        )
+        if ok2:
+            c.check(f"{engine} adapter imports in venv", True)
+        else:
+            c.warn(f"{engine} adapter import",
+                   f"failed in venv — engine deps may be incomplete: {out[-200:]}")
 
     # ── System tools ──────────────────────────────────────────────────────────
     print(f"\n{BLUE}System tools{RESET}")

@@ -1,0 +1,14 @@
+# TTS engine venv — Chatterbox Multilingual (Resemble AI).
+# Installed into /workspace/venvs/chatterbox by 04_setup.sh; driven by
+# tts/engines/chatterbox.py. MUST be isolated: chatterbox-tts pins
+# transformers==4.46.x / torch==2.6.x / numpy==1.26.x, which conflict with both
+# the main env and the XTTS env.
+#
+# NOTE: chatterbox-tts brings its own pinned torch (2.6.x). Verify the wheel
+# loads on the RunPod CUDA 12.8 driver during the smoke test; if not, install a
+# matching cu12x torch wheel here explicitly.
+
+chatterbox-tts
+
+# Audio I/O used by the worker (sf.read/write).
+soundfile>=0.12.1

@@ -55,6 +55,87 @@ PYCHECK
 
 log_success "Prerequisites OK"
 
+# ── Config: read settings from config.yaml ────────────────────────────────
+# The pipeline (02_pipeline.py) is driven by config.yaml. Setup reads the same
+# file so the models it pulls and the folders it creates match what the
+# pipeline will actually load at runtime — no drift between install and run.
+#
+# Resolution order: an existing /workspace/config.yaml (a user's customised,
+# live config) wins over the repo copy that ships in SCRIPT_DIR.
+
+log_step "Reading config.yaml …"
+
+CONFIG_FILE=""
+for candidate in /workspace/config.yaml "$SCRIPT_DIR/config.yaml"; do
+    if [[ -f "$candidate" ]]; then CONFIG_FILE="$candidate"; break; fi
+done
+
+# pyyaml is needed to parse config; it's installed properly in Step 9, but we
+# need it now. Install quietly up front if the interpreter can't already import it.
+$PYTHON -c "import yaml" 2>/dev/null \
+    || $PYTHON -m pip install --quiet --no-cache-dir pyyaml 2>&1 | tail -1 | tee -a "$LOGFILE"
+
+# get_cfg <dotted.key> <default> — print the config value, or <default> if the
+# key is absent/empty/unparseable. Section-aware (handles nested YAML correctly).
+get_cfg() {
+    local key="$1" default="${2:-}" val
+    if [[ -n "$CONFIG_FILE" ]]; then
+        val=$($PYTHON - "$CONFIG_FILE" "$key" <<'PYEOF' 2>/dev/null
+import sys, yaml
+path, dotted = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+except Exception:
+    sys.exit(1)
+cur = data
+for part in dotted.split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(1)
+    cur = cur[part]
+if cur is None or cur == "":
+    sys.exit(1)
+print(cur)
+PYEOF
+)
+        [[ $? -eq 0 && -n "$val" ]] && { echo "$val"; return 0; }
+    fi
+    echo "$default"
+}
+
+if [[ -n "$CONFIG_FILE" ]]; then
+    log_success "Using config: $CONFIG_FILE"
+else
+    log_warn "No config.yaml found — falling back to built-in defaults"
+fi
+
+# Folders (Step 2 creates these; pipeline reads the same keys).
+INPUT_FOLDER=$(get_cfg pipeline.input_folder  /workspace/videos/input)
+OUTPUT_FOLDER=$(get_cfg pipeline.output_folder /workspace/outputs)
+MODELS_FOLDER=$(get_cfg pipeline.models_folder /workspace/models)
+LOGS_FOLDER=$(get_cfg pipeline.logs_folder     /workspace/logs)
+TEMP_FOLDER=$(get_cfg pipeline.temp_folder     /workspace/temp)
+
+# Models to pre-download (must match what the pipeline loads).
+WHISPER_MODEL=$(get_cfg whisper.model     large-v3)
+TRANSLATION_MODEL=$(get_cfg translation.model qwen3:14b)
+
+# TTS engine — runs out-of-process in its own venv at $VENV_ROOT/<engine>.
+# Only the configured engine's venv is built (per project decision).
+TTS_ENGINE=$(get_cfg tts.engine xtts)
+VENV_ROOT="${TTS_VENV_ROOT:-/workspace/venvs}"
+
+# Common trap: editing the repo config while setup + the pipeline read the live
+# /workspace/config.yaml. Warn loudly if the two disagree on the engine.
+if [[ "$CONFIG_FILE" == "/workspace/config.yaml" && -f "$SCRIPT_DIR/config.yaml" ]]; then
+    REPO_ENGINE=$(CONFIG_FILE="$SCRIPT_DIR/config.yaml" get_cfg tts.engine "$TTS_ENGINE")
+    if [[ "$REPO_ENGINE" != "$TTS_ENGINE" ]]; then
+        log_warn "tts.engine mismatch: /workspace/config.yaml says '$TTS_ENGINE' but the repo config says '$REPO_ENGINE'. Setup uses the live /workspace/config.yaml — edit THAT to switch engines."
+    fi
+fi
+
+log_success "Whisper=$WHISPER_MODEL  Ollama=$TRANSLATION_MODEL  TTS-engine=$TTS_ENGINE"
+
 # ── Step 1: System packages ────────────────────────────────────────────────
 
 log_step "Installing system packages …"
@@ -74,7 +155,10 @@ fi
 
 log_step "Creating workspace at /workspace …"
 
-if mkdir -p /workspace/{videos/input,models/whisper,outputs,scripts,logs,temp} && \
+# Folders come from config.yaml (pipeline.*_folder); /workspace/scripts is the
+# fixed install target for the pipeline scripts and is not configurable.
+if mkdir -p "$INPUT_FOLDER" "$OUTPUT_FOLDER" "$MODELS_FOLDER/whisper" \
+            "$LOGS_FOLDER" "$TEMP_FOLDER" /workspace/scripts && \
    chmod -R 755 /workspace; then
     log_success "Workspace ready"
 else
@@ -82,7 +166,7 @@ else
 fi
 
 # Relocate log to workspace
-LOGFILE=/workspace/logs/setup.log
+LOGFILE="$LOGS_FOLDER/setup.log"
 cat /tmp/dubbing_setup.log >> "$LOGFILE" 2>/dev/null || true
 
 # ── Step 3: Python package upgrades ───────────────────────────────────────
@@ -204,23 +288,15 @@ else
     log_warn "Web UI dependency install failed — 05_web.sh will not run"
 fi
 
-# ── Step 8d: XTTS-v2 TTS (Idiap fork of Coqui TTS) ───────────────────────────
-# Multilingual zero-shot voice cloning with native French support.
+# ── Step 8d: TTS engine — installed later in its own venv (Step 14) ──────────
+# The TTS engine (XTTS, Chatterbox, …) is NOT installed in the main env. It runs
+# out-of-process via tts/tts_worker.py inside $VENV_ROOT/$TTS_ENGINE so its
+# (often conflicting) transformers/numpy/torch pins stay isolated. See Step 14.
 
-log_step "Installing XTTS-v2 (coqui-tts) …"
-
-# coqui-tts imports transformers symbols removed in 5.x — pin to last 4.x.
-# Install transformers first so coqui-tts doesn't pull 5.x as a transitive.
-if $PYTHON -m pip install --no-cache-dir "transformers<5" "coqui-tts>=0.27.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "coqui-tts (XTTS-v2) installed"
-else
-    log_error "coqui-tts install failed — TTS will not work"
-fi
-
-# Auto-accept the XTTS CPML license non-interactively, for setup + runtime.
+# Auto-accept the XTTS CPML license non-interactively (harmless for other engines).
 export COQUI_TOS_AGREED=1
-echo "export COQUI_TOS_AGREED=1" >> /workspace/.env 2>/dev/null || true
+grep -q "COQUI_TOS_AGREED" /workspace/.env 2>/dev/null \
+    || echo "export COQUI_TOS_AGREED=1" >> /workspace/.env
 
 # ── Step 9: Utilities ─────────────────────────────────────────────────────
 
@@ -305,9 +381,9 @@ pull_with_retry() {
 }
 
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    pull_with_retry "qwen3:14b"
+    pull_with_retry "$TRANSLATION_MODEL"
 else
-    log_warn "Ollama not reachable — skipping model download. Run: ollama pull qwen3:14b"
+    log_warn "Ollama not reachable — skipping model download. Run: ollama pull $TRANSLATION_MODEL"
 fi
 
 # ── Step 12b: HuggingFace token (pyannote diarization is a gated model) ──────
@@ -359,47 +435,95 @@ fi
 
 # ── Step 13: Pre-download Whisper large-v3 ────────────────────────────────
 
-log_step "Pre-downloading Whisper large-v3 (~3 GB) …"
+log_step "Pre-downloading Whisper $WHISPER_MODEL (~3 GB) …"
 
-if $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+if WHISPER_MODEL="$WHISPER_MODEL" WHISPER_ROOT="$MODELS_FOLDER/whisper" \
+   $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+import os
 from faster_whisper import WhisperModel
-print("Downloading Whisper large-v3 to /workspace/models/whisper …")
-m = WhisperModel("large-v3", device="cpu", compute_type="int8",
-                 download_root="/workspace/models/whisper")
+model = os.environ["WHISPER_MODEL"]
+root = os.environ["WHISPER_ROOT"]
+print(f"Downloading Whisper {model} to {root} …")
+m = WhisperModel(model, device="cpu", compute_type="int8",
+                 download_root=root)
 del m
-print("✓ Whisper large-v3 cached")
+print(f"✓ Whisper {model} cached")
 PYEOF
-    log_success "Whisper large-v3 cached"
+    log_success "Whisper $WHISPER_MODEL cached"
 else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
 
-# ── Step 14: Pre-download XTTS-v2 (~1.9 GB) ──────────────────────────────────
+# ── Step 14: Build the configured TTS engine venv + pre-download its model ────
+# The TTS engine runs out-of-process in its own venv ($VENV_ROOT/$TTS_ENGINE).
+# Only the configured engine is built. No --system-site-packages: each engine
+# needs its own (often older) numpy/torch, isolated from the modern main env.
 
-log_step "Pre-downloading XTTS-v2 model (~1.9 GB) …"
+ENGINE_REQS="$SCRIPT_DIR/requirements-$TTS_ENGINE.txt"
+ENGINE_VENV="$VENV_ROOT/$TTS_ENGINE"
 
-if COQUI_TOS_AGREED=1 $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
-try:
-    from TTS.api import TTS
-    print("Downloading XTTS-v2 weights from HuggingFace …")
-    t = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
-    del t
-    print("✓ XTTS-v2 cached")
-except ImportError:
-    print("coqui-tts not installed — skipping XTTS pre-download")
-except Exception as e:
-    print(f"XTTS-v2 download error: {e}")
-    raise
-PYEOF
-    log_success "XTTS-v2 cached (or not installed)"
+log_step "Building TTS engine venv: $TTS_ENGINE → $ENGINE_VENV …"
+
+if [[ ! -f "$ENGINE_REQS" ]]; then
+    log_error "requirements-$TTS_ENGINE.txt not found — cannot build $TTS_ENGINE venv; TTS will fail"
+elif ! mkdir -p "$VENV_ROOT" || ! $PYTHON -m venv "$ENGINE_VENV" 2>&1 | tee -a "$LOGFILE"; then
+    log_error "Could not create venv at $ENGINE_VENV — TTS will fail"
 else
-    log_warn "XTTS-v2 pre-download failed — it will download on first use"
+    VENV_PY="$ENGINE_VENV/bin/python"
+    "$VENV_PY" -m pip install --upgrade --no-cache-dir pip wheel \
+        2>&1 | tail -2 | tee -a "$LOGFILE" || true
+
+    if "$VENV_PY" -m pip install --no-cache-dir \
+           --extra-index-url https://download.pytorch.org/whl/cu128 \
+           -r "$ENGINE_REQS" 2>&1 | tail -5 | tee -a "$LOGFILE"; then
+        log_success "$TTS_ENGINE venv dependencies installed"
+    else
+        log_error "$TTS_ENGINE venv install failed — TTS will not work"
+    fi
+
+    # Build the engine's prefetch params (mirrors the pipeline dispatcher: xtts
+    # reads tts.xtts_model; any other engine gets tts.engine_params verbatim).
+    PREFETCH_PARAMS=$($PYTHON - "$CONFIG_FILE" "$TTS_ENGINE" <<'PYEOF' 2>/dev/null
+import sys, json, yaml
+cfg, engine = sys.argv[1], sys.argv[2]
+try:
+    tts = (yaml.safe_load(open(cfg)) or {}).get("tts", {}) if cfg else {}
+except Exception:
+    tts = {}
+if engine == "xtts":
+    params = {"model": tts.get("xtts_model", "tts_models/multilingual/multi-dataset/xtts_v2")}
+else:
+    params = dict(tts.get("engine_params") or {})
+print(json.dumps(params))
+PYEOF
+)
+    [[ -z "$PREFETCH_PARAMS" ]] && PREFETCH_PARAMS='{}'
+
+    log_step "Pre-downloading $TTS_ENGINE model weights …"
+    if COQUI_TOS_AGREED=1 PYTHONPATH="$SCRIPT_DIR/tts" TTS_PARAMS="$PREFETCH_PARAMS" \
+       "$VENV_PY" - "$TTS_ENGINE" <<'PYEOF' 2>&1 | tail -5 | tee -a "$LOGFILE"; then
+import importlib, json, os, sys
+engine = sys.argv[1]
+params = json.loads(os.environ.get("TTS_PARAMS", "{}"))
+mod = importlib.import_module(f"engines.{engine}")
+prefetch = getattr(mod.Adapter, "prefetch", None)
+if prefetch is None:
+    print(f"{engine}: no prefetch() — model downloads on first use")
+else:
+    print(f"Pre-downloading {engine} weights …")
+    prefetch(params)
+    print(f"✓ {engine} weights cached")
+PYEOF
+        log_success "$TTS_ENGINE model ready (or downloads on first use)"
+    else
+        log_warn "$TTS_ENGINE pre-download failed — it will download on first use"
+    fi
 fi
 
 # ── Step 14b: Refresh latest releases for non-pinned packages ────────────────
-# Pulls newest releases of packages without an upper bound. Run after all
-# installs (so transitive deps settle). NOTE: transformers stays pinned <5
-# because coqui-tts uses an internal symbol removed in 5.x.
+# Pulls newest releases of main-env packages without an upper bound. Run after
+# all installs (so transitive deps settle). The TTS engine is NOT touched here —
+# it lives in its own venv with its own pins.
 
 log_step "Upgrading non-pinned packages to latest …"
 
@@ -410,7 +534,7 @@ $PYTHON -m pip install --upgrade --no-cache-dir \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"
 
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    ollama pull qwen3:14b 2>&1 | tail -3 | tee -a "$LOGFILE" || true
+    ollama pull "$TRANSLATION_MODEL" 2>&1 | tail -3 | tee -a "$LOGFILE" || true
 fi
 
 # ── Step 16: Install scripts & config ─────────────────────────────────────
@@ -426,6 +550,16 @@ for script in 02_pipeline.py 03_batch_runner.py verify_setup.py 05_web.sh; do
         log_warn "$script not found in $SCRIPT_DIR — copy manually to /workspace/scripts/"
     fi
 done
+
+# TTS worker + engine adapters — invoked by 02_pipeline.py via the engine venv.
+# Path is resolved relative to 02_pipeline.py, so it must sit beside it.
+if [[ -d "$SCRIPT_DIR/tts" ]]; then
+    rm -rf /workspace/scripts/tts
+    cp -r "$SCRIPT_DIR/tts" /workspace/scripts/tts
+    log_success "tts/ (worker + engine adapters) → /workspace/scripts/tts/"
+else
+    log_warn "tts/ not found in $SCRIPT_DIR — TTS worker missing, synthesis will fail"
+fi
 
 # Install config only if one doesn't already exist
 if [[ -f "$SCRIPT_DIR/config.yaml" ]]; then

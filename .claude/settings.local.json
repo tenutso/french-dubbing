@@ -4,7 +4,16 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(python -c \"import py_compile, sys; py_compile.compile\\(r'\\\\\\\\wsl.localhost\\\\Ubuntu\\\\home\\\\anijmeh\\\\projects\\\\dubbing\\\\02_pipeline.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(ls -la \"//wsl.localhost/Ubuntu/home/anijmeh/projects/dubbing/\" 2>/dev/null | head -30)",
-      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/**)"
+      "Read(///wsl.localhost/Ubuntu/home/anijmeh/projects/**)",
+      "Read(///wsl.localhost/ubuntu/home/anijmeh/projects/**)",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -c \"import yaml; print\\(yaml.safe_load\\(open\\(\\\\\"config.yaml\\\\\"\\)\\) is not None\\)\"')",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'sed -n \"100,140p\" /tmp/cfg_test.yaml | cat -n')",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'python3 -c \" *)",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'sed -i \"s|.*comment kept.*|print\\(\\\\\"comment kept:\\\\\", \\\\x27# 20 segments per Ollama call\\\\x27 in tmp.read_text\\(\\)\\)|\" /tmp/test_fix.py && cd ~/projects/french-dubbing && python3 /tmp/test_fix.py && echo \"--- model line in file ---\" && grep -n \"model: qwen3\" /tmp/cfg_fix.yaml')",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'rm -f /tmp/test_rewrite.py /tmp/test_fix.py /tmp/cfg_test.yaml /tmp/cfg_fix.yaml && echo cleaned')",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -c \" *)",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'grep -n \"^acronyms:\\\\|^always:\\\\|^glossary:\\\\|── Core Speaker\\\\|── Always-substitute\\\\|── Acronyms\\\\|breakout session\\\\|follow-up\" /tmp/gloss_out.yaml')",
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -m py_compile web/app.py && echo \"app.py: syntax OK\" && node --check web/static/app.js 2>/dev/null && echo \"app.js: syntax OK\" || echo \"app.js: \\(node not available, skipped\\)\"; rm -f /tmp/test_gloss.py /tmp/gloss_out.yaml && echo cleaned')"
     ]
   }
 }

@@ -690,6 +690,14 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
         head, _, leaf = dotted.partition(".")
         by_section.setdefault(head, {})[leaf] = val
 
+    def _inline_yaml(v) -> str:
+        # Render a single-line inline YAML node. safe_dump appends a "\n...\n"
+        # document-end marker to bare scalars (and may fold long values across
+        # lines), so .strip() alone would leave a stray "..." on its own line and
+        # corrupt the file. Take only the first line of a wide, flow-style dump.
+        dumped = yaml.safe_dump(v, default_flow_style=True, width=10**9).strip()
+        return dumped.split("\n", 1)[0]
+
     def fmt(v) -> str:
         if isinstance(v, bool):
             return "true" if v else "false"
@@ -698,9 +706,9 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
         if isinstance(v, str):
             # Quote if it contains chars that YAML would otherwise mis-parse
             if v == "" or any(c in v for c in ":#'\"\n") or v.strip() != v:
-                return yaml.safe_dump(v).strip()
+                return _inline_yaml(v)
             return v
-        return yaml.safe_dump(v, default_flow_style=True).strip()
+        return _inline_yaml(v)
 
     out: list[str] = []
     written: list[str] = []
@@ -966,8 +974,15 @@ def _download(job: Job, kind: str) -> FileResponse:
 
 GLOSSARY_PATH = Path("/workspace/canadian_glossary.yaml")
 GLOSSARY_MIRRORS = [Path("/workspace/french-dubbing/canadian_glossary.yaml")]
-GLOSSARY_TERM_MODES = ["always", "suggest"]
-GLOSSARY_FIELDS = ("en", "fr_ca", "fr_std", "mode", "category", "note")
+GLOSSARY_TERM_MODES = ["suggest", "always"]
+# The flat glossary file stores two editable top-level maps:
+#   glossary: {english: fr_ca}    → mode "suggest" (injected into the prompt)
+#   always:   {find_form: fr_ca}  → mode "always"  (deterministic post-rewrite)
+# The editor surfaces each entry as a row {en, fr_ca, mode}. This mirrors how
+# 02_pipeline.py:load_glossary reads the file, so edits round-trip correctly.
+# The acronyms: section and all header/section comments are preserved on save.
+GLOSSARY_FIELDS = ("en", "fr_ca", "mode")
+_GLOSSARY_SECTION_BY_MODE = {"suggest": "glossary", "always": "always"}
 
 
 @app.get("/api/glossary")
@@ -976,8 +991,12 @@ async def get_glossary() -> JSONResponse:
         data = yaml.safe_load(GLOSSARY_PATH.read_text(encoding="utf-8")) or {}
     except Exception as e:
         raise HTTPException(500, f"failed to read glossary: {e}")
+    terms: list[dict] = []
+    for mode, section in (("suggest", "glossary"), ("always", "always")):
+        for k, v in (data.get(section) or {}).items():
+            terms.append({"en": str(k), "fr_ca": "" if v is None else str(v), "mode": mode})
     return JSONResponse({
-        "terms": data.get("terms", []) or [],
+        "terms": terms,
         "modes": GLOSSARY_TERM_MODES,
         "path": str(GLOSSARY_PATH),
     })
@@ -985,17 +1004,18 @@ async def get_glossary() -> JSONResponse:
 
 @app.post("/api/glossary")
 async def update_glossary(payload: dict) -> JSONResponse:
-    """Replace the `terms:` block in canadian_glossary.yaml.
+    """Rewrite the editable `glossary:` and `always:` maps in canadian_glossary.yaml.
 
-    Preserves the header comments, `formatting_rules:`, and `inclusive_language:`
-    sections by rewriting only the `terms:` block in place.
+    Body: {"terms": [{"en", "fr_ca", "mode"}, ...]}. Rows are grouped by mode
+    into the two flat maps the pipeline reads (mode "suggest" → glossary:,
+    mode "always" → always:). The acronyms: section, header comments, and any
+    other top-level content are preserved.
     """
     terms = payload.get("terms")
     if not isinstance(terms, list):
         raise HTTPException(400, "terms must be a list")
 
-    # Validate + normalise each row
-    clean: list[dict] = []
+    by_mode: dict[str, dict[str, str]] = {"suggest": {}, "always": {}}
     for i, raw in enumerate(terms):
         if not isinstance(raw, dict):
             raise HTTPException(400, f"terms[{i}] must be an object")
@@ -1003,13 +1023,13 @@ async def update_glossary(payload: dict) -> JSONResponse:
         fr_ca = (raw.get("fr_ca") or "").strip()
         if not en or not fr_ca:
             raise HTTPException(400, f"terms[{i}]: en and fr_ca are required")
-        mode = (raw.get("mode") or "always").strip()
+        mode = (raw.get("mode") or "suggest").strip()
         if mode not in GLOSSARY_TERM_MODES:
             raise HTTPException(400, f"terms[{i}].mode must be one of {GLOSSARY_TERM_MODES}")
-        clean.append({k: (raw.get(k) or "") for k in GLOSSARY_FIELDS} | {"en": en, "fr_ca": fr_ca, "mode": mode})
+        by_mode[mode][en] = fr_ca
 
     try:
-        _rewrite_glossary_terms(GLOSSARY_PATH, clean)
+        _rewrite_glossary_sections(GLOSSARY_PATH, by_mode["suggest"], by_mode["always"])
     except Exception as e:
         raise HTTPException(500, f"failed to update glossary: {e}")
 
@@ -1017,68 +1037,79 @@ async def update_glossary(payload: dict) -> JSONResponse:
     for mp in GLOSSARY_MIRRORS:
         try:
             if mp.exists() and mp.resolve() != GLOSSARY_PATH.resolve():
-                _rewrite_glossary_terms(mp, clean)
+                _rewrite_glossary_sections(mp, by_mode["suggest"], by_mode["always"])
                 mirrored.append(str(mp))
         except Exception as e:
             log.warning("glossary mirror failed for %s: %s", mp, e)
 
-    return JSONResponse({"ok": True, "count": len(clean), "mirrored": mirrored})
+    count = len(by_mode["suggest"]) + len(by_mode["always"])
+    return JSONResponse({"ok": True, "count": count, "mirrored": mirrored})
 
 
-def _rewrite_glossary_terms(path: Path, terms: list[dict]) -> None:
-    """Rewrite only the `terms:` section, preserving the rest of the file verbatim."""
+def _yaml_q(v) -> str:
+    """Quote a glossary key/value when YAML would otherwise misparse it."""
+    s = "" if v is None else str(v)
+    needs_quote = (
+        s == ""
+        or s != s.strip()
+        or any(c in s for c in ":#'\"\n\t[]{}|>&*!%@`,")
+        or s[:1] in "-?[]{}#&*!|>'\"%@`"
+        or s.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
+    )
+    if not needs_quote:
+        return s
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _rewrite_glossary_sections(path: Path, suggest_map: dict, always_map: dict) -> None:
+    """Regenerate the `glossary:` and `always:` flat maps in place.
+
+    Only those two top-level sections are rewritten from the editor data; the
+    file header, the acronyms: section, and the comment blocks that precede each
+    section are preserved. Inline grouping comments *inside* a rewritten section
+    are not retained (the section body is regenerated from the submitted rows).
+    """
     text = path.read_text(encoding="utf-8")
+    newline_eof = "\n" if text.endswith("\n") else ""
     lines = text.splitlines()
 
-    # Find `terms:` line and the next top-level key (or EOF)
-    start = None
-    end = len(lines)
-    for i, line in enumerate(lines):
-        if start is None and re.match(r"^terms:\s*$", line):
-            start = i
-            continue
-        if start is not None:
-            # Next top-level key ends the block (non-indented, non-blank, non-comment)
-            if line and not line.startswith(" ") and not line.startswith("\t") \
-                    and not line.lstrip().startswith("#"):
-                end = i
+    def render(section: str, mapping: dict) -> list[str]:
+        body = [f"{section}:"]
+        for k, v in mapping.items():
+            body.append(f"  {_yaml_q(k)}: {_yaml_q(v)}")
+        return body
+
+    def splice(lines: list[str], section: str, mapping: dict) -> list[str]:
+        start = None
+        for i, line in enumerate(lines):
+            if re.match(rf"^{re.escape(section)}:\s*$", line):
+                start = i
                 break
+        if start is None:
+            if not mapping:
+                return lines  # nothing to write and no section to replace
+            sep = [""] if lines and lines[-1].strip() else []
+            return lines + sep + render(section, mapping)
+        # Walk to the last indented body line; trailing blanks and any comment
+        # block that precedes the next section are left for that section.
+        last_body = start
+        j = start + 1
+        while j < len(lines):
+            line = lines[j]
+            if line.strip() == "":
+                j += 1
+                continue
+            if line[0].isspace():            # indented → belongs to this section
+                last_body = j
+                j += 1
+                continue
+            break                            # column-0 content → next section/comment
+        return lines[:start] + render(section, mapping) + lines[last_body + 1:]
 
-    def q(v):
-        s = "" if v is None else str(v)
-        # Quote when YAML would otherwise misparse: empty, leading/trailing space,
-        # or contains structural chars. Use double quotes with escapes.
-        needs_quote = (
-            s == ""
-            or s != s.strip()
-            or any(c in s for c in ":#'\"\n\t[]{}|>&*!%@`,")
-            or s[:1] in "-?[]{}#&*!|>'\"%@`"
-            or s.lower() in ("true", "false", "null", "yes", "no", "on", "off", "~")
-        )
-        if not needs_quote:
-            return s
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    lines = splice(lines, "glossary", suggest_map)
+    lines = splice(lines, "always", always_map)
 
-    block: list[str] = []
-    block.append("terms:")
-    for t in terms:
-        block.append("")
-        block.append(f"  - en:       {q(t.get('en', ''))}")
-        block.append(f"    fr_ca:    {q(t.get('fr_ca', ''))}")
-        block.append(f"    fr_std:   {q(t.get('fr_std', ''))}")
-        block.append(f"    mode:     {t.get('mode', 'always')}")
-        if t.get("category"):
-            block.append(f"    category: {q(t['category'])}")
-        if t.get("note"):
-            block.append(f"    note:     {q(t['note'])}")
-
-    if start is None:
-        # Append a new terms section at end
-        out = lines + [""] + block
-    else:
-        out = lines[:start] + block + lines[end:]
-
-    path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    path.write_text("\n".join(lines) + newline_eof, encoding="utf-8")
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:

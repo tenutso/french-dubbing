@@ -591,7 +591,6 @@ function renderGlossaryRow(term, idx) {
   const fields = [
     { key: "en", placeholder: "speaker" },
     { key: "fr_ca", placeholder: "conférencier·ère" },
-    { key: "fr_std", placeholder: "(empty)" },
   ];
   for (const f of fields) {
     const td = document.createElement("td");
@@ -614,22 +613,13 @@ function renderGlossaryRow(term, idx) {
   for (const m of glossaryModes) {
     const o = document.createElement("option");
     o.value = m; o.textContent = m;
-    if ((term.mode || "always") === m) o.selected = true;
+    if ((term.mode || "suggest") === m) o.selected = true;
     sel.appendChild(o);
   }
   sel.addEventListener("change", e => { glossaryTerms[idx].mode = e.target.value; renderGlossary(); });
   tdMode.appendChild(sel);
   tr.appendChild(tdMode);
-  // Category + note + delete
-  for (const k of ["category", "note"]) {
-    const td = document.createElement("td");
-    const inp = document.createElement("input");
-    inp.type = "text";
-    inp.value = term[k] || "";
-    inp.addEventListener("input", e => { glossaryTerms[idx][k] = e.target.value; });
-    td.appendChild(inp);
-    tr.appendChild(td);
-  }
+  // Delete
   const tdDel = document.createElement("td");
   const del = document.createElement("button");
   del.type = "button";
@@ -675,7 +665,7 @@ async function init() {
   $("#config-save").addEventListener("click", () => saveConfig(false));
   $("#config-revert").addEventListener("click", revertConfig);
   $("#glossary-add").addEventListener("click", () => {
-    glossaryTerms.push({ en: "", fr_ca: "", fr_std: "", mode: "always", category: "", note: "" });
+    glossaryTerms.push({ en: "", fr_ca: "", mode: "suggest" });
     renderGlossary();
     const inputs = $$("#glossary-table tbody tr:last-child input");
     if (inputs.length) inputs[0].focus();

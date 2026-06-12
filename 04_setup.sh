@@ -205,7 +205,7 @@ fi
 
 log_step "Installing faster-whisper …"
 
-if $PYTHON -m pip install --no-cache-dir "faster-whisper>=1.0.0" \
+if $PYTHON -m pip install --no-cache-dir "faster-whisper>=1.1.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "faster-whisper installed"
 else
@@ -284,7 +284,7 @@ log_step "Installing utility packages …"
 if $PYTHON -m pip install --no-cache-dir \
        "pysrt>=1.1.2" "chardet<6" "requests>=2.32.0" \
        "tqdm>=4.66.0" "click>=8.1.7" "pyyaml>=6.0.1" \
-       "python-dotenv>=1.0.0" "hf_transfer>=0.1.6" \
+       "python-dotenv>=1.0.0" "hf_transfer>=0.1.6" "yt-dlp>=2024.1.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "Utilities installed"
 else

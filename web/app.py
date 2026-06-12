@@ -106,7 +106,7 @@ CONFIG_SCHEMA: dict = {
     "tts.xtts_top_k":                  ("int",   "Top-k",                   "", {"min": 1, "max": 200, "step": 1, "group": "TTS"}),
     "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
     "tts.speaker_profile_skip":        ("int",   "Speaker clip skip (s)",   "Seconds to skip from start (avoids intro music).", {"min": 0, "max": 600, "step": 1, "group": "TTS"}),
-    "tts.use_deepfilter":              ("bool",  "DeepFilterNet denoise",   "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
+    "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
     "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
     "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
     "tts.group_gap":                   ("float", "Group gap (s)",           "Consecutive segments within this gap share one stretch ratio.", {"min": 0.0, "max": 3.0, "step": 0.1, "group": "TTS"}),

@@ -10,7 +10,7 @@ Stack (single, fixed path):
   Segment merging   : sentence-scale chunks     (8–12s, no sub-second fragments)
   Diarization (opt) : pyannote-audio            (per-speaker voice profiles)
   Translation       : Qwen3:14b via Ollama      (natural pass + English-echo guard)
-  Speaker denoising : DeepFilterNet             (clean voice reference)
+  Speaker denoising : noisereduce              (clean voice reference)
   TTS               : Coqui XTTS-v2 at 24 kHz   (multilingual voice cloning)
   Assembly          : Rubber Band stretch       (no_drop: never truncate; reading-pace slow-down)
   Subtitles         : hybrid BBC/Netflix shaper (≤2 lines, ≤42 cpl, ≤17 CPS)
@@ -25,9 +25,8 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -132,13 +131,6 @@ class PipelineConfig:
     use_deepfilter: bool = True
     tts_speaker_duration: float = 25.0
     tts_speaker_skip: float = 20.0
-
-    # TTS engine selection. ``tts_engine`` names an adapter in tts/engines/ run
-    # out-of-process in its own venv; ``tts_engine_params`` is the opaque
-    # engine-specific knob dict from config (tts.engine_params). XTTS stays the
-    # default and reads the xtts_* fields below, so existing configs are unchanged.
-    tts_engine: str = "xtts"
-    tts_engine_params: dict = field(default_factory=dict)
 
     # TTS — Coqui XTTS-v2 (Idiap fork)
     # In "anchored" mode tts_max_stretch is the per-group *speed-up* cap used to
@@ -306,8 +298,6 @@ def load_config(path: str) -> PipelineConfig:
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
-        tts_engine=tts.get("engine", "xtts"),
-        tts_engine_params=dict(tts.get("engine_params") or {}),
         xtts_model=tts.get("xtts_model", "tts_models/multilingual/multi-dataset/xtts_v2"),
         xtts_temperature=tts.get("xtts_temperature", 0.65),
         xtts_length_penalty=tts.get("xtts_length_penalty", 1.0),
@@ -1843,26 +1833,7 @@ def denoise_audio(
     output_path: str,
     log: logging.Logger,
 ) -> str:
-    """Denoise speaker reference. Tries DeepFilterNet → noisereduce → FFmpeg anlmdn."""
-    try:
-        from df.enhance import enhance, init_df
-        try:
-            from df.enhance import load_audio, save_audio
-        except ImportError:
-            from df.io import load_audio, save_audio
-
-        log.info("Denoising with DeepFilterNet …")
-        model, df_state, _ = init_df()
-        audio, _  = load_audio(audio_path, sr=df_state.sr())
-        enhanced  = enhance(model, df_state, audio)
-        save_audio(output_path, enhanced, df_state.sr())
-        log.info("✓ Speaker reference denoised (DeepFilterNet)")
-        return output_path
-    except ImportError:
-        log.debug("DeepFilterNet not available — trying noisereduce")
-    except Exception as e:
-        log.warning(f"DeepFilterNet failed ({e}) — trying noisereduce")
-
+    """Denoise speaker reference. Tries noisereduce → FFmpeg anlmdn."""
     try:
         import noisereduce as nr
         import soundfile as _sf
@@ -1903,24 +1874,54 @@ def _seg_text(seg: dict) -> str:
     return (seg.get("text_fr") or seg.get("text") or "").strip()
 
 
-# NOTE: XTTS chunk-splitting (_split_for_xtts / per-language limits) now lives in
-# the engine adapter at tts/engines/xtts.py — each engine owns its own text
-# chunking, so the core pipeline carries no engine-specific logic.
+# XTTS-v2 hard per-language character cap. The values below are well under
+# the model's internal token cap (FR: 273, EN: 250, DE/PL: 248, …) — XTTS
+# becomes loop-prone well *before* its hard cap, so we split aggressively
+# on sentence boundaries. Empirically, 180 chars/chunk for Romance languages
+# eliminates almost all internal looping while keeping prosody continuous.
+_XTTS_CHUNK_LIMITS = {
+    "fr": 180, "en": 200, "es": 180, "de": 200, "it": 170, "pt": 180,
+    "pl": 200, "nl": 200, "ru": 160, "cs": 160, "ar": 150, "tr": 180,
+    "hu": 160, "zh": 80, "ja": 80, "ko": 80, "hi": 200,
+}
 
 
-def _resolve_tts_worker(engine: str) -> Tuple[str, str]:
-    """Return (python_executable, worker_script) for the engine subprocess.
+def _split_for_xtts(text: str, limit: int) -> List[str]:
+    """Break text into ≤limit-char chunks on natural boundaries.
 
-    The engine runs in its own venv at $TTS_VENV_ROOT/<engine> (default
-    /workspace/venvs/<engine>). If that venv is absent we fall back to the
-    current interpreter, so the seam is usable in dev/CI where the engine is
-    installed in the active env.
+    Tries sentences first (. ! ? …), then clauses (; : ,), then a hard split.
+    Returns chunks that are each ≤ limit chars (with one-char slack for joins).
     """
-    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tts", "tts_worker.py")
-    venv_root = os.environ.get("TTS_VENV_ROOT", "/workspace/venvs")
-    venv_python = os.path.join(venv_root, engine, "bin", "python")
-    python = venv_python if os.path.exists(venv_python) else sys.executable
-    return python, worker
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+    import re as _re
+
+    pieces = _re.split(r"(?<=[.!?…])\s+", text)
+    out: List[str] = []
+    for piece in pieces:
+        if len(piece) <= limit:
+            out.append(piece)
+            continue
+        # Sub-split on clause punctuation, then accumulate greedily.
+        sub = _re.split(r"(?<=[,;:])\s+", piece)
+        buf = ""
+        for s in sub:
+            if len(s) > limit:  # one clause is itself too long → hard wrap
+                if buf:
+                    out.append(buf.strip()); buf = ""
+                for i in range(0, len(s), limit):
+                    out.append(s[i:i + limit].strip())
+                continue
+            if len(buf) + 1 + len(s) <= limit:
+                buf = f"{buf} {s}".strip()
+            else:
+                if buf:
+                    out.append(buf.strip())
+                buf = s
+        if buf:
+            out.append(buf.strip())
+    return [c for c in out if c]
 
 
 def synthesize_all_segments(
@@ -1929,100 +1930,83 @@ def synthesize_all_segments(
     config: "PipelineConfig",
     log: logging.Logger,
     speaker_profiles: Optional[dict] = None,
-    temp_dir: Optional[str] = None,
 ) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
-    """Synthesize every segment via the configured TTS engine, out-of-process.
-
-    The engine (``config.tts_engine``) runs in its own venv through
-    tts/tts_worker.py so its dependencies stay isolated from the main pipeline.
-    Data crosses the process boundary as a manifest JSON in + per-segment WAVs
-    out; the return contract — (list of (waveform, start, end), sample_rate) —
-    is unchanged so the assembler downstream is untouched.
-    """
-    engine = config.tts_engine or "xtts"
-    lang_code = (config.target_lang or "fr").lower().split("-")[0]
-
-    # XTTS reads the historical xtts_* fields so existing configs behave
-    # identically; any other engine gets its opaque engine_params verbatim.
-    if engine == "xtts":
-        params = {
-            "model": config.xtts_model,
-            "temperature": config.xtts_temperature,
-            "length_penalty": config.xtts_length_penalty,
-            "repetition_penalty": config.xtts_repetition_penalty,
-            "top_k": config.xtts_top_k,
-            "top_p": config.xtts_top_p,
-        }
-    else:
-        params = dict(config.tts_engine_params or {})
-
-    work_dir = os.path.join(temp_dir or config.temp_folder, "tts_out")
-    os.makedirs(work_dir, exist_ok=True)
-    manifest = {
-        "engine": engine,
-        "lang": lang_code,
-        "speaker_wav": speaker_wav,
-        "speaker_profiles": speaker_profiles or {},
-        "engine_params": params,
-        "out_dir": work_dir,
-        "segments": [
-            {
-                "id": s["id"],
-                "text": _seg_text(s),
-                "start": s["start"],
-                "end": s["end"],
-                "speaker": s.get("speaker", "SPEAKER_00"),
-            }
-            for s in segments
-        ],
-    }
-    manifest_path = os.path.join(work_dir, "manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f)
-
-    python, worker = _resolve_tts_worker(engine)
-    log.info(f"Synthesizing via '{engine}' engine ({python}) …")
-    # Stream the worker's per-segment progress live (merge stderr→stdout) instead
-    # of buffering it, and enforce a hard timeout with a watchdog that kills the
-    # process even if it hangs mid-line.
-    proc = subprocess.Popen(
-        [python, worker, manifest_path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
-    timed_out = {"v": False}
-    watchdog = threading.Timer(config.timeout_seconds, lambda: (timed_out.__setitem__("v", True), proc.kill()))
-    watchdog.start()
+    """Synthesize every segment with Coqui XTTS-v2."""
     try:
-        for line in proc.stdout:
-            line = line.rstrip()
-            if line:
-                log.info(f"  [tts] {line}")
-        ret = proc.wait()
-    finally:
-        watchdog.cancel()
-    if timed_out["v"]:
-        log.error(f"TTS worker timed out after {config.timeout_seconds}s")
-        return [], 24000
-    if ret != 0:
-        log.error(f"TTS worker ({engine}) exited with code {ret}")
+        from TTS.api import TTS
+    except ImportError:
+        log.error("coqui-tts not installed. Install: pip install 'transformers<5' coqui-tts")
         return [], 24000
 
-    results_path = os.path.join(work_dir, "results.json")
-    if not os.path.exists(results_path):
-        log.error("TTS worker produced no results.json")
-        return [], 24000
-    with open(results_path) as f:
-        results = json.load(f)
+    import torch as _torch
 
-    sr = int(results.get("sample_rate", 24000))
+    def _pick_wav(seg: dict) -> Optional[str]:
+        if speaker_profiles:
+            profile = speaker_profiles.get(seg.get("speaker", "SPEAKER_00"))
+            if profile and os.path.exists(profile):
+                return profile
+        return speaker_wav
+
+    lang_code = (config.target_lang or "fr").lower().split("-")[0]
+    log.info(f"Loading XTTS-v2: {config.xtts_model} (lang={lang_code}) …")
+    # Auto-accept the CPML license non-interactively.
+    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+    tts = TTS(config.xtts_model).to(device)
+    sr = 24000  # XTTS-v2 native rate
+    log.info(f"✓ XTTS-v2 ready (output: {sr} Hz, device: {device})")
+
+    chunk_limit = _XTTS_CHUNK_LIMITS.get(lang_code, 240)
+    # 80 ms silence between concatenated chunks of the same segment.
+    chunk_gap = np.zeros(int(sr * 0.08), dtype=np.float32)
+
+    def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+        return np.asarray(
+            tts.tts(
+                text=text,
+                speaker_wav=ref_wav,
+                language=lang_code,
+                temperature=config.xtts_temperature,
+                length_penalty=config.xtts_length_penalty,
+                repetition_penalty=config.xtts_repetition_penalty,
+                top_k=config.xtts_top_k,
+                top_p=config.xtts_top_p,
+                split_sentences=True,
+            ),
+            dtype=np.float32,
+        )
+
     synthesized: List[Tuple[np.ndarray, float, float]] = []
-    for r in results.get("segments", []):
-        wav, _ = sf.read(r["wav"], dtype="float32")
-        if wav.ndim > 1:           # safety: collapse stray stereo to mono
-            wav = wav.mean(axis=1)
-        synthesized.append((np.asarray(wav, dtype=np.float32), r["start"], r["end"]))
+    with tqdm(total=len(segments), desc="Synthesizing (XTTS-v2)") as pbar:
+        for seg in segments:
+            text = _seg_text(seg)
+            if not text:
+                pbar.update(1)
+                continue
+            try:
+                ref_wav = _pick_wav(seg)
+                if not ref_wav or not os.path.exists(ref_wav):
+                    log.warning(f"Segment {seg['id']}: no speaker reference, skipping")
+                    pbar.update(1)
+                    continue
+                chunks = _split_for_xtts(text, chunk_limit)
+                if len(chunks) > 1:
+                    log.info(
+                        f"Segment {seg['id']}: {len(text)} chars > {chunk_limit} "
+                        f"limit → split into {len(chunks)} chunks"
+                    )
+                parts = [_synth_one(c, ref_wav) for c in chunks]
+                wav = parts[0] if len(parts) == 1 else np.concatenate(
+                    [p for i, part in enumerate(parts) for p in
+                     ((part,) if i == 0 else (chunk_gap, part))]
+                )
+                synthesized.append((wav, seg["start"], seg["end"]))
+            except Exception as e:
+                log.warning(f"Segment {seg['id']} XTTS-v2 failed: {e}")
+            pbar.update(1)
 
     log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
+    del tts
     free_vram(log)
     return synthesized, sr
 
@@ -3435,14 +3419,13 @@ def process_video(
         log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
-    log.info(f"\n[5/6] SYNTHESIZING FRENCH AUDIO ({config.tts_engine})")
+    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (XTTS-v2)")
     synthesized, actual_sr = synthesize_all_segments(
         segments,
         speaker_wav,
         config,
         log,
         speaker_profiles=speaker_profiles,
-        temp_dir=temp_dir,
     )
     if not synthesized:
         return False

@@ -33,10 +33,9 @@ RUN mkdir -p /workspace/{videos/input,models/whisper,outputs,scripts,logs,temp}
 RUN pip install --upgrade --no-cache-dir pip setuptools wheel packaging
 
 # Phase 1: Core scientific stack
-# Main env is unpinned (modern numpy is fine); the numpy<2 constraint applies
-# only inside the TTS engine venv built in Phase 5.
+# numpy<2.0.0 required by Coqui TTS (XTTS v2)
 RUN pip install --no-cache-dir \
-    "numpy>=1.26.4" \
+    "numpy>=1.26.4,<2.0.0" \
     "scipy>=1.13.1"
 
 # Phase 2: PyTorch 2.8.0 + torchaudio (CUDA 12.8.1 = cu128)
@@ -54,19 +53,13 @@ RUN pip install --no-cache-dir \
 # Phase 4: Transcription — faster-whisper (CTranslate2)
 RUN pip install --no-cache-dir "faster-whisper>=1.0.0"
 
-# Phase 5: TTS engine — built into its OWN venv, not the main env, so its
-# transformers/numpy/torch pins stay isolated. ENGINE selects the adapter +
-# requirements-<engine>.txt (default xtts). Build with:
-#   docker build --build-arg TTS_ENGINE=chatterbox .
-ARG TTS_ENGINE=xtts
-ENV TTS_VENV_ROOT=/workspace/venvs
-COPY requirements-${TTS_ENGINE}.txt /workspace/
-COPY tts/ /workspace/scripts/tts/
-RUN python3 -m venv "/workspace/venvs/${TTS_ENGINE}" \
- && /workspace/venvs/${TTS_ENGINE}/bin/pip install --no-cache-dir --upgrade pip wheel \
- && /workspace/venvs/${TTS_ENGINE}/bin/pip install --no-cache-dir \
-        --extra-index-url https://download.pytorch.org/whl/cu128 \
-        -r "/workspace/requirements-${TTS_ENGINE}.txt"
+# Phase 5: TTS — Coqui XTTS v2
+# Pin transformers FIRST: coqui-tts imports isin_mps_friendly which was removed in 4.41.0
+RUN pip install --no-cache-dir "transformers>=4.36.0,<4.41.0"
+# coqui-tts is the community fork of the original TTS package (removed from PyPI);
+# installs to the same TTS.* import namespace.
+RUN pip install --no-cache-dir coqui-tts || \
+    pip install --no-cache-dir "git+https://github.com/coqui-ai/TTS.git"
 
 # Phase 6: Utilities
 RUN pip install --no-cache-dir \
@@ -93,18 +86,16 @@ COPY config.yaml          /workspace/
 
 RUN chmod +x /workspace/scripts/*.py
 
-# Verify critical imports at build time — main env (no TTS) + the engine adapter
-# inside its venv.
+# Verify critical imports at build time
 RUN python3 -c "\
 import torch; \
 assert torch.__version__.startswith('2.8'), f'Wrong PyTorch: {torch.__version__}'; \
+assert torch.cuda.is_available() or True; \
 print(f'PyTorch {torch.__version__}'); \
 from faster_whisper import WhisperModel; print('✓ faster-whisper'); \
-print('Main env imports OK') \
+from TTS.api import TTS; print('✓ Coqui TTS (XTTS v2)'); \
+print('All imports OK') \
 "
-RUN PYTHONPATH=/workspace/scripts/tts \
-    "/workspace/venvs/${TTS_ENGINE}/bin/python" -c \
-    "import engines.${TTS_ENGINE} as e; assert hasattr(e, 'Adapter'); print('✓ TTS engine adapter:', '${TTS_ENGINE}')"
 
 VOLUME ["/workspace/videos", "/workspace/outputs", "/workspace/models"]
 

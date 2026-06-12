@@ -22,20 +22,28 @@ faster-whisper>=1.1.0
 # ── Speaker Diarization — pyannote.audio (optional, gated HF model) ───────────
 pyannote.audio>=3.3.0
 
-# ── Speaker Denoising (in priority order — first available is used) ────────────
-# DeepFilterNet best quality; noisereduce and FFmpeg anlmdn are fallbacks.
-deepfilternet
+# ── Speaker Denoising (noisereduce primary, FFmpeg anlmdn fallback) ────────────
+# DeepFilterNet was dropped: it has no cp312 wheel (needs a Rust toolchain to
+# build) and pins numpy<2.0, conflicting with the numpy 2.x stack. noisereduce
+# gives a clean voice-clone reference; FFmpeg anlmdn is the always-present fallback.
 noisereduce>=3.0.0
 
 # ── TTS — XTTS-v2 via Idiap fork of Coqui TTS ────────────────────────────────
 # MPL-2.0; multilingual (17 langs incl. French) zero-shot voice cloning at 24 kHz.
 # Auto-accepts the CPML license via COQUI_TOS_AGREED=1 (set in 04_setup.sh).
-coqui-tts>=0.27.0
+coqui-tts>=0.27.5
 # coqui-tts uses transformers internals removed in 5.x; pin to last 4.x.
-transformers<5
+# (coqui-tts 0.27.5 metadata declares transformers>=4.57 with no upper bound, but
+#  TTS/tts/layers/tortoise/autoregressive.py still imports isin_mps_friendly, which
+#  transformers 5.x removed — so TTS.api fails to import under 5.x. Keep <5.)
+transformers>=4.57,<5
 
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 pysrt>=1.1.2
+# pysrt pulls chardet unpinned (grabs 7.x). requests 2.32.x only recognises
+# chardet<6, so a 7.x install triggers a RequestsDependencyWarning on every
+# `import requests`. Cap it to keep requests' charset check happy.
+chardet<6
 
 # ── Translation transport — Ollama HTTP ──────────────────────────────────────
 requests>=2.32.0

@@ -17,7 +17,7 @@ The pipeline does everything from source separation through translation, voice�
 | Translation | **Qwen3:14b via Ollama** | Single natural pass + targeted compression; glossary prompt‑injection |
 | English‑echo guard | automatic re‑translation | Detects segments the LLM left in English and re‑translates them individually |
 | TTS | **Coqui XTTS‑v2** (Idiap fork, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; native French |
-| Speaker denoising | DeepFilterNet → noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
+| Speaker denoising | noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
 | Assembly | numpy timeline + Rubber Band time‑stretch + crossfade | **Holds the source timeline** (see timing policy); upsamples 24 kHz → 48 kHz |
 | Subtitles | **Hybrid BBC/Netflix shaper** | ≤2 lines, ≤42 cpl, ≤17 CPS reading speed, logical line breaks |
 | Output | AAC 192 kbps / 48 kHz stereo (+ optional full‑mix with background) + UTF‑8 SRT + optional muxed MP4 | Vimeo‑ready |
@@ -62,7 +62,7 @@ cd french-dubbing
 bash 04_setup.sh
 ```
 
-`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `DeepFilterNet`, `noisereduce`, `coqui-tts`, `transformers<5`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + XTTS‑v2 weights, and copies the pipeline into `/workspace/scripts/`.
+`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `noisereduce`, `coqui-tts`, `transformers<5`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + XTTS‑v2 weights, and copies the pipeline into `/workspace/scripts/`.
 
 ### 3. Verify
 
@@ -250,7 +250,7 @@ french-dubbing/
 ## License & attribution
 
 - Pipeline code, web UI, glue: **MIT**
-- faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · DeepFilterNet: MIT/Apache · Qwen3 (via Ollama): Apache 2.0 · FFmpeg: LGPL/GPL
+- faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · noisereduce: MIT · Qwen3 (via Ollama): Apache 2.0 · FFmpeg: LGPL/GPL
 - **Coqui XTTS‑v2 (Idiap fork): code MPL‑2.0; model weights [CPML — non‑commercial only](https://coqui.ai/cpml).** Auto‑accepted at install via `COQUI_TOS_AGREED=1`. ⚠️ For commercial dubbing you must obtain a commercial license from Coqui or swap in a permissively‑licensed cloning TTS — every other component is already commercial‑friendly.
 
 No proprietary APIs are required to run the pipeline end‑to‑end.

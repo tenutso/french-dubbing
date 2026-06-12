@@ -217,23 +217,15 @@ def main():
     c.check("demucs", ok2, f"v{ver}" if ok2 else "pip install demucs")
 
     # ── Speaker denoising ─────────────────────────────────────────────────────
-    print(f"\n{BLUE}Speaker denoising (at least one required){RESET}")
-    ok_df, ver_df = pkg("df")
+    print(f"\n{BLUE}Speaker denoising{RESET}")
     ok_nr, ver_nr = pkg("noisereduce")
-    if ok_df:
-        c.check("deepfilternet", True, f"v{ver_df}")
-    else:
-        c.warn("deepfilternet", "not installed — will try noisereduce fallback")
     if ok_nr:
-        c.check("noisereduce (fallback)", True, f"v{ver_nr}")
-    elif not ok_df:
-        c.check(
-            "speaker denoising", False,
-            "neither deepfilternet nor noisereduce installed. "
+        c.check("noisereduce", True, f"v{ver_nr}")
+    else:
+        c.warn(
+            "noisereduce", "not installed — will fall back to FFmpeg anlmdn. "
             "Run: pip install noisereduce"
         )
-    else:
-        c.warn("noisereduce (fallback)", "not installed — deepfilternet will be used")
 
     # ── transformers (required by coqui-tts XTTS) ─────────────────────────────
     print(f"\n{BLUE}transformers (XTTS dependency){RESET}")

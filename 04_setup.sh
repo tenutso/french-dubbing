@@ -55,6 +55,68 @@ PYCHECK
 
 log_success "Prerequisites OK"
 
+# ── Load configuration ─────────────────────────────────────────────────────
+# Read paths and model names from config.yaml so setup and the pipeline stay in
+# sync. Falls back to the documented defaults if a key (or the file) is missing.
+
+log_step "Loading configuration from config.yaml …"
+
+CONFIG_FILE="$SCRIPT_DIR/config.yaml"
+
+# PyYAML is installed properly in Step 9; ensure it's importable now so the
+# config reader below works before the main dependency install.
+$PYTHON -c "import yaml" 2>/dev/null \
+    || $PYTHON -m pip install --quiet --no-cache-dir pyyaml 2>/dev/null || true
+
+cfg() {
+    # cfg <dotted.key> <default> — prints the config value or the default.
+    local key="$1" default="$2" val
+    val=$($PYTHON - "$CONFIG_FILE" "$key" <<'PYEOF' 2>/dev/null
+import sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    for part in key.split("."):
+        data = data[part]
+    if data is None or data == "":
+        sys.exit(1)
+    print(data)
+except Exception:
+    sys.exit(1)
+PYEOF
+)
+    if [[ $? -ne 0 || -z "$val" ]]; then
+        echo "$default"
+    else
+        echo "$val"
+    fi
+}
+
+if [[ -f "$CONFIG_FILE" ]]; then
+    log_success "Using config: $CONFIG_FILE"
+else
+    log_warn "config.yaml not found at $CONFIG_FILE — using built-in defaults"
+fi
+
+# Paths
+INPUT_FOLDER=$(cfg  pipeline.input_folder  /workspace/videos/input)
+OUTPUT_FOLDER=$(cfg pipeline.output_folder /workspace/outputs)
+MODELS_FOLDER=$(cfg pipeline.models_folder /workspace/models)
+LOGS_FOLDER=$(cfg   pipeline.logs_folder   /workspace/logs)
+TEMP_FOLDER=$(cfg   pipeline.temp_folder   /workspace/temp)
+WHISPER_CACHE="$MODELS_FOLDER/whisper"
+
+# Models
+WHISPER_MODEL=$(cfg     whisper.model      large-v3)
+OLLAMA_MODEL=$(cfg      translation.model  qwen3:14b)
+XTTS_MODEL=$(cfg        tts.xtts_model     tts_models/multilingual/multi-dataset/xtts_v2)
+DIARIZATION_MODEL=$(cfg diarization.model  pyannote/speaker-diarization-community-1)
+
+log_success "Paths: input=$INPUT_FOLDER output=$OUTPUT_FOLDER models=$MODELS_FOLDER"
+log_success "Models: whisper=$WHISPER_MODEL ollama=$OLLAMA_MODEL xtts=$XTTS_MODEL"
+
 # ── Step 1: System packages ────────────────────────────────────────────────
 
 log_step "Installing system packages …"
@@ -74,7 +136,8 @@ fi
 
 log_step "Creating workspace at /workspace …"
 
-if mkdir -p /workspace/{videos/input,models/whisper,outputs,scripts,logs,temp} && \
+if mkdir -p "$INPUT_FOLDER" "$OUTPUT_FOLDER" "$WHISPER_CACHE" \
+            "$LOGS_FOLDER" "$TEMP_FOLDER" /workspace/scripts && \
    chmod -R 755 /workspace; then
     log_success "Workspace ready"
 else
@@ -82,7 +145,7 @@ else
 fi
 
 # Relocate log to workspace
-LOGFILE=/workspace/logs/setup.log
+LOGFILE="$LOGS_FOLDER/setup.log"
 cat /tmp/dubbing_setup.log >> "$LOGFILE" 2>/dev/null || true
 
 # ── Step 3: Python package upgrades ───────────────────────────────────────
@@ -160,20 +223,11 @@ else
     log_warn "Demucs install failed — pipeline falls back to raw audio (lower voice-clone quality)"
 fi
 
-# ── Step 8b: Speaker denoising — DeepFilterNet (+ noisereduce fallback) ──────
-
-log_step "Installing DeepFilterNet (speaker reference denoising) …"
-
-if $PYTHON -m pip install --no-cache-dir "deepfilternet>=0.5.6" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "DeepFilterNet installed"
-else
-    log_warn "DeepFilterNet install failed — will rely on noisereduce fallback"
-fi
-
-# noisereduce is the pure-Python fallback denoiser used if DeepFilterNet is
-# missing or errors at runtime. Install regardless so the fallback always works.
-log_step "Installing noisereduce (denoise fallback) …"
+# ── Step 8b: Speaker denoising — noisereduce (+ FFmpeg anlmdn fallback) ──────
+# DeepFilterNet was dropped (no cp312 wheel → needs Rust; and pins numpy<2.0,
+# which conflicts with the numpy 2.x stack). noisereduce is the primary denoiser;
+# FFmpeg anlmdn is the always-present runtime fallback.
+log_step "Installing noisereduce (speaker reference denoising) …"
 
 if $PYTHON -m pip install --no-cache-dir "noisereduce>=3.0.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
@@ -209,9 +263,10 @@ fi
 
 log_step "Installing XTTS-v2 (coqui-tts) …"
 
-# coqui-tts imports transformers symbols removed in 5.x — pin to last 4.x.
-# Install transformers first so coqui-tts doesn't pull 5.x as a transitive.
-if $PYTHON -m pip install --no-cache-dir "transformers<5" "coqui-tts>=0.27.0" \
+# coqui-tts imports transformers symbols removed in 5.x (isin_mps_friendly in the
+# tortoise autoregressive layer) — pin to last 4.x. Install transformers first so
+# coqui-tts doesn't pull 5.x as a transitive.
+if $PYTHON -m pip install --no-cache-dir "transformers>=4.57,<5" "coqui-tts>=0.27.5" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "coqui-tts (XTTS-v2) installed"
 else
@@ -227,7 +282,7 @@ echo "export COQUI_TOS_AGREED=1" >> /workspace/.env 2>/dev/null || true
 log_step "Installing utility packages …"
 
 if $PYTHON -m pip install --no-cache-dir \
-       "pysrt>=1.1.2" "requests>=2.32.0" \
+       "pysrt>=1.1.2" "chardet<6" "requests>=2.32.0" \
        "tqdm>=4.66.0" "click>=8.1.7" "pyyaml>=6.0.1" \
        "python-dotenv>=1.0.0" "hf_transfer>=0.1.6" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
@@ -270,7 +325,7 @@ log_step "Starting Ollama service …"
 if pgrep -x ollama > /dev/null 2>&1; then
     log_success "Ollama already running"
 elif command -v ollama &>/dev/null; then
-    OLLAMA_MODELS="$OLLAMA_MODELS" nohup ollama serve > /workspace/logs/ollama.log 2>&1 &
+    OLLAMA_MODELS="$OLLAMA_MODELS" nohup ollama serve > "$LOGS_FOLDER/ollama.log" 2>&1 &
     # Wait up to 30 s for readiness
     READY=0
     for i in $(seq 1 15); do
@@ -281,7 +336,7 @@ elif command -v ollama &>/dev/null; then
             break
         fi
     done
-    [[ $READY -eq 0 ]] && log_error "Ollama did not start in 30 s — check /workspace/logs/ollama.log"
+    [[ $READY -eq 0 ]] && log_error "Ollama did not start in 30 s — check $LOGS_FOLDER/ollama.log"
 else
     log_warn "Ollama not installed — skipping service start"
 fi
@@ -305,9 +360,9 @@ pull_with_retry() {
 }
 
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    pull_with_retry "qwen3:14b"
+    pull_with_retry "$OLLAMA_MODEL"
 else
-    log_warn "Ollama not reachable — skipping model download. Run: ollama pull qwen3:14b"
+    log_warn "Ollama not reachable — skipping model download. Run: ollama pull $OLLAMA_MODEL"
 fi
 
 # ── Step 12b: HuggingFace token (pyannote diarization is a gated model) ──────
@@ -325,7 +380,7 @@ HF_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-${HUGGINGFACE_HUB_TOKEN:-}}}"
 if [[ -z "$HF_TOKEN" ]]; then
     echo ""
     echo -e "${YELLOW}pyannote diarization uses a gated HuggingFace model.${NC}"
-    echo "  1. Accept license: https://huggingface.co/pyannote/speaker-diarization-community-1"
+    echo "  1. Accept license: https://huggingface.co/$DIARIZATION_MODEL"
     echo "  2. Get your token: https://huggingface.co/settings/tokens (read permission)"
     echo ""
     read -rp "  Enter HuggingFace token (or press Enter to skip): " HF_TOKEN
@@ -359,17 +414,20 @@ fi
 
 # ── Step 13: Pre-download Whisper large-v3 ────────────────────────────────
 
-log_step "Pre-downloading Whisper large-v3 (~3 GB) …"
+log_step "Pre-downloading Whisper $WHISPER_MODEL (~3 GB) …"
 
-if $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+if WHISPER_MODEL="$WHISPER_MODEL" WHISPER_CACHE="$WHISPER_CACHE" \
+   $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+import os
 from faster_whisper import WhisperModel
-print("Downloading Whisper large-v3 to /workspace/models/whisper …")
-m = WhisperModel("large-v3", device="cpu", compute_type="int8",
-                 download_root="/workspace/models/whisper")
+model = os.environ["WHISPER_MODEL"]
+cache = os.environ["WHISPER_CACHE"]
+print(f"Downloading Whisper {model} to {cache} …")
+m = WhisperModel(model, device="cpu", compute_type="int8", download_root=cache)
 del m
-print("✓ Whisper large-v3 cached")
+print(f"✓ Whisper {model} cached")
 PYEOF
-    log_success "Whisper large-v3 cached"
+    log_success "Whisper $WHISPER_MODEL cached"
 else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
@@ -378,11 +436,12 @@ fi
 
 log_step "Pre-downloading XTTS-v2 model (~1.9 GB) …"
 
-if COQUI_TOS_AGREED=1 $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+if COQUI_TOS_AGREED=1 XTTS_MODEL="$XTTS_MODEL" $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+import os
 try:
     from TTS.api import TTS
     print("Downloading XTTS-v2 weights from HuggingFace …")
-    t = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
+    t = TTS(os.environ["XTTS_MODEL"])
     del t
     print("✓ XTTS-v2 cached")
 except ImportError:
@@ -404,13 +463,13 @@ fi
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper pyannote.audio deepfilternet noisereduce \
+       faster-whisper pyannote.audio noisereduce \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"
 
 if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    ollama pull qwen3:14b 2>&1 | tail -3 | tee -a "$LOGFILE" || true
+    ollama pull "$OLLAMA_MODEL" 2>&1 | tail -3 | tee -a "$LOGFILE" || true
 fi
 
 # ── Step 16: Install scripts & config ─────────────────────────────────────
@@ -484,9 +543,9 @@ echo "==========================================" | tee -a "$LOGFILE"
 echo ""
 echo "Next steps:"
 echo "  1. Verify:  python /workspace/scripts/verify_setup.py"
-echo "  2. Copy:    cp *.mp4 /workspace/videos/input/"
+echo "  2. Copy:    cp *.mp4 $INPUT_FOLDER/"
 echo "  3. Single:  python /workspace/scripts/02_pipeline.py \\"
-echo "                --video /workspace/videos/input/webinar.mp4"
+echo "                --video $INPUT_FOLDER/webinar.mp4"
 echo "  4. Batch:   python /workspace/scripts/03_batch_runner.py"
 echo "  5. Web UI:  bash /workspace/scripts/05_web.sh"
 echo "              then open the RunPod-proxied URL on port 7860"

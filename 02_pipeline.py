@@ -10,7 +10,7 @@ Stack (single, fixed path):
   Segment merging   : sentence-scale chunks     (8–12s, no sub-second fragments)
   Diarization (opt) : pyannote-audio            (per-speaker voice profiles)
   Translation       : Qwen3:14b via Ollama      (natural pass + English-echo guard)
-  Speaker denoising : DeepFilterNet             (clean voice reference)
+  Speaker denoising : noisereduce              (clean voice reference)
   TTS               : Coqui XTTS-v2 at 24 kHz   (multilingual voice cloning)
   Assembly          : Rubber Band stretch       (no_drop: never truncate; reading-pace slow-down)
   Subtitles         : hybrid BBC/Netflix shaper (≤2 lines, ≤42 cpl, ≤17 CPS)
@@ -1833,26 +1833,7 @@ def denoise_audio(
     output_path: str,
     log: logging.Logger,
 ) -> str:
-    """Denoise speaker reference. Tries DeepFilterNet → noisereduce → FFmpeg anlmdn."""
-    try:
-        from df.enhance import enhance, init_df
-        try:
-            from df.enhance import load_audio, save_audio
-        except ImportError:
-            from df.io import load_audio, save_audio
-
-        log.info("Denoising with DeepFilterNet …")
-        model, df_state, _ = init_df()
-        audio, _  = load_audio(audio_path, sr=df_state.sr())
-        enhanced  = enhance(model, df_state, audio)
-        save_audio(output_path, enhanced, df_state.sr())
-        log.info("✓ Speaker reference denoised (DeepFilterNet)")
-        return output_path
-    except ImportError:
-        log.debug("DeepFilterNet not available — trying noisereduce")
-    except Exception as e:
-        log.warning(f"DeepFilterNet failed ({e}) — trying noisereduce")
-
+    """Denoise speaker reference. Tries noisereduce → FFmpeg anlmdn."""
     try:
         import noisereduce as nr
         import soundfile as _sf

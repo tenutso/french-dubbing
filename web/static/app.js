@@ -391,12 +391,22 @@ function applyPreset(p) {
     : `preset "${p.label}" matches current config`;
 }
 
+// The TTS engine currently in effect for the form (pending change wins over the
+// saved value). Engine-specific fields (f.engine) only render for this engine.
+function currentEngine() {
+  if ("tts.engine" in configDirty) return configDirty["tts.engine"];
+  return configValues["tts.engine"] || "xtts";
+}
+
 function renderConfigFields() {
   const root = $("#advanced-fields");
   root.innerHTML = "";
-  // Group by `group`
+  const eng = currentEngine();
+  // Group by `group`, dropping engine-specific fields that don't match the
+  // selected engine so each engine shows only its own essential params.
   const groups = new Map();
   for (const f of configSchema) {
+    if (f.engine && f.engine !== eng) continue;
     if (!groups.has(f.group)) groups.set(f.group, []);
     groups.get(f.group).push(f);
   }
@@ -495,6 +505,8 @@ function onFieldChange(ev) {
     configDirty[path] = val;
     el.closest(".cfg-field").classList.add("dirty");
   }
+  // Switching engine changes which per-engine fields are relevant — re-render.
+  if (path === "tts.engine") renderConfigFields();
   updateAdvancedSummary();
 }
 

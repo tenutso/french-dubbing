@@ -45,10 +45,11 @@ else
     git -C "$REPO_DIR" clean -fd
 fi
 
-# 2. Setup: idempotent. Re-runs only if requirements.txt changed since last boot.
-REQ_HASH=$(sha256sum "$REPO_DIR/requirements.txt" | awk '{print $1}')
+# 2. Setup: idempotent. Re-runs if ANY requirements file changed since last boot
+#    (main env or any engine venv), so TTS engine dep changes re-trigger setup.
+REQ_HASH=$(cat "$REPO_DIR"/requirements*.txt | sha256sum | awk '{print $1}')
 if [[ -f "$MARKER" && "$(cat "$MARKER")" == "$REQ_HASH" ]]; then
-    echo "Setup already current (requirements.txt unchanged) — skipping."
+    echo "Setup already current (requirements unchanged) — skipping."
 else
     echo "Running 04_setup.sh (this takes ~10 min on first boot) …"
     bash "$REPO_DIR/04_setup.sh"

@@ -98,15 +98,25 @@ CONFIG_SCHEMA: dict = {
     "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
     "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
 
-    # TTS
+    # TTS — engine selector
+    "tts.engine":                      ("str",   "TTS engine",              "Voice-synthesis backend, each in its own isolated venv. xtts/chatterbox/f5_tts are self-hosted and clone the speaker locally; elevenlabs is a cloud API (needs ELEVENLABS_API_KEY). Switching engine takes effect on the next job; its venv must be built by 04_setup.sh.", {"choices": ["xtts", "chatterbox", "elevenlabs", "f5_tts"], "group": "TTS engine"}),
+
+    # Per-engine essentials — each shown only when its engine is selected. Leave a
+    # field blank to use the engine's built-in default. Advanced knobs (sampling
+    # tails, model variants, API voice settings) stay in config.yaml.
+    "tts.xtts_temperature":            ("float", "Temperature",             "XTTS sampling temperature. Lower = more monotone/stable. Default 0.65.", {"min": 0.1, "max": 1.2, "step": 0.05, "group": "TTS engine", "engine": "xtts"}),
+    "tts.engine_params.exaggeration":  ("float", "Exaggeration",            "Chatterbox emotion/intensity. Default 0.5.", {"min": 0.0, "max": 2.0, "step": 0.05, "group": "TTS engine", "engine": "chatterbox"}),
+    "tts.engine_params.cfg_weight":    ("float", "CFG weight",              "Chatterbox classifier-free guidance weight. Default 0.5.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "TTS engine", "engine": "chatterbox"}),
+    "tts.engine_params.temperature":   ("float", "Temperature",             "Chatterbox sampling temperature. Default 0.8.", {"min": 0.05, "max": 1.5, "step": 0.05, "group": "TTS engine", "engine": "chatterbox"}),
+    "tts.engine_params.stability":     ("float", "Stability",               "ElevenLabs voice stability. Higher = steadier, lower = more expressive. Default 0.5.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "TTS engine", "engine": "elevenlabs"}),
+    "tts.engine_params.similarity_boost": ("float", "Similarity boost",     "ElevenLabs adherence to the cloned voice. Default 0.75.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "TTS engine", "engine": "elevenlabs"}),
+    "tts.engine_params.remove_silence": ("bool", "Remove silence",          "F5-TTS: trim leading/trailing silence from each clip. Default off.", {"group": "TTS engine", "engine": "f5_tts"}),
+
+    # TTS — engine-agnostic timing & assembly (apply to every engine)
     "tts.timing_policy":               ("str",   "Timing policy",           "anchored holds the source timeline (speed dense runs up, re-anchor drift at pauses) so the dub stays in sync over a full program. no_drop never speeds up and drifts longer than the video. lock truncates overflow.", {"choices": ["anchored", "no_drop", "lock"], "group": "TTS"}),
-    "tts.xtts_temperature":            ("float", "XTTS temperature",        "Lower = more monotone.", {"min": 0.1, "max": 1.2, "step": 0.05, "group": "TTS"}),
-    "tts.xtts_repetition_penalty":     ("float", "Repetition penalty",      "", {"min": 1.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
-    "tts.xtts_top_p":                  ("float", "Top-p",                   "", {"min": 0.1, "max": 1.0, "step": 0.05, "group": "TTS"}),
-    "tts.xtts_top_k":                  ("int",   "Top-k",                   "", {"min": 1, "max": 200, "step": 1, "group": "TTS"}),
     "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
     "tts.speaker_profile_skip":        ("int",   "Speaker clip skip (s)",   "Seconds to skip from start (avoids intro music).", {"min": 0, "max": 600, "step": 1, "group": "TTS"}),
-    "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
+    "tts.use_deepfilter":              ("bool",  "DeepFilterNet denoise",   "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
     "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
     "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
     "tts.group_gap":                   ("float", "Group gap (s)",           "Consecutive segments within this gap share one stretch ratio.", {"min": 0.0, "max": 3.0, "step": 0.1, "group": "TTS"}),
@@ -649,9 +659,25 @@ async def update_config(payload: dict, force: bool = False) -> JSONResponse:
     if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and smin > smax:
         raise HTTPException(400, "tts.min_stretch must be ≤ tts.max_stretch")
 
-    # Write — comment-preserving line rewrite for known leaves
+    # Split nested tts.engine_params.* (block writer) from flat leaves (line writer).
+    ep_prefix = "tts.engine_params."
+    flat_coerced = {k: v for k, v in coerced.items() if not k.startswith(ep_prefix)}
+    ep_coerced = {k[len(ep_prefix):]: v for k, v in coerced.items() if k.startswith(ep_prefix)}
+    # Full merged engine_params (existing keys + this request's updates) — used to
+    # expand an inline `engine_params: {}` into block form without dropping keys.
+    merged_ep = _get_dotted(merged, "tts.engine_params")
+    if not isinstance(merged_ep, dict):
+        merged_ep = dict(ep_coerced)
+
+    def _write_config(p: Path) -> list[str]:
+        w = _rewrite_yaml_leaves(p, flat_coerced)
+        if ep_coerced:
+            w = w + _rewrite_engine_params(p, ep_coerced, merged_ep)
+        return w
+
+    # Write — comment-preserving rewrite for known leaves
     try:
-        written = _rewrite_yaml_leaves(CONFIG_PATH, coerced)
+        written = _write_config(CONFIG_PATH)
     except Exception as e:
         raise HTTPException(500, f"failed to write config: {e}")
 
@@ -660,7 +686,7 @@ async def update_config(payload: dict, force: bool = False) -> JSONResponse:
     for mp in CONFIG_MIRRORS:
         try:
             if mp.exists() and mp.resolve() != CONFIG_PATH.resolve():
-                _rewrite_yaml_leaves(mp, coerced)
+                _write_config(mp)
                 mirrored.append(str(mp))
         except Exception as e:
             log.warning("mirror write failed for %s: %s", mp, e)
@@ -673,6 +699,20 @@ async def update_config(payload: dict, force: bool = False) -> JSONResponse:
     })
 
 
+def _yaml_fmt(v) -> str:
+    """Render a Python scalar as a YAML inline value (shared by both writers)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v) if isinstance(v, float) else str(v)
+    if isinstance(v, str):
+        # Quote if it contains chars that YAML would otherwise mis-parse
+        if v == "" or any(c in v for c in ":#'\"\n") or v.strip() != v:
+            return yaml.safe_dump(v).strip()
+        return v
+    return yaml.safe_dump(v, default_flow_style=True).strip()
+
+
 def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
     """In-place rewrite of `key: value` lines under their parent section.
 
@@ -680,6 +720,9 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
     sections (translation:, tts:, …) are tracked via indentation depth.
     For any key not found, the line is appended under its section header
     (or at end of file if the section is absent).
+
+    Nested paths (a.b.c) are NOT handled here — engine_params.* is written by
+    _rewrite_engine_params instead.
     """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -690,17 +733,7 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
         head, _, leaf = dotted.partition(".")
         by_section.setdefault(head, {})[leaf] = val
 
-    def fmt(v) -> str:
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, (int, float)):
-            return repr(v) if isinstance(v, float) else str(v)
-        if isinstance(v, str):
-            # Quote if it contains chars that YAML would otherwise mis-parse
-            if v == "" or any(c in v for c in ":#'\"\n") or v.strip() != v:
-                return yaml.safe_dump(v).strip()
-            return v
-        return yaml.safe_dump(v, default_flow_style=True).strip()
+    fmt = _yaml_fmt
 
     out: list[str] = []
     written: list[str] = []
@@ -766,6 +799,104 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
                 for k, v in kvs.items():
                     out.append(f"  {k}: {fmt(v)}")
             written.extend(f"{sec}.{k}" for k in kvs)
+
+    path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
+    return written
+
+
+def _rewrite_engine_params(path: Path, updates: dict, merged: dict) -> list[str]:
+    """In-place update of keys under ``tts.engine_params``.
+
+    ``updates`` maps bare param names (e.g. "stability") to the changed values;
+    ``merged`` is the full engine_params dict (existing keys + updates) used only
+    when expanding an inline ``engine_params: {}`` into block form. Existing
+    block-form children NOT in ``updates`` — including hand-added advanced keys —
+    are left byte-for-byte intact (comments and all). This is what lets the UI own
+    a few essential knobs while the rest live, hand-edited, in config.yaml.
+    """
+    if not updates:
+        return []
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    out: list[str] = []
+    written: list[str] = []
+    in_tts = False
+    handled = False
+    tts_last_out_idx = -1
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+
+        # Track the tts: top-level section.
+        if indent == 0 and stripped and not stripped.startswith("#") and stripped.rstrip().endswith(":"):
+            in_tts = stripped.rstrip()[:-1].strip() == "tts"
+
+        m = re.match(r"^(\s*)engine_params\s*:(.*)$", line)
+        if in_tts and not handled and m and indent > 0:
+            lead = m.group(1)
+            rest = m.group(2).strip()
+            child_lead = lead + "  "
+            if rest.startswith("{"):
+                # Inline form ({} or {k: v}) — expand to a block with every merged
+                # key (inline dicts carry no comments, so nothing is lost).
+                out.append(f"{lead}engine_params:")
+                for k, v in merged.items():
+                    out.append(f"{child_lead}{k}: {_yaml_fmt(v)}")
+                    if k in updates:
+                        written.append(f"tts.engine_params.{k}")
+                handled = True
+                i += 1
+                continue
+            # Block form — keep the header, then edit/keep/append children.
+            out.append(line)
+            i += 1
+            present: set[str] = set()
+            insert_idx = len(out)  # after last real child
+            while i < n:
+                cl = lines[i]
+                cs = cl.lstrip()
+                ci = len(cl) - len(cs)
+                if cs == "" or ci <= indent:
+                    break  # blank line or dedent ends the block
+                cm = re.match(r"^(\s*)([A-Za-z_][\w-]*)\s*:(.*)$", cl)
+                if cm and cm.group(2) in updates:
+                    key = cm.group(2)
+                    crest = cm.group(3)
+                    comment = ""
+                    if "#" in crest:
+                        comment = "  " + crest[crest.find("#"):].strip()
+                    out.append(f"{cm.group(1)}{key}: {_yaml_fmt(updates[key])}{comment}")
+                    written.append(f"tts.engine_params.{key}")
+                    present.add(key)
+                else:
+                    out.append(cl)
+                    if cm:
+                        present.add(cm.group(2))
+                insert_idx = len(out)
+                i += 1
+            new_lines = [
+                f"{child_lead}{k}: {_yaml_fmt(v)}"
+                for k, v in updates.items() if k not in present
+            ]
+            out[insert_idx:insert_idx] = new_lines
+            written.extend(f"tts.engine_params.{k}" for k, v in updates.items() if k not in present)
+            handled = True
+            continue
+
+        out.append(line)
+        if in_tts and indent > 0 and stripped and not stripped.startswith("#"):
+            tts_last_out_idx = len(out) - 1
+        i += 1
+
+    # Fallback: no engine_params key existed — append a block at the tts section end.
+    if not handled and tts_last_out_idx >= 0:
+        block = [f"  engine_params:"] + [f"    {k}: {_yaml_fmt(v)}" for k, v in merged.items()]
+        out[tts_last_out_idx + 1:tts_last_out_idx + 1] = block
+        written.extend(f"tts.engine_params.{k}" for k in updates)
 
     path.write_text("\n".join(out) + ("\n" if text.endswith("\n") else ""), encoding="utf-8")
     return written

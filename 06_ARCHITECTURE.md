@@ -22,7 +22,7 @@ MP4
  │        ├─ compression pass (over-budget segments only)
  │        └─ always-substitute glossary (deterministic)
  │
- ├─▶ 6. Voice references         per-speaker 25 s clips, noisereduce-denoised
+ ├─▶ 6. Voice references         per-speaker 25 s clips, DeepFilterNet-denoised
  │
  ├─▶ 7. TTS                      Coqui XTTS-v2 zero-shot cloning (24 kHz)
  │
@@ -96,7 +96,7 @@ roughly half the VRAM, leaving headroom for Whisper + XTTS to stay resident. Swa
 ## 6. Voice references
 
 A ~25 s reference clip is extracted per speaker (skipping the first ~20 s of intro/music) and
-denoised through noisereduce → FFmpeg `anlmdn` (whichever is available). XTTS
+denoised through DeepFilterNet → noisereduce → FFmpeg `anlmdn` (whichever is available). XTTS
 clones timbre from this clip, so a clean reference is what preserves the original voice.
 
 ## 7. TTS — Coqui XTTS‑v2 (Idiap fork)

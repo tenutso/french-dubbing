@@ -1,0 +1,6 @@
+# TTS engine venv — ElevenLabs.
+# Installed into /workspace/venvs/elevenlabs by 04_setup.sh; driven by
+# tts/engines/elevenlabs.py.
+requests
+soundfile>=0.12.1
+numpy

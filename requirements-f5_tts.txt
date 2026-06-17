@@ -1,0 +1,15 @@
+# TTS engine venv — F5-TTS (SWivid/F5-TTS).
+# Installed into /workspace/venvs/f5_tts by 04_setup.sh; driven by
+# tts/engines/f5_tts.py. MUST be isolated: f5-tts pulls its own
+# transformers/vocos/torchaudio stack.
+#
+# torch/torchaudio match the RunPod CUDA 12.8 base. Install with:
+#   pip install -r requirements-f5_tts.txt --extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchaudio==2.8.0
+
+f5-tts
+
+# Audio I/O used by the worker (sf.read/write).
+soundfile>=0.12.1
+numpy

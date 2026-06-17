@@ -9,6 +9,8 @@
 # matching cu12x torch wheel here explicitly.
 
 chatterbox-tts
+# Pin setuptools below 82.0.0 because >=82.0.0 removes pkg_resources, which resemble-perth requires.
+setuptools<82.0.0
 
 # Audio I/O used by the worker (sf.read/write).
 soundfile>=0.12.1

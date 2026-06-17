@@ -1,0 +1,12 @@
+# TTS engine venv — Google Cloud Text-to-Speech (Neural2 / WaveNet / Studio).
+# Installed into /workspace/venvs/google_tts by 04_setup.sh; driven by
+# tts/engines/google_tts.py.
+#
+# google-cloud-texttospeech is only needed for service-account / ADC auth. If you
+# authenticate with an API key (engine_params.api_key), the adapter uses the REST
+# endpoint and requests/soundfile alone are sufficient — but it's pinned here so
+# both auth paths work out of the box.
+google-cloud-texttospeech>=2.16.0
+requests
+soundfile>=0.12.1
+numpy

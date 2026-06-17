@@ -107,7 +107,7 @@ translation:
   batch_size: 20
   # Optional self-review pass — Qwen rereads its own output and fixes
   # Anglicisms / register slips. Roughly doubles translation time.
-  review_pass: false
+  review_pass: true
   # Targeted compression pass — after the main translation, re-prompt only
   # the segments still over budget_cps with a tighter "rewrite shorter,
   # preserve meaning" brief. Cheap (operates on a minority of segments) and
@@ -122,6 +122,16 @@ translation:
   # (less expansion → less speed-up needed → better sync). Raising it gives the
   # LLM more headroom but reintroduces drift. Keep ≤ subtitles.max_cps / reading_cps.
   budget_cps: 15
+  # Target syllables-per-second ceiling, used as a SECOND over-budget gate
+  # alongside budget_cps in the compression pass. French syllable count tracks
+  # speaking time better than raw characters, so a segment that is dense by either
+  # chars/sec or syllables/sec gets a compression attempt. ~6 syl/s is a
+  # comfortable spoken-French dubbing pace; lower = more aggressive compression.
+  target_sps: 6.0
+  # Write one per-segment metrics CSV per stage into the video's output_dir
+  # ({name}_metrics_<stage>.csv) with EN/FR chars, expansion %, target/actual CPS,
+  # syllable rate and density ratio — for offline tuning of budget_cps/target_sps.
+  metrics_csv: true
 
   # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
@@ -140,10 +150,45 @@ translation:
   huggingface_token: ""
 
 # ============================================================
-# Text-to-Speech — Coqui XTTS-v2 (Idiap fork)
-# Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
+# Text-to-Speech
+# The engine runs out-of-process in its own venv (/workspace/venvs/<engine>),
+# so each engine's dependencies stay isolated. Add a new engine by dropping a
+# tts/engines/<name>.py adapter + requirements-<name>.txt — no pipeline edits.
 # ============================================================
 tts:
+  # Adapter name in tts/engines/. "xtts" (default) reads the xtts_* keys below.
+  engine: f5_tts  # xtts | chatterbox | elevenlabs | f5_tts | google_tts | <your-adapter>
+  # Opaque, engine-specific knobs handed verbatim to the adapter. Ignored by
+  # xtts (which uses the xtts_* keys). Examples per engine:
+  #   chatterbox:  { exaggeration: 0.5, cfg_weight: 0.5, temperature: 0.8 }
+  #   elevenlabs:  { model_id: eleven_multilingual_v2, stability: 0.5,
+  #                  similarity_boost: 0.75, style: 0.0, use_speaker_boost: true }
+  #                # API key comes from the ELEVENLABS_API_KEY env var (preferred)
+  #                # — do NOT put it here. Set voice_id to reuse a pre-made voice
+  #                # instead of cloning the reference clip on the fly.
+  #   f5_tts:      { model: F5TTS_v1_Base, ref_text: "", remove_silence: false }
+  #   google_tts:  { voice_name: fr-CA-Neural2-A, api_key: GOOGLE_TTS_API_KEY }
+  #                # Google Cloud TTS (Neural2/WaveNet/Studio). Cloud API, fixed
+  #                # voice — does NOT clone the speaker. voice_name picks language +
+  #                # tier (…-Neural2-…, …-Wavenet-…, …-Studio-…). api_key is the env
+  #                # var NAME holding the key; or use credentials_path for a
+  #                # service-account JSON. See tts/engines/google_tts.py.
+  #
+  # f5_tts + French: the stock F5TTS_v1_Base checkpoint is English/Chinese only,
+  # so French text comes out mispronounced. Point it at a French fine-tune via
+  # hf_repo (auto-downloaded + pre-cached by setup) and set `model` to the
+  # fine-tune's architecture. To revert to the English base, set engine_params: {}.
+  # `ckpt_file`/`vocab_file` (local paths) override hf_repo if you have weights on disk.
+  engine_params:
+    model: F5TTS_Base        # RASPIAUDIO fine-tune is the v0 architecture, NOT v1
+    hf_repo: RASPIAUDIO/F5-French-MixedSpeakers-reduced
+    hf_ckpt_file: model_last_reduced.pt
+    hf_vocab_file: vocab.txt
+    ref_text: ""
+    remove_silence: false
+
+  # ── XTTS-v2 (Coqui / Idiap fork) settings — used when engine: xtts ──────────
+  # Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
   xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
   # XTTS sampling. 0.65 is a stable default; lower = more monotone.
   xtts_temperature: 0.65
@@ -157,8 +202,7 @@ tts:
   # Skip this many seconds from the start (avoids intro music / titles).
   speaker_profile_skip: 20
 
-  # Denoise the speaker reference clip before voice cloning
-  # (noisereduce, with an FFmpeg anlmdn fallback). Key name kept for back-compat.
+  # DeepFilterNet denoising on the speaker reference clip.
   use_deepfilter: true
 
   # Per-group speed-up cap. In timing_policy=anchored this is how much a dense

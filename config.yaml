@@ -100,7 +100,7 @@ whisper:
 # ============================================================
 translation:
   # Qwen3:14b via Ollama. /no_think is sent automatically for qwen3.* tags.
-  model: qwen3:32b
+  model: qwen3:14b
   temperature: 0.3
   # 20 segments per Ollama call. Bigger batches save calls but risk hitting
   # the 4096-token output budget if segments are long.

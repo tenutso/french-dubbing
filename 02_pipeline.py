@@ -225,6 +225,8 @@ class PipelineConfig:
     # Fix #2: lightly LLM-shorten only the cues still over the reading-speed cap
     # after #1, so dense subtitles become readable with minimal divergence.
     subtitle_condense: bool = True
+    # How many iterative LLM rounds Fix #2 spends shortening still-dense cues.
+    subtitle_condense_rounds: int = 3
 
     # Sample rates
     synthesis_sample_rate: int = 48000
@@ -355,6 +357,7 @@ def load_config(path: str) -> PipelineConfig:
         subtitle_min_gap=float(sub.get("min_gap", 0.083)),
         subtitle_max_lag=float(sub.get("max_lag", 3.0)),
         subtitle_condense=bool(sub.get("condense", True)),
+        subtitle_condense_rounds=int(sub.get("condense_rounds", 3)),
         synthesis_sample_rate=aud.get("synthesis_sample_rate", 48000),
         output_sample_rate=aud.get("output_sample_rate", 48000),
         mux_video=bool(out.get("mux_video", True)),
@@ -2996,6 +2999,7 @@ def condense_overlong_cues(
     log: logging.Logger,
     target_lang: str = "fr",
     margin: float = 1.08,
+    rounds: int = 3,
 ) -> List[dict]:
     """Fix #2 — lightly shorten only the cues still over the reading-speed cap.
 
@@ -3003,44 +3007,62 @@ def condense_overlong_cues(
     whose French is still denser than `max_cps` even with the bounded lag. Each
     offender is rewritten to fit `floor(duration × max_cps)` characters, keeping
     meaning. Rewrites are accepted only when strictly shorter, so a cue can never
-    get longer. Timing is left untouched (the cue already covers its audio)."""
+    get longer. Timing is left untouched (the cue already covers its audio).
+
+    Iterative (mirrors compress_overflowing_translations): each round recomputes
+    the offenders from the *current* cue text, so converged cues drop out and
+    stubborn ones get re-prompted against their now-shorter text. A single pass
+    leaves many dense cues unfixed; several light rounds converge most of them.
+    Genuinely fast-source cues may never fully fit and are left as-is."""
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
+    BATCH = 15
 
     def _cps(c) -> float:
         d = c["end"] - c["start"]
         return (len(c["text"].replace("\n", " ")) / d) if d > 0 else 0.0
 
-    offenders = [(i, c) for i, c in enumerate(cues) if _cps(c) > max_cps * margin]
-    if not offenders:
-        log.debug("✓ Subtitle condensation: all cues within reading speed")
-        return cues
+    for rnd in range(1, max(1, rounds) + 1):
+        # Recompute offenders from the latest text each round.
+        offenders = [(i, c) for i, c in enumerate(cues) if _cps(c) > max_cps * margin]
+        if not offenders:
+            if rnd == 1:
+                log.debug("✓ Subtitle condensation: all cues within reading speed")
+            else:
+                log.info(f"✓ Subtitle condensation converged after {rnd - 1} round(s)")
+            break
 
-    log.info(
-        f"Subtitle condensation: {len(offenders)} cue(s) over {max_cps:.0f} CPS "
-        f"— shortening to fit reading speed"
-    )
-    BATCH = 15
-    applied = 0
-    for bs in range(0, len(offenders), BATCH):
-        chunk = offenders[bs:bs + BATCH]
-        numbered = "\n".join(
-            f"{j + 1}. [≤{max(8, int((c['end'] - c['start']) * max_cps))} chars] "
-            f"{c['text'].replace(chr(10), ' ')}"
-            for j, (_i, c) in enumerate(chunk)
+        log.info(
+            f"Subtitle condensation round {rnd}/{rounds}: {len(offenders)} cue(s) "
+            f"over {max_cps:.0f} CPS — shortening to fit reading speed"
         )
-        prompt = think_prefix + _SUB_CONDENSE_PROMPT.format(language=language, lines=numbered)
-        resp = _ollama_call(prompt, model, temperature, log)
-        if not resp:
-            continue
-        rewrites = _parse_numbered(resp, len(chunk))
-        for j, (i, c) in enumerate(chunk):
-            new = (rewrites[j] or "").strip()
-            old = c["text"].replace("\n", " ")
-            if new and len(new) < len(old):
-                cues[i]["text"] = new
-                applied += 1
-    log.info(f"  condensed {applied}/{len(offenders)} over-speed cue(s)")
+        round_applied = 0
+        for bs in range(0, len(offenders), BATCH):
+            chunk = offenders[bs:bs + BATCH]
+            numbered = "\n".join(
+                f"{j + 1}. [≤{max(8, int((c['end'] - c['start']) * max_cps))} chars] "
+                f"{c['text'].replace(chr(10), ' ')}"
+                for j, (_i, c) in enumerate(chunk)
+            )
+            prompt = think_prefix + _SUB_CONDENSE_PROMPT.format(language=language, lines=numbered)
+            resp = _ollama_call(prompt, model, temperature, log)
+            if not resp:
+                continue
+            rewrites = _parse_numbered(resp, len(chunk))
+            for j, (i, c) in enumerate(chunk):
+                new = (rewrites[j] or "").strip()
+                old = c["text"].replace("\n", " ")
+                # Accept any strictly shorter rewrite — even if still over cap it
+                # makes cross-round progress (the next round re-prompts it).
+                if new and len(new) < len(old):
+                    cues[i]["text"] = new
+                    round_applied += 1
+        log.info(f"  round {rnd}: condensed {round_applied}/{len(offenders)} over-speed cue(s)")
+
+        # A whole round that changed nothing won't improve on the next — stop.
+        if round_applied == 0:
+            log.info(f"  round {rnd}: no further condensation possible — stopping")
+            break
     return cues
 
 
@@ -3060,6 +3082,7 @@ def create_srt(
     max_lag: float = 3.0,
     condense_model: Optional[str] = None,
     condense_temperature: float = 0.3,
+    condense_rounds: int = 3,
     target_lang: str = "fr",
 ) -> bool:
     """Write broadcast-grade subtitles (hybrid BBC/Netflix) from the dub segments.
@@ -3120,7 +3143,7 @@ def create_srt(
         if condense_model:
             raw = condense_overlong_cues(
                 raw, condense_model, condense_temperature, max_cps, min_dur, log,
-                target_lang=target_lang,
+                target_lang=target_lang, rounds=condense_rounds,
             )
 
         subs = pysrt.SubRipFile()
@@ -3684,6 +3707,7 @@ def process_video(
         max_lag=config.subtitle_max_lag,
         condense_model=(config.translation_model if config.subtitle_condense else None),
         condense_temperature=config.translation_temperature,
+        condense_rounds=config.subtitle_condense_rounds,
         target_lang=config.target_lang,
     )
 

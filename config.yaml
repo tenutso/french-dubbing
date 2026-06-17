@@ -118,10 +118,11 @@ translation:
   # no further progress is made. More rounds = tighter fit, slightly more calls.
   compression_rounds: 3
   # Character budget per second of audio that Qwen is asked to fit each segment
-  # into. Lowered to 15 so the French is tight enough to fit the source timeline
-  # (less expansion → less speed-up needed → better sync). Raising it gives the
-  # LLM more headroom but reintroduces drift. Keep ≤ subtitles.max_cps / reading_cps.
-  budget_cps: 15
+  # into. Matched to assembler reading_cps (16) so the LLM is not asked to
+  # over-compress below what the timing policy already tolerates — extra tightness
+  # below reading_cps just strips meaning without improving sync. Keep ≤
+  # subtitles.max_cps / reading_cps. Lower (e.g. 15) = tighter French, more drift risk.
+  budget_cps: 16
   # Target syllables-per-second ceiling, used as a SECOND over-budget gate
   # alongside budget_cps in the compression pass. French syllable count tracks
   # speaking time better than raw characters, so a segment that is dense by either
@@ -279,8 +280,13 @@ subtitles:
   max_lag: 3.0
   # Fix #2 — after #1, lightly LLM-shorten only the cues still above max_cps so
   # dense subtitles become readable while staying close to the spoken dub.
-  # Adds a few minutes (one Qwen pass over the over-speed cues). false disables.
+  # Adds a few minutes (Qwen passes over the over-speed cues). false disables.
   condense: true
+  # Fix #2 iterations — how many LLM rounds to spend shortening cues still over
+  # max_cps. Each round re-prompts only the remaining offenders against their
+  # latest (shorter) text, mirroring the translation compression pass. 1 = the
+  # old single-shot behaviour. Genuinely fast-source cues may never fully fit.
+  condense_rounds: 3
 
 # ============================================================
 # Processing

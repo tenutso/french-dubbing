@@ -7,6 +7,10 @@
 #   pip install -r requirements-f5_tts.txt --extra-index-url https://download.pytorch.org/whl/cu128
 torch==2.8.0
 torchaudio==2.8.0
+# Pin to the torchcodec that matches torch 2.8 / CUDA 12.8. f5-tts otherwise
+# pulls the latest torchcodec (0.14+), which is built for CUDA 13 and fails at
+# import with "OSError: libnvrtc.so.13: cannot open shared object file".
+torchcodec==0.7.0
 
 f5-tts
 

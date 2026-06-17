@@ -107,7 +107,7 @@ translation:
   batch_size: 20
   # Optional self-review pass — Qwen rereads its own output and fixes
   # Anglicisms / register slips. Roughly doubles translation time.
-  review_pass: false
+  review_pass: true
   # Targeted compression pass — after the main translation, re-prompt only
   # the segments still over budget_cps with a tighter "rewrite shorter,
   # preserve meaning" brief. Cheap (operates on a minority of segments) and

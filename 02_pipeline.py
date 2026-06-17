@@ -1224,19 +1224,24 @@ English segments:
 {language} translations:"""
 
 _REVIEW_PROMPT = """\
-You are a native {language} editor reviewing dubbed video subtitles.{locale_note}
-Correct unnatural phrasing, Anglicisms, grammar errors, and register slips.
+You are a native Canadian French dubbing editor.
 
-Each segment includes its duration in seconds [N.Ns].
-Ensure the corrected text remains concise enough to fit the timing.
+Review each segment for:
 
-- Output only the corrected numbered list, same numbering as input.
-- Do NOT add character counts, parentheticals, notes, brackets, or explanations.
-{glossary_section}
-{language} subtitles to review:
-{segments}
+- natural spoken rhythm
+- voice dubbing suitability
+- grammar and fluency
+- Canadian French usage
+- timing efficiency
 
-Corrected {language} subtitles:"""
+When multiple valid phrasings exist:
+
+- prefer shorter spoken forms
+- prefer conversational language
+- reduce Anglicisms
+- preserve intent rather than literal wording
+
+Do not make a segment longer unless necessary for clarity."""
 
 
 # Maximum sustainable characters-per-second of French speech. Beyond this,
@@ -1332,55 +1337,37 @@ def split_overflowing_segments(
 
 
 _COMPRESS_PROMPT = """\
-You are a native {language} dubbing editor.{locale_note}
+You are a professional {language} dubbing editor.
 
-Review each translated segment for:
+Rewrite each numbered {language} segment so it sounds natural when spoken aloud and fits within its character budget.
 
-* natural spoken language
-* dubbing flow and rhythm
-* grammar and fluency
-* consistency of terminology
-* timing suitability for voice synthesis
+Priorities (in order):
 
-Each segment includes:
+Preserve the speaker's intent, key message, facts, numbers, names, and technical terms.
+Use natural spoken {language}, not literal translation.
+Match the speaker's tone, formality, and emotional intensity.
+Keep the segment concise enough for dubbing timing.
+Remove fillers, hedges, repetitions, and unnecessary words when needed.
 
-[N.Ns, ≤M chars]
+You may:
 
-Your objectives:
-
-1. Preserve the speaker's intent, facts, names, numbers, and technical terms.
-2. Improve unnatural translations, Anglicisms, and awkward phrasing.
-3. Match the original tone, emotion, and formality.
-4. Keep the text natural when spoken aloud.
-5. Ensure the segment fits within the stated character budget.
-
-If a segment exceeds its budget:
-
-* remove filler words
-* shorten phrasing
-* replace long expressions with shorter natural alternatives
-* remove redundant qualifiers and repetition
+Rephrase sentences.
+Use shorter synonyms.
+Restructure wording.
+Slightly condense non-essential details.
 
 Do not:
 
-* change facts or meaning
-* omit important information
-* add new information
-* make segments longer unless necessary for clarity
+Change facts, numbers, names, or technical terminology.
+Add information not present in the source.
+Exceed the character limit.
 
-Output Rules:
+Each line is tagged [≤N chars]. Your rewrite must not exceed N characters.
 
-* Output ONLY the corrected numbered segments.
-* One segment per line.
-* Preserve original numbering.
-* Do not output notes, explanations, brackets, character counts, or commentary.
+Output ONLY the numbered rewrites, one per line, preserving the original numbering. No explanations or notes.
 
-{glossary_section}
-
-{language} segments to review:
-{segments}
-
-Final dubbed {language} segments:"""
+{language} segments:
+{segments}"""
 
 def compress_overflowing_translations(
     segments: List[dict],

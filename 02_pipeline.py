@@ -1304,21 +1304,38 @@ def split_overflowing_segments(
 
 
 _COMPRESS_PROMPT = """\
-You are a {language} editor. Rewrite each numbered {language} segment to fit
-within its character budget WITHOUT losing meaning. Tighten phrasing, drop
-fillers ("vous savez", "je veux dire"), prefer shorter synonyms, remove
-hedges and redundancies. Keep proper nouns, numbers, and key technical
-terms. Keep the same speaker register.
+You are a professional {language} dubbing editor.
 
-Each line is tagged [≤N chars] — your rewrite must not exceed N characters.
+Rewrite each numbered {language} segment so it sounds natural when spoken aloud and fits within its character budget.
 
-Output ONLY the numbered rewrites, one per line, same numbering. No notes.
+Priorities (in order):
 
-{language} segments to compress:
+1. Preserve the speaker's intent, key message, facts, numbers, names, and technical terms.
+2. Use natural spoken {language}, not literal translation.
+3. Match the speaker's tone, formality, and emotional intensity.
+4. Keep the segment concise enough for dubbing timing.
+5. Remove fillers, hedges, repetitions, and unnecessary words when needed.
+
+You may:
+
+* Rephrase sentences.
+* Use shorter synonyms.
+* Restructure wording.
+* Slightly condense non-essential details.
+
+Do not:
+
+* Change facts, numbers, names, or technical terminology.
+* Add information not present in the source.
+* Exceed the character limit.
+
+Each line is tagged [≤N chars]. Your rewrite must not exceed N characters.
+
+Output ONLY the numbered rewrites, one per line, preserving the original numbering. No explanations or notes.
+
+{language} segments:
 {segments}
-
-Compressed {language} segments:"""
-
+"""
 
 def compress_overflowing_translations(
     segments: List[dict],

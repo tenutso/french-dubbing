@@ -81,6 +81,8 @@ from tqdm import tqdm
 
 from faster_whisper import WhisperModel
 
+from metrics import MetricsCollector
+
 
 # ============================================================================
 # Configuration
@@ -224,6 +226,10 @@ class PipelineConfig:
     # Debug — keep all temp files and dump intermediate segment JSON
     keep_temp: bool = False
 
+    # Metrics — emit per-phase CSV instrumentation to {output}/{name}_metrics/
+    # for tuning translation length/timing fit. See metrics.py.
+    metrics_enabled: bool = False
+
     @property
     def target_locale(self) -> str:
         return self.locale
@@ -268,6 +274,7 @@ def load_config(path: str) -> PipelineConfig:
     sub  = c.get("subtitles", {})
     dia  = c.get("diarization", {})
     out  = c.get("output", {})
+    met  = c.get("metrics", {})
     return PipelineConfig(
         input_folder=p.get("input_folder", "/workspace/videos/input"),
         output_folder=p.get("output_folder", "/workspace/outputs"),
@@ -340,6 +347,7 @@ def load_config(path: str) -> PipelineConfig:
         burn_subs=bool(out.get("burn_subs", False)),
         timeout_seconds=proc.get("timeout_seconds", 7200),
         keep_temp=bool(proc.get("keep_temp", False)),
+        metrics_enabled=bool(met.get("enabled", False)),
     )
 
 
@@ -1224,24 +1232,78 @@ English segments:
 {language} translations:"""
 
 _REVIEW_PROMPT = """\
-You are a native Canadian French dubbing editor.
+You are a native {language} dubbing editor.{locale_note}
 
-Review each segment for:
+Below are numbered {language} dubbing segments that have already been translated.
+Lightly revise each one. Each line is tagged [N.Ns, ≤M chars] where N.Ns is the
+target audio duration and M is the maximum character budget.
 
-- natural spoken rhythm
-- voice dubbing suitability
-- grammar and fluency
-- Canadian French usage
-- timing efficiency
+Revise each segment for:
+
+* natural spoken rhythm
+* voice dubbing suitability
+* grammar and fluency
+* {language} usage and register
+* timing efficiency
 
 When multiple valid phrasings exist:
 
-- prefer shorter spoken forms
-- prefer conversational language
-- reduce Anglicisms
-- preserve intent rather than literal wording
+* prefer shorter spoken forms
+* prefer conversational language
+* reduce Anglicisms
+* preserve intent rather than literal wording
 
-Do not make a segment longer unless necessary for clarity."""
+Do not make a segment longer unless necessary for clarity.
+Do not change facts, numbers, names, or technical terms.
+Keep each revision within its stated character budget.
+
+Output Rules:
+
+* Output ONLY the numbered revised segments — nothing else.
+* One revised segment per line, preserving the original numbering.
+* If a segment is already good, output it unchanged (still numbered).
+* Do NOT output notes, explanations, headers, markdown, bullet points,
+  character counts, the review criteria, or any commentary.
+
+{glossary_section}
+
+{language} segments to review:
+{segments}
+
+Revised {language} segments:"""
+
+
+# Signatures of LLM meta-commentary / prompt-instruction leakage. When an LLM
+# echoes its own brief (review criteria, markdown headers, rewrite arrows)
+# instead of returning a clean translation, the text matches one of these. Used
+# to drop such items so they can never reach the TTS or the subtitles. Kept
+# high-precision (strong signals only) so ordinary French is never discarded.
+_LEAK_SIGNATURE_RE = re.compile(
+    r"\*\*"                                   # markdown bold
+    r"|(?:^|\s)#{2,}\s"                       # markdown headers
+    r"|→"                                     # rewrite arrow ("X → Y")
+    r"|timing efficiency"
+    r"|voice[\s-]*dubbing"
+    r"|natural spoken rhythm"
+    r"|grammar (?:and|/) fluency"
+    r"|canadian french usage"
+    r"|(?:reduce|éviter les) anglicism"
+    r"|prefer shorter"
+    r"|trim redundan"
+    r"|privilégier la concision"          # French instruction phrasing seen
+    r"|mots redondants"                   # in compression-pass rewrites of
+    r"|termes québécois"                  # leaked review criteria
+    r"|éviter les traductions",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_instruction_leak(text: str) -> bool:
+    """True if `text` looks like echoed prompt instructions / meta-commentary
+    rather than a real translation. See _LEAK_SIGNATURE_RE."""
+    if not text:
+        return False
+    return bool(_LEAK_SIGNATURE_RE.search(text))
 
 
 # Maximum sustainable characters-per-second of French speech. Beyond this,
@@ -1362,7 +1424,15 @@ Change facts, numbers, names, or technical terminology.
 Add information not present in the source.
 Exceed the character limit.
 
-Each line is tagged [≤N chars]. Your rewrite must not exceed N characters.
+IMPORTANT — trim minimally:
+Shorten ONLY as much as needed to fit within the limit. Most segments are just
+slightly over budget and need only a light trim. Preserve as much of the
+original meaning, detail, and natural phrasing as possible — aim to use most of
+the available characters rather than producing the shortest possible text. Do
+not gut a sentence or drop clauses when a small cut would have fit.
+
+Each line is tagged [≤N chars]. Your rewrite must not exceed N characters, but
+should stay reasonably close to N — do not compress far below it.
 
 Output ONLY the numbered rewrites, one per line, preserving the original numbering. No explanations or notes.
 
@@ -1392,6 +1462,14 @@ def compress_overflowing_translations(
     margin: a small relaxation factor on the budget. Default 1.05 means
     "rewrite if FR is >5% over budget" — leaves a buffer for natural variance.
     rounds: maximum number of compression passes (length-aware iteration).
+
+    Fidelity guard: Qwen tends to over-shorten, gutting a segment that was only
+    slightly over budget (e.g. 185→61 chars against a 161 budget — dropping real
+    content, not just filler). A rewrite that undershoots the budget drastically
+    (< UNDERSHOOT_FLOOR × budget) is rejected UNLESS the original was heavily over
+    budget (> HEAVY_OVER × budget) and therefore genuinely needs deep cutting.
+    Rejected segments keep their faithful (mildly-over) translation; the small
+    overflow is absorbed downstream by anchored timing + subtitle condensing.
     """
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
@@ -1402,6 +1480,10 @@ def compress_overflowing_translations(
 
     out = [dict(s) for s in segments]
     BATCH = 15
+    # Fidelity guard thresholds (see docstring).
+    UNDERSHOOT_FLOOR = 0.70   # reject rewrites below 70% of budget…
+    HEAVY_OVER = 1.60         # …unless the original was >160% of budget
+    rejected_overtrim = 0
 
     for rnd in range(1, max(1, rounds) + 1):
         # Recompute offenders from the *current* text so converged segments drop
@@ -1450,6 +1532,13 @@ def compress_overflowing_translations(
                 # noisy inputs. If it's still over budget, keep it anyway iff
                 # it's at least 10% shorter than the current text.
                 if len(new) < len(old) and len(new) <= int(b * margin):
+                    # Fidelity guard: reject a drastic undershoot (content drop)
+                    # on a segment that was only mildly over budget. Keep the
+                    # faithful original; the small overflow is absorbed by
+                    # anchored timing + subtitle condensing downstream.
+                    if len(new) < int(b * UNDERSHOOT_FLOOR) and len(old) <= int(b * HEAVY_OVER):
+                        rejected_overtrim += 1
+                        continue
                     out[idx]["text_fr"] = new
                     if "text_fr_natural" in out[idx]:
                         out[idx]["text_fr_natural"] = new
@@ -1472,6 +1561,11 @@ def compress_overflowing_translations(
             log.info(f"  round {rnd}: no further compression possible — stopping")
             break
 
+    if rejected_overtrim:
+        log.info(
+            f"✓ Compression fidelity guard: kept {rejected_overtrim} faithful "
+            f"translation(s) over an over-trimmed rewrite"
+        )
     return out
 
 
@@ -1677,6 +1771,12 @@ def _parse_numbered(text: str, count: int) -> List[str]:
         content = re.sub(r"\s*\(\s*\d+\s*\)\s*$", "", content)
         content = re.sub(r"\s*\[[^\]]*\]\s*$", "", content)
         content = content.strip(" \t\"'")
+        # Defensive guard: drop items that are echoed prompt instructions /
+        # meta-commentary rather than a real translation. The caller's
+        # `if result[i]:` fallback then keeps the prior good text. Protects
+        # every LLM pass that routes through _parse_numbered.
+        if content and _looks_like_instruction_leak(content):
+            return
         if content:
             result[idx] = content
 
@@ -1934,6 +2034,18 @@ _XTTS_CHUNK_LIMITS = {
     "hu": 160, "zh": 80, "ja": 80, "ko": 80, "hi": 200,
 }
 
+# Runaway-TTS guard. XTTS occasionally enters a repetition loop and emits a clip
+# many times longer than the text warrants (observed: a 67-char line → ~24 s of
+# audio). We estimate the expected spoken length from the character count and
+# flag a clip as runaway when it grossly overshoots, then regenerate it at a
+# lower temperature and keep the shortest take (the correct one is the short one).
+# Thresholds are deliberately loose so ordinary slow/expressive speech and short
+# multi-sentence interjections (XTTS inter-sentence pauses) are NOT touched.
+_TTS_EXPECTED_CPS = 13.0          # chars/sec of natural synthesized speech
+_TTS_RUNAWAY_FACTOR = 2.5         # natural > 2.5x expected → suspect runaway
+_TTS_RUNAWAY_MIN_EXCESS_S = 2.0   # …and at least this many seconds over expected
+_TTS_RETRY_TEMPERATURES = (0.30, 0.50)
+
 
 def _split_for_xtts(text: str, limit: int) -> List[str]:
     """Break text into ≤limit-char chunks on natural boundaries.
@@ -2009,13 +2121,13 @@ def synthesize_all_segments(
     # 80 ms silence between concatenated chunks of the same segment.
     chunk_gap = np.zeros(int(sr * 0.08), dtype=np.float32)
 
-    def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+    def _synth_one(text: str, ref_wav: str, temperature: Optional[float] = None) -> np.ndarray:
         return np.asarray(
             tts.tts(
                 text=text,
                 speaker_wav=ref_wav,
                 language=lang_code,
-                temperature=config.xtts_temperature,
+                temperature=config.xtts_temperature if temperature is None else temperature,
                 length_penalty=config.xtts_length_penalty,
                 repetition_penalty=config.xtts_repetition_penalty,
                 top_k=config.xtts_top_k,
@@ -2024,6 +2136,37 @@ def synthesize_all_segments(
             ),
             dtype=np.float32,
         )
+
+    def _synth_guarded(text: str, ref_wav: str, seg_id) -> np.ndarray:
+        """Synthesize `text`, regenerating if XTTS produces a runaway clip."""
+        wav = _synth_one(text, ref_wav)
+        expected = max(len(text) / _TTS_EXPECTED_CPS, 0.4)
+        natural = len(wav) / sr
+        if (natural <= expected * _TTS_RUNAWAY_FACTOR
+                or natural - expected <= _TTS_RUNAWAY_MIN_EXCESS_S):
+            return wav
+        best = wav
+        for retry_temp in _TTS_RETRY_TEMPERATURES:
+            try:
+                cand = _synth_one(text, ref_wav, temperature=retry_temp)
+            except Exception as e:
+                log.debug(f"Segment {seg_id}: runaway retry @T={retry_temp} failed: {e}")
+                continue
+            if len(cand) < len(best):
+                best = cand
+            if len(best) / sr <= expected * _TTS_RUNAWAY_FACTOR:
+                break
+        if len(best) < len(wav):
+            log.warning(
+                f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
+                f"(~{expected:.1f}s expected) — regenerated to {len(best)/sr:.1f}s"
+            )
+        else:
+            log.warning(
+                f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
+                f"(~{expected:.1f}s expected) — retries did not improve, keeping original"
+            )
+        return best
 
     synthesized: List[Tuple[np.ndarray, float, float]] = []
     with tqdm(total=len(segments), desc="Synthesizing (XTTS-v2)") as pbar:
@@ -2044,7 +2187,7 @@ def synthesize_all_segments(
                         f"Segment {seg['id']}: {len(text)} chars > {chunk_limit} "
                         f"limit → split into {len(chunks)} chunks"
                     )
-                parts = [_synth_one(c, ref_wav) for c in chunks]
+                parts = [_synth_guarded(c, ref_wav, seg["id"]) for c in chunks]
                 wav = parts[0] if len(parts) == 1 else np.concatenate(
                     [p for i, part in enumerate(parts) for p in
                      ((part,) if i == 0 else (chunk_gap, part))]
@@ -3240,6 +3383,17 @@ def process_video(
 
     log.info(f"\n{'=' * 60}\nPipeline v1.0: {name}\n{'=' * 60}")
 
+    metrics = MetricsCollector(
+        enabled=config.metrics_enabled,
+        output_dir=output_dir,
+        name=name,
+        log=log,
+        budget_cps=config.translation_budget_cps,
+        cps_split_threshold=config.cps_split_threshold,
+        max_stretch=config.tts_max_stretch,
+        readability_cap=config.subtitle_max_cps,
+    )
+
     # Ollama required for translation.
     if not check_ollama(config.translation_model, log):
         return False
@@ -3322,6 +3476,9 @@ def process_video(
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "03_merged", log)
 
+    # Source baseline (English only) — the timeline the French must fit.
+    metrics.snapshot("merged_source", segments)
+
     # Optional diarization.
     diarization_turns: Optional[List[Tuple[float, float, str]]] = None
     if config.use_diarization:
@@ -3372,6 +3529,8 @@ def process_video(
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "05_translated", log)
 
+    metrics.snapshot("translated", segments)
+
     if config.translation_review:
         log.info(f"\n[3b/6] REVIEWING TRANSLATIONS ({config.translation_model})")
         segments = review_translations(
@@ -3386,6 +3545,7 @@ def process_video(
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06_reviewed", log)
+        metrics.snapshot("reviewed", segments)
 
     # Compression fallback: targeted second pass on segments still over budget.
     if config.translation_compression_pass:
@@ -3401,12 +3561,14 @@ def process_video(
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06b_compressed", log)
+        metrics.snapshot("compressed", segments)
 
     if glossary.entries:
         log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
         segments = apply_glossary(segments, glossary.entries, log)
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "07_glossary", log)
+        metrics.snapshot("glossary", segments)
 
     # CPS guard: split segments whose final French text would force the
     # assembler past max_stretch. Splits at sentence boundary; halves
@@ -3417,6 +3579,7 @@ def process_video(
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "07b_cps_split", log)
+        metrics.snapshot("cps_split", segments)
 
     # Defensive sweep: strip any leaked "[≤N chars]" budget tag the LLM may have
     # echoed, so it never reaches the TTS or the SRT. (Root cause is handled in
@@ -3480,6 +3643,9 @@ def process_video(
         return False
     free_vram(log)
 
+    # Ground-truth fit: did the natural TTS length fit each segment's window?
+    metrics.record_synthesis_fit(segments, synthesized, actual_sr)
+
     # ── 6. Assemble + encode + SRT ──────────────────────────────────────────
     log.info("\n[6/6] ASSEMBLING & ENCODING")
     interim_wav = os.path.join(temp_dir, f"{name}_french.wav")
@@ -3528,6 +3694,10 @@ def process_video(
 
     if config.keep_temp:
         _dump_segments(srt_segments, temp_dir, "08_retimed", log)
+
+    # Final phase: French text against the timing it actually plays at.
+    metrics.snapshot("final_retimed", srt_segments)
+    metrics.finalize()
 
     create_srt(
         srt_segments, final_srt, log,

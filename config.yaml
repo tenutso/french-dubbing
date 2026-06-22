@@ -106,8 +106,10 @@ translation:
   # the 4096-token output budget if segments are long.
   batch_size: 20
   # Optional self-review pass — Qwen rereads its own output and fixes
-  # Anglicisms / register slips. Roughly doubles translation time.
-  review_pass: true
+  # Anglicisms / register slips. Roughly doubles translation time. Off by
+  # default: the translate + compression passes already cover length, and the
+  # downstream leak guard makes it safe to re-enable for experiments.
+  review_pass: false
   # Targeted compression pass — after the main translation, re-prompt only
   # the segments still over budget_cps with a tighter "rewrite shorter,
   # preserve meaning" brief. Cheap (operates on a minority of segments) and
@@ -118,10 +120,13 @@ translation:
   # no further progress is made. More rounds = tighter fit, slightly more calls.
   compression_rounds: 3
   # Character budget per second of audio that Qwen is asked to fit each segment
-  # into. Lowered to 15 so the French is tight enough to fit the source timeline
-  # (less expansion → less speed-up needed → better sync). Raising it gives the
-  # LLM more headroom but reintroduces drift. Keep ≤ subtitles.max_cps / reading_cps.
-  budget_cps: 15
+  # into. Set to 14 (below subtitles.max_cps of 17). Tuning history: 15 left no
+  # headroom (final ≈15.2 CPS); 13 fit well but over-compressed
+  # (mean_expansion 0.78 — French 22% shorter than English, fidelity risk); 14
+  # is the middle ground — keeps audio fit healthy while recovering translation
+  # headroom. Track mean_expansion and final_over_readability_pct in
+  # _dubbing_metrics_runs.csv after changing. Keep ≤ subtitles.max_cps.
+  budget_cps: 14
 
   # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
@@ -248,3 +253,28 @@ processing:
   # Useful for inspecting what each pipeline stage produces (transcription, merge,
   # translation, etc.). Files land in temp_folder/<video-stem>/segments_NN_*.json.
   keep_temp: true
+
+# ============================================================
+# Metrics — per-phase CSV instrumentation (for tuning translation)
+# ============================================================
+# When enabled, the pipeline writes CSV metrics for every phase that touches
+# the text or the timeline it must fit, into:
+#     {output_folder}/{video-stem}_metrics/
+#
+# Files produced:
+#   segments_NN_<phase>.csv  — per-segment snapshot after each phase
+#       (merged_source → translated → [reviewed] → compressed → glossary →
+#        cps_split → final_retimed). Diff two snapshots to see what a phase
+#        changed. Key columns: duration_s, en_chars, fr_chars, fr_cps,
+#        expansion_ratio (fr/en length), budget_chars, over_budget, over_by_pct.
+#   synthesis_fit.csv        — natural TTS length vs target window per segment:
+#        tts_natural_s, required_stretch, fits. required_stretch > max_stretch
+#        means the French was too long to fit (translation/budget too loose).
+#   phase_summary.csv        — one row per phase (CPS distribution, mean
+#        expansion, % over budget) so you can see how much compression buys you.
+#   {output_folder}/_dubbing_metrics_runs.csv — one row per video, appended
+#        across runs, to compare prompt/config changes over time.
+#
+# Cost is negligible (CSV writes only). Safe to leave on. Defaults off.
+metrics:
+  enabled: true

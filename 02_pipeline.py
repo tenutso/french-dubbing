@@ -1685,6 +1685,95 @@ def _retranslate_leftover_english(
     return segments
 
 
+# Digit sequences worth checking for preservation (≥3 digits = year, phone,
+# ID, price, etc. — short numbers like "5" or "10" are often spelled out in FR).
+_DIGIT_SEQ_RE = re.compile(r'\b\d{3,}(?:[,.\-]\d+)*\b')
+
+
+def _scan_and_fix_hallucinations(
+    segments: List[dict],
+    model: str,
+    log: logging.Logger,
+    target_lang: str = "fr",
+    locale: str = "fr",
+    glossary_section: str = "",
+) -> List[dict]:
+    """Scan translations for hallucination patterns and re-translate flagged ones.
+
+    Checks (per segment):
+      1. Number dropout  — digit sequences ≥3 digits in EN are missing from FR.
+      2. FR phrase loop  — a ≥5-word run appears twice in the FR output (Qwen loop).
+      3. Length explosion — FR text is >2.5× the EN length (possible fabrication).
+
+    Flagged segments are re-translated individually with a strict single-line prompt
+    that explicitly reminds the model to preserve numbers. The original is kept if
+    the re-translation fails or still looks untranslated.
+    """
+    language = _LANG_NAMES.get(target_lang, target_lang.upper())
+    locale_note = " Use Québécois/Canadian French." if locale == "fr-ca" else ""
+    think = "/no_think\n" if "qwen3" in model.lower() else ""
+
+    def _has_number_dropout(en: str, fr: str) -> bool:
+        en_nums = set(_DIGIT_SEQ_RE.findall(en))
+        fr_nums = set(_DIGIT_SEQ_RE.findall(fr.replace(" ", "").replace("\xa0", "")))
+        return bool(en_nums - fr_nums)
+
+    def _has_fr_phrase_loop(fr: str, min_k: int = 5) -> bool:
+        toks = [t.strip(".,!?;:\"'()[]…").lower() for t in fr.split() if t.strip(".,!?;:\"'()[]…")]
+        n = len(toks)
+        for k in range(min(12, n // 2), min_k - 1, -1):
+            for i in range(n - 2 * k + 1):
+                if toks[i:i + k] == toks[i + k:i + 2 * k]:
+                    return True
+        return False
+
+    flagged: List[Tuple[dict, List[str]]] = []
+    for s in segments:
+        en = s.get("text", "")
+        fr = s.get("text_fr", "")
+        if not en or not fr:
+            continue
+        reasons: List[str] = []
+        if _has_number_dropout(en, fr):
+            missing = set(_DIGIT_SEQ_RE.findall(en)) - set(_DIGIT_SEQ_RE.findall(fr.replace(" ", "").replace("\xa0", "")))
+            reasons.append(f"number dropout: {sorted(missing)}")
+        if _has_fr_phrase_loop(fr):
+            reasons.append("repeated phrase loop in FR output")
+        if len(en) > 20 and len(fr) > len(en) * 2.5:
+            reasons.append(f"length explosion ({len(fr)/len(en):.1f}× EN)")
+        if reasons:
+            flagged.append((s, reasons))
+
+    if not flagged:
+        log.debug("✓ Hallucination scan: no issues detected in translations")
+        return segments
+
+    log.info(f"Hallucination scan: {len(flagged)} suspicious segment(s) — re-translating")
+    fixed = 0
+    for seg, reasons in flagged:
+        log.info(f"  Segment {seg.get('id')}: {'; '.join(reasons)}")
+        prompt = (
+            f"{think}Translate this single line into natural, spoken {language}."
+            f"{locale_note} Preserve ALL numbers exactly as written.\n"
+            f"Output ONLY the {language} translation — no quotes, no notes.\n\n"
+            f"English: {seg['text']}\n{language}:"
+        )
+        out = _ollama_call(prompt, model, 0.2, log)
+        if not out:
+            continue
+        out = re.sub(r"<think>.*?</think>", "", out, flags=re.DOTALL).strip()
+        cand = next((ln.strip().strip('"') for ln in out.splitlines() if ln.strip()), "")
+        if cand and not _looks_untranslated(cand) and not _looks_like_instruction_leak(cand):
+            seg["text_fr"] = cand
+            seg["text_fr_natural"] = cand
+            fixed += 1
+        else:
+            log.warning(f"  Segment {seg.get('id')}: re-translation failed, keeping original")
+
+    log.info(f"  ✓ Fixed {fixed}/{len(flagged)} flagged segment(s)")
+    return segments
+
+
 def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logger) -> Optional[str]:
     # keep_alive=30m pins the model in VRAM between batches.
     try:
@@ -2050,12 +2139,14 @@ _TTS_RETRY_TEMPERATURES = (0.30, 0.50)
 def _split_for_xtts(text: str, limit: int) -> List[str]:
     """Break text into ≤limit-char chunks on natural boundaries.
 
-    Tries sentences first (. ! ? …), then clauses (; : ,), then a hard split.
-    Returns chunks that are each ≤ limit chars (with one-char slack for joins).
+    Always splits at sentence boundaries so the caller's chunk_gap inserts an
+    audible inter-sentence pause even for short texts. Further sub-splits long
+    sentences on clause punctuation or hard-wraps as a last resort.
+    Returns chunks that are each ≤ limit chars.
     """
     text = text.strip()
-    if len(text) <= limit:
-        return [text]
+    if not text:
+        return []
     import re as _re
 
     pieces = _re.split(r"(?<=[.!?…])\s+", text)
@@ -2118,8 +2209,10 @@ def synthesize_all_segments(
     log.info(f"✓ XTTS-v2 ready (output: {sr} Hz, device: {device})")
 
     chunk_limit = _XTTS_CHUNK_LIMITS.get(lang_code, 240)
-    # 80 ms silence between concatenated chunks of the same segment.
-    chunk_gap = np.zeros(int(sr * 0.08), dtype=np.float32)
+    # 180 ms silence between sentence chunks — inter-sentence pause that XTTS
+    # won't insert on its own. Every sentence boundary now gets this gap because
+    # _split_for_xtts always splits on sentence endings (not just when >limit).
+    chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
 
     def _synth_one(text: str, ref_wav: str, temperature: Optional[float] = None) -> np.ndarray:
         return np.asarray(
@@ -2132,41 +2225,66 @@ def synthesize_all_segments(
                 repetition_penalty=config.xtts_repetition_penalty,
                 top_k=config.xtts_top_k,
                 top_p=config.xtts_top_p,
-                split_sentences=True,
+                split_sentences=False,  # we split externally via _split_for_xtts + chunk_gap
             ),
             dtype=np.float32,
         )
 
     def _synth_guarded(text: str, ref_wav: str, seg_id) -> np.ndarray:
-        """Synthesize `text`, regenerating if XTTS produces a runaway clip."""
+        """Synthesize `text`, regenerating on runaway duration or near-silent output."""
         wav = _synth_one(text, ref_wav)
         expected = max(len(text) / _TTS_EXPECTED_CPS, 0.4)
         natural = len(wav) / sr
-        if (natural <= expected * _TTS_RUNAWAY_FACTOR
-                or natural - expected <= _TTS_RUNAWAY_MIN_EXCESS_S):
-            return wav
-        best = wav
-        for retry_temp in _TTS_RETRY_TEMPERATURES:
-            try:
-                cand = _synth_one(text, ref_wav, temperature=retry_temp)
-            except Exception as e:
-                log.debug(f"Segment {seg_id}: runaway retry @T={retry_temp} failed: {e}")
-                continue
-            if len(cand) < len(best):
-                best = cand
-            if len(best) / sr <= expected * _TTS_RUNAWAY_FACTOR:
-                break
-        if len(best) < len(wav):
-            log.warning(
-                f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
-                f"(~{expected:.1f}s expected) — regenerated to {len(best)/sr:.1f}s"
-            )
-        else:
-            log.warning(
-                f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
-                f"(~{expected:.1f}s expected) — retries did not improve, keeping original"
-            )
-        return best
+
+        # Runaway guard: clip is far longer than the text warrants.
+        is_runaway = (natural > expected * _TTS_RUNAWAY_FACTOR
+                      and natural - expected > _TTS_RUNAWAY_MIN_EXCESS_S)
+        if is_runaway:
+            best = wav
+            for retry_temp in _TTS_RETRY_TEMPERATURES:
+                try:
+                    cand = _synth_one(text, ref_wav, temperature=retry_temp)
+                except Exception as e:
+                    log.debug(f"Segment {seg_id}: runaway retry @T={retry_temp} failed: {e}")
+                    continue
+                if len(cand) < len(best):
+                    best = cand
+                if len(best) / sr <= expected * _TTS_RUNAWAY_FACTOR:
+                    break
+            if len(best) < len(wav):
+                log.warning(
+                    f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
+                    f"(~{expected:.1f}s expected) — regenerated to {len(best)/sr:.1f}s"
+                )
+            else:
+                log.warning(
+                    f"Segment {seg_id}: runaway TTS {natural:.1f}s for {len(text)} chars "
+                    f"(~{expected:.1f}s expected) — retries did not improve, keeping original"
+                )
+            wav = best
+
+        # Quality guard: catch near-silent clips or drastically-too-short takes
+        # (XTTS occasionally returns silence or a clipped stub on short/unusual input).
+        rms = float(np.sqrt(np.mean(wav ** 2))) if len(wav) > 0 else 0.0
+        min_dur = max(len(text) / _TTS_EXPECTED_CPS * 0.25, 0.15)
+        if len(text) > 10 and (rms < 5e-3 or len(wav) / sr < min_dur):
+            reason = (f"near-silent (RMS={rms:.4f})" if rms < 5e-3
+                      else f"too short ({len(wav)/sr:.2f}s, expected ≥{min_dur:.2f}s)")
+            for retry_temp in _TTS_RETRY_TEMPERATURES:
+                try:
+                    cand = _synth_one(text, ref_wav, temperature=retry_temp)
+                except Exception as e:
+                    log.debug(f"Segment {seg_id}: quality retry @T={retry_temp} failed: {e}")
+                    continue
+                cand_rms = float(np.sqrt(np.mean(cand ** 2))) if len(cand) > 0 else 0.0
+                if cand_rms >= 5e-3 and len(cand) / sr >= min_dur:
+                    log.warning(f"Segment {seg_id}: {reason} — fixed at T={retry_temp}")
+                    wav = cand
+                    break
+            else:
+                log.warning(f"Segment {seg_id}: {reason} — retries did not improve")
+
+        return wav
 
     synthesized: List[Tuple[np.ndarray, float, float]] = []
     with tqdm(total=len(segments), desc="Synthesizing (XTTS-v2)") as pbar:
@@ -2183,9 +2301,9 @@ def synthesize_all_segments(
                     continue
                 chunks = _split_for_xtts(text, chunk_limit)
                 if len(chunks) > 1:
-                    log.info(
-                        f"Segment {seg['id']}: {len(text)} chars > {chunk_limit} "
-                        f"limit → split into {len(chunks)} chunks"
+                    log.debug(
+                        f"Segment {seg['id']}: split into {len(chunks)} chunks "
+                        f"({len(text)} chars, limit={chunk_limit})"
                     )
                 parts = [_synth_guarded(c, ref_wav, seg["id"]) for c in chunks]
                 wav = parts[0] if len(parts) == 1 else np.concatenate(
@@ -3521,6 +3639,12 @@ def process_video(
     )
     _verify_translation_quality(segments, log)
     segments = _retranslate_leftover_english(
+        segments, config.translation_model, log,
+        target_lang=config.target_lang, locale=config.locale,
+        glossary_section=glossary_section,
+    )
+
+    segments = _scan_and_fix_hallucinations(
         segments, config.translation_model, log,
         target_lang=config.target_lang, locale=config.locale,
         glossary_section=glossary_section,

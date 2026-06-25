@@ -2188,7 +2188,7 @@ def synthesize_all_segments(
 
     log.info(f"Loading F5-TTS: {config.f5tts_model} …")
     device = "cuda" if _torch.cuda.is_available() else "cpu"
-    f5 = F5TTS(model_type=config.f5tts_model, device=device)
+    f5 = F5TTS(model=config.f5tts_model, device=device)
     sr = 24000  # F5-TTS/vocos native rate
     log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
 
@@ -2206,7 +2206,7 @@ def synthesize_all_segments(
             speed=config.f5tts_speed,
             remove_silence=False,
             file_wave=None,
-            seed=-1,              # random seed → each retry is an independent sample
+            seed=None,            # None → random each call, so retries are independent
         )
         return np.asarray(wav, dtype=np.float32)
 

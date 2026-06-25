@@ -28,15 +28,11 @@ pyannote.audio>=3.3.0
 # gives a clean voice-clone reference; FFmpeg anlmdn is the always-present fallback.
 noisereduce>=3.0.0
 
-# ── TTS — XTTS-v2 via Idiap fork of Coqui TTS ────────────────────────────────
-# MPL-2.0; multilingual (17 langs incl. French) zero-shot voice cloning at 24 kHz.
-# Auto-accepts the CPML license via COQUI_TOS_AGREED=1 (set in 04_setup.sh).
-coqui-tts>=0.27.5
-# coqui-tts uses transformers internals removed in 5.x; pin to last 4.x.
-# (coqui-tts 0.27.5 metadata declares transformers>=4.57 with no upper bound, but
-#  TTS/tts/layers/tortoise/autoregressive.py still imports isin_mps_friendly, which
-#  transformers 5.x removed — so TTS.api fails to import under 5.x. Keep <5.)
-transformers>=4.57,<5
+# ── TTS — F5-TTS (flow-matching zero-shot voice cloning, 24 kHz) ─────────────
+# MIT; multilingual (incl. French) flow-matching DiT; more reliable than
+# autoregressive XTTS-v2 on names and unusual input (no temperature drift).
+f5-tts>=1.0.0
+transformers>=4.57
 
 # ── Subtitles ─────────────────────────────────────────────────────────────────
 pysrt>=1.1.2

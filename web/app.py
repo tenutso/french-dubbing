@@ -65,7 +65,6 @@ LOCALE_CHOICES = ["fr", "fr-ca"]
 CONFIG_SCHEMA: dict = {
     # Audio
     "audio.volume_boost_pct":          ("int",   "Volume boost (%)",        "0 = off. Applied after peak normalization; hard-clipped at ±1.0.", {"min": -50, "max": 100, "step": 1, "group": "Audio"}),
-    "audio.output_sample_rate":        ("int",   "Output sample rate (Hz)", "Vimeo accepts 44100 or 48000.", {"choices": [44100, 48000], "group": "Audio"}),
 
     # Diarization
     "diarization.enabled":             ("bool",  "Enable diarization",      "Detect speakers and clone a distinct voice per speaker.", {"group": "Diarization"}),
@@ -80,12 +79,10 @@ CONFIG_SCHEMA: dict = {
 
     # Whisper
     "whisper.model":                   ("str",   "Whisper model",           "", {"choices": ["large-v3", "large-v2", "medium", "small", "distil-large-v3"], "group": "Whisper"}),
-    "whisper.language":                ("str",   "Source language",         "ISO code of the source audio.", {"group": "Whisper"}),
     "whisper.compute_type":            ("str",   "Compute type",            "", {"choices": ["float16", "int8_float16", "int8", "float32"], "group": "Whisper"}),
     "whisper.condition_on_previous_text": ("bool", "Condition on prev text", "Off = strongest anti-hallucination posture; Whisper won't feed its own (possibly looped) output back as context.", {"group": "Whisper"}),
     "whisper.compression_ratio_threshold": ("float", "Compression-ratio max", "Reject segments above this ratio (a classic loop signature). Lower = more aggressive. fw default 2.4.", {"min": 1.5, "max": 4.0, "step": 0.05, "group": "Whisper"}),
     "whisper.no_speech_threshold":     ("float", "No-speech threshold",     "Drop windows whose no-speech probability exceeds this.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "Whisper"}),
-    "whisper.log_prob_threshold":      ("float", "Log-prob threshold",      "Average log-prob floor; lower-scoring segments are dropped.", {"min": -3.0, "max": 0.0, "step": 0.1, "group": "Whisper"}),
 
     # Translation
     "translation.model":               ("str",   "Translation model",       "Ollama tag (e.g. qwen3:14b, qwen3:32b).", {"group": "Translation"}),
@@ -100,33 +97,21 @@ CONFIG_SCHEMA: dict = {
 
     # TTS
     "tts.timing_policy":               ("str",   "Timing policy",           "anchored holds the source timeline (speed dense runs up, re-anchor drift at pauses) so the dub stays in sync over a full program. no_drop never speeds up and drifts longer than the video. lock truncates overflow.", {"choices": ["anchored", "no_drop", "lock"], "group": "TTS"}),
-    "tts.xtts_temperature":            ("float", "XTTS temperature",        "Lower = more monotone.", {"min": 0.1, "max": 1.2, "step": 0.05, "group": "TTS"}),
-    "tts.xtts_repetition_penalty":     ("float", "Repetition penalty",      "", {"min": 1.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
-    "tts.xtts_top_p":                  ("float", "Top-p",                   "", {"min": 0.1, "max": 1.0, "step": 0.05, "group": "TTS"}),
-    "tts.xtts_top_k":                  ("int",   "Top-k",                   "", {"min": 1, "max": 200, "step": 1, "group": "TTS"}),
+    "tts.f5tts_nfe_step":              ("int",   "F5-TTS ODE steps",        "More steps = better quality, slower. 16 = fast draft, 32 = high quality, 64 = max.", {"min": 8, "max": 64, "step": 4, "group": "TTS"}),
+    "tts.f5tts_cfg_strength":          ("float", "CFG strength",             "Classifier-free guidance. Higher = more faithful to reference voice.", {"min": 0.5, "max": 5.0, "step": 0.25, "group": "TTS"}),
     "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
-    "tts.speaker_profile_skip":        ("int",   "Speaker clip skip (s)",   "Seconds to skip from start (avoids intro music).", {"min": 0, "max": 600, "step": 1, "group": "TTS"}),
     "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
     "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
     "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
-    "tts.group_gap":                   ("float", "Group gap (s)",           "Consecutive segments within this gap share one stretch ratio.", {"min": 0.0, "max": 3.0, "step": 0.1, "group": "TTS"}),
     "tts.stretcher":                   ("str",   "Time-stretch engine",     "rubberband preserves formants; atempo is the ffmpeg fallback.", {"choices": ["rubberband", "atempo"], "group": "TTS"}),
-    "tts.segment_merge_gap":           ("float", "Segment merge gap (s)",   "Whisper fragments closer than this are merged into one TTS chunk.", {"min": 0.0, "max": 5.0, "step": 0.1, "group": "TTS"}),
-    "tts.segment_merge_max_duration":  ("float", "Segment merge max (s)",   "Upper bound on merged-chunk length.", {"min": 3.0, "max": 30.0, "step": 0.5, "group": "TTS"}),
-    "tts.segment_merge_min_duration":  ("float", "Segment merge min (s)",   "Lower bound on merged-chunk length.", {"min": 0.5, "max": 10.0, "step": 0.5, "group": "TTS"}),
-    "tts.cps_split_threshold":         ("float", "CPS split threshold",     "Translated segments above this French CPS get split at a sentence boundary before TTS. Halves are more stable for XTTS and stretch independently. 0 disables.", {"min": 0.0, "max": 40.0, "step": 0.5, "group": "TTS"}),
+    "tts.cps_split_threshold":         ("float", "CPS split threshold",     "Translated segments above this French CPS get split at a sentence boundary before TTS. Shorter halves stretch independently. 0 disables.", {"min": 0.0, "max": 40.0, "step": 0.5, "group": "TTS"}),
 
     # Subtitles
     "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
-    "subtitles.max_lag":               ("float", "Max subtitle lag (s)",    "How long a subtitle may lag its audio to earn reading time in dense speech (re-syncs at pauses). 0 locks cues to the audio.", {"min": 0.0, "max": 6.0, "step": 0.5, "group": "Subtitles"}),
-    "subtitles.condense":              ("bool",  "Condense dense cues",     "After timing, lightly LLM-shorten only the cues still over the reading-speed cap so they're readable. Adds a few minutes per video.", {"group": "Subtitles"}),
 
     # Output
     "output.mux_video":                ("bool",  "Mux final video",         "Also emit {name}_french.mp4 (original video + dubbed audio + subtitles). Audio is held to the source length so they end together.", {"group": "Output"}),
     "output.burn_subs":                ("bool",  "Burn-in subtitles",       "On = render subtitles into the picture (re-encodes video). Off = soft-embed the SRT track and copy the video stream.", {"group": "Output"}),
-
-    # Processing
-    "processing.keep_temp":            ("bool",  "Keep temp files",         "Dump intermediate segment JSON for inspection.", {"group": "Processing"}),
 }
 
 
@@ -186,14 +171,15 @@ CONFIG_PRESETS: dict[str, dict] = {
             "diarization.enabled": True,
             "diarization.profile_duration": 40,
             "translation.compression_pass": True,         # short utterances clone better
-            "translation.budget_cps": 16,                 # tighter to preserve XTTS stability
+            "translation.budget_cps": 16,
             "tts.speaker_profile_duration": 40,
             "tts.use_deepfilter": True,
-            "tts.xtts_temperature": 0.6,
+            "tts.f5tts_nfe_step": 32,
+            "tts.f5tts_cfg_strength": 2.5,                # stronger reference adherence
             "tts.max_stretch": 1.2,
             "tts.min_stretch": 0.8,
             "tts.stretcher": "rubberband",
-            "tts.cps_split_threshold": 19.0,              # split more, helps XTTS stability
+            "tts.cps_split_threshold": 19.0,
         },
     },
 }

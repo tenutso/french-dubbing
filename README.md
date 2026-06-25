@@ -16,7 +16,7 @@ The pipeline does everything from source separation through translation, voice�
 | Speaker diarization | [pyannote `speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) | On by default; builds a separate voice clone per speaker |
 | Translation | **Qwen3:14b via Ollama** | Single natural pass + targeted compression; glossary prompt‑injection |
 | English‑echo guard | automatic re‑translation | Detects segments the LLM left in English and re‑translates them individually |
-| TTS | **Coqui XTTS‑v2** (Idiap fork, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; native French |
+| TTS | **F5‑TTS** (flow‑matching DiT, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; reliable on names and unusual input |
 | Speaker denoising | noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
 | Assembly | numpy timeline + Rubber Band time‑stretch + crossfade | **Holds the source timeline** (see timing policy); upsamples 24 kHz → 48 kHz |
 | Subtitles | **Hybrid BBC/Netflix shaper** | ≤2 lines, ≤42 cpl, ≤17 CPS reading speed, logical line breaks |
@@ -62,7 +62,7 @@ cd french-dubbing
 bash 04_setup.sh
 ```
 
-`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `noisereduce`, `coqui-tts`, `transformers<5`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + XTTS‑v2 weights, and copies the pipeline into `/workspace/scripts/`.
+`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `noisereduce`, `f5-tts`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + F5‑TTS weights (~1.5 GB), and copies the pipeline into `/workspace/scripts/`.
 
 ### 3. Verify
 
@@ -153,7 +153,9 @@ translation:
   locale: fr-ca            # loads canadian_glossary.yaml
 
 tts:
-  xtts_temperature: 0.65
+  f5tts_model: F5TTS_v1_Multilingual   # F5TTS_v1_Base for English/Chinese only
+  f5tts_nfe_step: 32                    # ODE steps: 16 = fast draft, 32 = high quality
+  f5tts_cfg_strength: 2.0               # CFG: higher = more faithful to reference voice
   stretcher: rubberband
   timing_policy: anchored   # anchored = hold source timeline (default) | no_drop = never speed up | lock = exact timing + truncate
   max_stretch: 1.3          # per‑group speed‑up cap used to hold the timeline (anchored)
@@ -201,7 +203,7 @@ For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the Fre
 
 ## Running outside RunPod
 
-Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + XTTS‑v2 + Qwen3:14b co‑resident) and CUDA 12.x:
+Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + Qwen3:14b co‑resident) and CUDA 12.x:
 
 - Use the [`Dockerfile`](Dockerfile) (PyTorch 2.8 / CUDA 12.8 base), or
 - Run `04_setup.sh` directly on Ubuntu 24.04 with PyTorch 2.8 installed.
@@ -219,7 +221,6 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + XTTS‑v2 + Q
 | Output too quiet | 0.95 peak‑normalise | `--volume-boost 20` |
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
 | A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
-| `ImportError: ... isin_mps_friendly` at synth | `transformers>=5` pulled in | `pip install 'transformers<5'` |
 | `qwen3:14b` re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.
@@ -251,7 +252,7 @@ french-dubbing/
 
 - Pipeline code, web UI, glue: **MIT**
 - faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · noisereduce: MIT · Qwen3 (via Ollama): Apache 2.0 · FFmpeg: LGPL/GPL
-- **Coqui XTTS‑v2 (Idiap fork): code MPL‑2.0; model weights [CPML — non‑commercial only](https://coqui.ai/cpml).** Auto‑accepted at install via `COQUI_TOS_AGREED=1`. ⚠️ For commercial dubbing you must obtain a commercial license from Coqui or swap in a permissively‑licensed cloning TTS — every other component is already commercial‑friendly.
+- **F5‑TTS**: MIT licence (model weights and code). All pipeline components are now commercial‑friendly.
 
 No proprietary APIs are required to run the pipeline end‑to‑end.
 

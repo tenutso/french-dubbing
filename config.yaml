@@ -15,10 +15,7 @@ pipeline:
 # Audio
 # ============================================================
 audio:
-  # Source audio extraction rate (whisper/demucs/diarization input).
-  # TTS output is independent: XTTS-v2 produces 24 kHz, upsampled at assembly.
-  synthesis_sample_rate: 48000
-  # Vimeo accepts both 44100 and 48000 Hz; 48000 avoids resampling loss
+  # 48000 Hz — avoids resampling loss on Vimeo and modern video platforms.
   output_sample_rate: 48000
   # Boost the final output by this percent (0 = off, 20 = +20%). Applied after
   # peak normalization; hard-clipped at ±1.0. Override at runtime: --volume-boost 20
@@ -75,7 +72,6 @@ source_separation:
 # ============================================================
 whisper:
   model: large-v3
-  language: en
   device: cuda
   # float16       → best quality on RTX 4090
   # int8_float16  → lower VRAM, marginal accuracy loss
@@ -145,17 +141,20 @@ translation:
   huggingface_token: ""
 
 # ============================================================
-# Text-to-Speech — Coqui XTTS-v2 (Idiap fork)
-# Multilingual zero-shot voice cloning, 24 kHz native output, native FR support.
+# Text-to-Speech — F5-TTS (flow-matching zero-shot voice cloning)
+# Multilingual (incl. French), 24 kHz native output. More reliable than
+# autoregressive XTTS-v2 on names, numbers, and unusual input.
 # ============================================================
 tts:
-  xtts_model: tts_models/multilingual/multi-dataset/xtts_v2
-  # XTTS sampling. 0.65 is a stable default; lower = more monotone.
-  xtts_temperature: 0.65
-  xtts_repetition_penalty: 2.0
-  xtts_length_penalty: 1.0
-  xtts_top_k: 50
-  xtts_top_p: 0.85
+  # F5TTS_v1_Multilingual → recommended for French and other European languages.
+  # F5TTS_v1_Base → English/Chinese only; marginally faster.
+  f5tts_model: F5TTS_v1_Multilingual
+  # ODE solver steps. 16 = fast draft; 32 = high quality (default); 64 = max quality.
+  f5tts_nfe_step: 32
+  # Classifier-free guidance strength. 2.0 is a reliable default.
+  f5tts_cfg_strength: 2.0
+  # Speech rate multiplier. 1.0 = natural pace.
+  f5tts_speed: 1.0
 
   # Speaker reference clip for voice cloning.
   speaker_profile_duration: 25
@@ -212,7 +211,7 @@ tts:
 
   # CPS guard — translated segments whose French exceeds this CPS get split
   # at a sentence boundary before TTS. Shorter halves are more stable for
-  # XTTS and the assembler can stretch each half independently. 0 disables.
+  # Shorter halves stretch independently. 0 disables.
   cps_split_threshold: 21.0
 
 # ============================================================
@@ -247,7 +246,6 @@ subtitles:
 # Processing
 # ============================================================
 processing:
-  max_workers: 1       # keep at 1 — models share 24 GB VRAM
   timeout_seconds: 7200
   # Set to true to skip temp-dir cleanup and dump intermediate segment JSON files.
   # Useful for inspecting what each pipeline stage produces (transcription, merge,

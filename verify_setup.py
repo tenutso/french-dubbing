@@ -109,7 +109,7 @@ def main():
     if ok:
         major, minor = (ver.split(".")[:2] + ["0", "0"])[:2]
         if int(major) == 3 and int(minor) >= 12:
-            c.warn("Python 3.12+", "Coqui XTTS v2 fallback may have issues — 3.11 preferred")
+            pass  # F5-TTS has no Python version constraint
 
     try:
         import torch
@@ -161,27 +161,6 @@ def main():
     # ── Core Python packages ──────────────────────────────────────────────────
     print(f"\n{BLUE}Core packages{RESET}")
 
-    # Apply transformers compatibility patch so XTTS import check works
-    try:
-        import importlib as _il, torch as _t
-        from packaging.version import Version as _V
-
-        _pu = _il.import_module("transformers.pytorch_utils")
-        if not hasattr(_pu, "isin_mps_friendly"):
-            _pu.isin_mps_friendly = _t.isin
-
-        _iu = _il.import_module("transformers.utils.import_utils")
-        if not hasattr(_iu, "is_torch_greater_or_equal"):
-            def _gte(version, revision=None):
-                v = f"{version}.{revision}" if revision else version
-                return _V(_t.__version__.split("+")[0]) >= _V(v)
-            _iu.is_torch_greater_or_equal = _gte
-            _tu = _il.import_module("transformers.utils")
-            if not hasattr(_tu, "is_torch_greater_or_equal"):
-                _tu.is_torch_greater_or_equal = _gte
-    except Exception:
-        pass
-
     required = [
         ("faster_whisper", "faster-whisper (transcription)"),
         ("librosa",        "librosa"),
@@ -227,44 +206,30 @@ def main():
             "Run: pip install noisereduce"
         )
 
-    # ── transformers (required by coqui-tts XTTS) ─────────────────────────────
-    print(f"\n{BLUE}transformers (XTTS dependency){RESET}")
+    # ── transformers ──────────────────────────────────────────────────────────
+    print(f"\n{BLUE}transformers{RESET}")
     hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
     ok2, ver = pkg("transformers")
     c.check("transformers", ok2, f"v{ver}" if ok2 else ver)
-    # coqui-tts requires transformers <5. Warn if a 5.x is installed.
-    if ok2:
-        try:
-            from packaging.version import Version
-            if Version(ver) >= Version("5.0.0"):
-                c.warn("transformers <5 (required by coqui-tts)",
-                       f"v{ver} — XTTS engine will fail to import. "
-                       f"Run: pip install 'transformers<5'")
-        except Exception:
-            pass
 
-    # ── TTS — Coqui XTTS-v2 (Idiap fork) ─────────────────────────────────────
-    print(f"\n{BLUE}TTS — Coqui XTTS-v2 (Idiap fork, French support){RESET}")
-    ok2, ver = pkg("TTS")
+    # ── TTS — F5-TTS ──────────────────────────────────────────────────────────
+    print(f"\n{BLUE}TTS — F5-TTS (flow-matching voice cloning, French support){RESET}")
+    ok2, ver = pkg("f5_tts")
     if ok2:
-        c.check("coqui-tts (XTTS-v2)", True, f"v{ver}")
-        xtts_cached = any(
-            "xtts_v2" in str(p).lower()
-            for p in hf_cache.rglob("*.pth") if hf_cache.exists()
-        ) or any(
-            "xtts" in str(p).lower()
-            for p in (Path.home() / ".local" / "share" / "tts").rglob("*.pth")
-            if (Path.home() / ".local" / "share" / "tts").exists()
+        c.check("f5-tts", True, f"v{ver}")
+        f5_cached = any(
+            "f5tts" in str(p).lower() or "f5-tts" in str(p).lower()
+            for p in hf_cache.rglob("*.safetensors") if hf_cache.exists()
         )
-        if xtts_cached:
-            c.check("XTTS-v2 weights cached", True)
+        if f5_cached:
+            c.check("F5-TTS weights cached", True)
         else:
-            c.warn("XTTS-v2 weights",
-                   "not cached — will download (~1.9 GB) on first xtts run")
+            c.warn("F5-TTS weights",
+                   "not cached — will download (~1.5 GB) on first run")
     else:
-        c.warn("coqui-tts (XTTS-v2)",
-               "not installed — xtts engine unavailable. "
-               "Run: pip install 'transformers<5' 'coqui-tts>=0.27.0'")
+        c.warn("f5-tts",
+               "not installed — TTS engine unavailable. "
+               "Run: pip install f5-tts")
 
     # ── System tools ──────────────────────────────────────────────────────────
     print(f"\n{BLUE}System tools{RESET}")

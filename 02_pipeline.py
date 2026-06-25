@@ -11,7 +11,7 @@ Stack (single, fixed path):
   Diarization (opt) : pyannote-audio            (per-speaker voice profiles)
   Translation       : Qwen3:14b via Ollama      (natural pass + English-echo guard)
   Speaker denoising : noisereduce              (clean voice reference)
-  TTS               : Coqui XTTS-v2 at 24 kHz   (multilingual voice cloning)
+  TTS               : F5-TTS at 24 kHz            (multilingual flow-matching voice cloning)
   Assembly          : Rubber Band stretch       (no_drop: never truncate; reading-pace slow-down)
   Subtitles         : hybrid BBC/Netflix shaper (≤2 lines, ≤42 cpl, ≤17 CPS)
   Output            : AAC 192 kbps 48 kHz stereo + UTF-8 SRT
@@ -134,7 +134,7 @@ class PipelineConfig:
     tts_speaker_duration: float = 25.0
     tts_speaker_skip: float = 20.0
 
-    # TTS — Coqui XTTS-v2 (Idiap fork)
+    # TTS — F5-TTS (flow-matching zero-shot voice cloning)
     # In "anchored" mode tts_max_stretch is the per-group *speed-up* cap used to
     # keep the dub inside the source timeline (1.30 ≈ inaudible on speech).
     tts_max_stretch: float = 1.3
@@ -160,12 +160,10 @@ class PipelineConfig:
     tts_group_gap: float = 0.4
     # Stretch engine: "rubberband" (natural, formant-preserving) or "atempo".
     tts_stretcher: str = "rubberband"
-    xtts_model: str = "tts_models/multilingual/multi-dataset/xtts_v2"
-    xtts_temperature: float = 0.65
-    xtts_length_penalty: float = 1.0
-    xtts_repetition_penalty: float = 2.0
-    xtts_top_k: int = 50
-    xtts_top_p: float = 0.85
+    f5tts_model: str = "F5TTS_v1_Multilingual"
+    f5tts_nfe_step: int = 32
+    f5tts_cfg_strength: float = 2.0
+    f5tts_speed: float = 1.0
 
     # Audio
     output_volume_boost_pct: float = 0.0
@@ -305,12 +303,10 @@ def load_config(path: str) -> PipelineConfig:
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
-        xtts_model=tts.get("xtts_model", "tts_models/multilingual/multi-dataset/xtts_v2"),
-        xtts_temperature=tts.get("xtts_temperature", 0.65),
-        xtts_length_penalty=tts.get("xtts_length_penalty", 1.0),
-        xtts_repetition_penalty=tts.get("xtts_repetition_penalty", 2.0),
-        xtts_top_k=tts.get("xtts_top_k", 50),
-        xtts_top_p=tts.get("xtts_top_p", 0.85),
+        f5tts_model=tts.get("f5tts_model", "F5TTS_v1_Multilingual"),
+        f5tts_nfe_step=int(tts.get("f5tts_nfe_step", 32)),
+        f5tts_cfg_strength=float(tts.get("f5tts_cfg_strength", 2.0)),
+        f5tts_speed=float(tts.get("f5tts_speed", 1.0)),
         tts_max_stretch=tts.get("max_stretch", 1.3),
         tts_min_stretch=tts.get("min_stretch", 0.8),
         tts_group_gap=tts.get("group_gap", 0.4),
@@ -2105,38 +2101,29 @@ def denoise_audio(
 
 
 # ============================================================================
-# Step 6: TTS Synthesis — Coqui XTTS-v2 (Idiap fork)
+# Step 6: TTS Synthesis — F5-TTS (flow-matching zero-shot voice cloning)
 # ============================================================================
 
 def _seg_text(seg: dict) -> str:
     return (seg.get("text_fr") or seg.get("text") or "").strip()
 
 
-# XTTS-v2 hard per-language character cap. The values below are well under
-# the model's internal token cap (FR: 273, EN: 250, DE/PL: 248, …) — XTTS
-# becomes loop-prone well *before* its hard cap, so we split aggressively
-# on sentence boundaries. Empirically, 180 chars/chunk for Romance languages
-# eliminates almost all internal looping while keeping prosody continuous.
-_XTTS_CHUNK_LIMITS = {
-    "fr": 180, "en": 200, "es": 180, "de": 200, "it": 170, "pt": 180,
-    "pl": 200, "nl": 200, "ru": 160, "cs": 160, "ar": 150, "tr": 180,
-    "hu": 160, "zh": 80, "ja": 80, "ko": 80, "hi": 200,
-}
+# F5-TTS does not have XTTS's hard token cap, but very long single-call inputs
+# still reduce quality. 250 chars/chunk keeps each call focused while allowing
+# longer sentences than XTTS permitted.
+_F5TTS_CHUNK_LIMIT = 250
 
-# Runaway-TTS guard. XTTS occasionally enters a repetition loop and emits a clip
-# many times longer than the text warrants (observed: a 67-char line → ~24 s of
-# audio). We estimate the expected spoken length from the character count and
-# flag a clip as runaway when it grossly overshoots, then regenerate it at a
-# lower temperature and keep the shortest take (the correct one is the short one).
-# Thresholds are deliberately loose so ordinary slow/expressive speech and short
-# multi-sentence interjections (XTTS inter-sentence pauses) are NOT touched.
+# Runaway / quality guard. F5-TTS is much less prone to repetition loops than
+# autoregressive XTTS, but near-silent or oddly-long outputs can still occur on
+# unusual input. We retry up to _TTS_MAX_RETRIES times; each call uses seed=-1
+# (random), so retries are genuinely independent samples.
 _TTS_EXPECTED_CPS = 13.0          # chars/sec of natural synthesized speech
 _TTS_RUNAWAY_FACTOR = 2.5         # natural > 2.5x expected → suspect runaway
 _TTS_RUNAWAY_MIN_EXCESS_S = 2.0   # …and at least this many seconds over expected
-_TTS_RETRY_TEMPERATURES = (0.30, 0.50)
+_TTS_MAX_RETRIES = 2
 
 
-def _split_for_xtts(text: str, limit: int) -> List[str]:
+def _split_for_tts(text: str, limit: int) -> List[str]:
     """Break text into ≤limit-char chunks on natural boundaries.
 
     Always splits at sentence boundaries so the caller's chunk_gap inserts an
@@ -2183,11 +2170,11 @@ def synthesize_all_segments(
     log: logging.Logger,
     speaker_profiles: Optional[dict] = None,
 ) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
-    """Synthesize every segment with Coqui XTTS-v2."""
+    """Synthesize every segment with F5-TTS (flow-matching zero-shot voice cloning)."""
     try:
-        from TTS.api import TTS
+        from f5_tts.api import F5TTS
     except ImportError:
-        log.error("coqui-tts not installed. Install: pip install 'transformers<5' coqui-tts")
+        log.error("f5-tts not installed. Install: pip install f5-tts")
         return [], 24000
 
     import torch as _torch
@@ -2199,36 +2186,29 @@ def synthesize_all_segments(
                 return profile
         return speaker_wav
 
-    lang_code = (config.target_lang or "fr").lower().split("-")[0]
-    log.info(f"Loading XTTS-v2: {config.xtts_model} (lang={lang_code}) …")
-    # Auto-accept the CPML license non-interactively.
-    os.environ.setdefault("COQUI_TOS_AGREED", "1")
+    log.info(f"Loading F5-TTS: {config.f5tts_model} …")
     device = "cuda" if _torch.cuda.is_available() else "cpu"
-    tts = TTS(config.xtts_model).to(device)
-    sr = 24000  # XTTS-v2 native rate
-    log.info(f"✓ XTTS-v2 ready (output: {sr} Hz, device: {device})")
+    f5 = F5TTS(model_type=config.f5tts_model, device=device)
+    sr = 24000  # F5-TTS/vocos native rate
+    log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
 
-    chunk_limit = _XTTS_CHUNK_LIMITS.get(lang_code, 240)
-    # 180 ms silence between sentence chunks — inter-sentence pause that XTTS
-    # won't insert on its own. Every sentence boundary now gets this gap because
-    # _split_for_xtts always splits on sentence endings (not just when >limit).
+    # 180 ms silence between sentence chunks — inter-sentence pause.
+    # _split_for_tts always splits on sentence endings so every boundary gets this gap.
     chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
 
-    def _synth_one(text: str, ref_wav: str, temperature: Optional[float] = None) -> np.ndarray:
-        return np.asarray(
-            tts.tts(
-                text=text,
-                speaker_wav=ref_wav,
-                language=lang_code,
-                temperature=config.xtts_temperature if temperature is None else temperature,
-                length_penalty=config.xtts_length_penalty,
-                repetition_penalty=config.xtts_repetition_penalty,
-                top_k=config.xtts_top_k,
-                top_p=config.xtts_top_p,
-                split_sentences=False,  # we split externally via _split_for_xtts + chunk_gap
-            ),
-            dtype=np.float32,
+    def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+        wav, _, _ = f5.infer(
+            ref_file=ref_wav,
+            ref_text="",          # empty → F5-TTS auto-transcribes the reference
+            gen_text=text,
+            nfe_step=config.f5tts_nfe_step,
+            cfg_strength=config.f5tts_cfg_strength,
+            speed=config.f5tts_speed,
+            remove_silence=False,
+            file_wave=None,
+            seed=-1,              # random seed → each retry is an independent sample
         )
+        return np.asarray(wav, dtype=np.float32)
 
     def _synth_guarded(text: str, ref_wav: str, seg_id) -> np.ndarray:
         """Synthesize `text`, regenerating on runaway duration or near-silent output."""
@@ -2236,16 +2216,15 @@ def synthesize_all_segments(
         expected = max(len(text) / _TTS_EXPECTED_CPS, 0.4)
         natural = len(wav) / sr
 
-        # Runaway guard: clip is far longer than the text warrants.
         is_runaway = (natural > expected * _TTS_RUNAWAY_FACTOR
                       and natural - expected > _TTS_RUNAWAY_MIN_EXCESS_S)
         if is_runaway:
             best = wav
-            for retry_temp in _TTS_RETRY_TEMPERATURES:
+            for _ in range(_TTS_MAX_RETRIES):
                 try:
-                    cand = _synth_one(text, ref_wav, temperature=retry_temp)
+                    cand = _synth_one(text, ref_wav)
                 except Exception as e:
-                    log.debug(f"Segment {seg_id}: runaway retry @T={retry_temp} failed: {e}")
+                    log.debug(f"Segment {seg_id}: runaway retry failed: {e}")
                     continue
                 if len(cand) < len(best):
                     best = cand
@@ -2263,22 +2242,20 @@ def synthesize_all_segments(
                 )
             wav = best
 
-        # Quality guard: catch near-silent clips or drastically-too-short takes
-        # (XTTS occasionally returns silence or a clipped stub on short/unusual input).
         rms = float(np.sqrt(np.mean(wav ** 2))) if len(wav) > 0 else 0.0
         min_dur = max(len(text) / _TTS_EXPECTED_CPS * 0.25, 0.15)
         if len(text) > 10 and (rms < 5e-3 or len(wav) / sr < min_dur):
             reason = (f"near-silent (RMS={rms:.4f})" if rms < 5e-3
                       else f"too short ({len(wav)/sr:.2f}s, expected ≥{min_dur:.2f}s)")
-            for retry_temp in _TTS_RETRY_TEMPERATURES:
+            for _ in range(_TTS_MAX_RETRIES):
                 try:
-                    cand = _synth_one(text, ref_wav, temperature=retry_temp)
+                    cand = _synth_one(text, ref_wav)
                 except Exception as e:
-                    log.debug(f"Segment {seg_id}: quality retry @T={retry_temp} failed: {e}")
+                    log.debug(f"Segment {seg_id}: quality retry failed: {e}")
                     continue
                 cand_rms = float(np.sqrt(np.mean(cand ** 2))) if len(cand) > 0 else 0.0
                 if cand_rms >= 5e-3 and len(cand) / sr >= min_dur:
-                    log.warning(f"Segment {seg_id}: {reason} — fixed at T={retry_temp}")
+                    log.warning(f"Segment {seg_id}: {reason} — fixed on retry")
                     wav = cand
                     break
             else:
@@ -2287,7 +2264,7 @@ def synthesize_all_segments(
         return wav
 
     synthesized: List[Tuple[np.ndarray, float, float]] = []
-    with tqdm(total=len(segments), desc="Synthesizing (XTTS-v2)") as pbar:
+    with tqdm(total=len(segments), desc="Synthesizing (F5-TTS)") as pbar:
         for seg in segments:
             text = _seg_text(seg)
             if not text:
@@ -2299,11 +2276,11 @@ def synthesize_all_segments(
                     log.warning(f"Segment {seg['id']}: no speaker reference, skipping")
                     pbar.update(1)
                     continue
-                chunks = _split_for_xtts(text, chunk_limit)
+                chunks = _split_for_tts(text, _F5TTS_CHUNK_LIMIT)
                 if len(chunks) > 1:
                     log.debug(
                         f"Segment {seg['id']}: split into {len(chunks)} chunks "
-                        f"({len(text)} chars, limit={chunk_limit})"
+                        f"({len(text)} chars, limit={_F5TTS_CHUNK_LIMIT})"
                     )
                 parts = [_synth_guarded(c, ref_wav, seg["id"]) for c in chunks]
                 wav = parts[0] if len(parts) == 1 else np.concatenate(
@@ -2312,11 +2289,11 @@ def synthesize_all_segments(
                 )
                 synthesized.append((wav, seg["start"], seg["end"]))
             except Exception as e:
-                log.warning(f"Segment {seg['id']} XTTS-v2 failed: {e}")
+                log.warning(f"Segment {seg['id']} F5-TTS failed: {e}")
             pbar.update(1)
 
     log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
-    del tts
+    del f5
     free_vram(log)
     return synthesized, sr
 
@@ -3755,7 +3732,7 @@ def process_video(
         log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
-    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (XTTS-v2)")
+    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")
     synthesized, actual_sr = synthesize_all_segments(
         segments,
         speaker_wav,

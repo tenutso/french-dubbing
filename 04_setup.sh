@@ -111,11 +111,11 @@ WHISPER_CACHE="$MODELS_FOLDER/whisper"
 # Models
 WHISPER_MODEL=$(cfg     whisper.model      large-v3)
 OLLAMA_MODEL=$(cfg      translation.model  qwen3:14b)
-XTTS_MODEL=$(cfg        tts.xtts_model     tts_models/multilingual/multi-dataset/xtts_v2)
+F5TTS_MODEL=$(cfg       tts.f5tts_model    F5TTS_v1_Multilingual)
 DIARIZATION_MODEL=$(cfg diarization.model  pyannote/speaker-diarization-community-1)
 
 log_success "Paths: input=$INPUT_FOLDER output=$OUTPUT_FOLDER models=$MODELS_FOLDER"
-log_success "Models: whisper=$WHISPER_MODEL ollama=$OLLAMA_MODEL xtts=$XTTS_MODEL"
+log_success "Models: whisper=$WHISPER_MODEL ollama=$OLLAMA_MODEL f5tts=$F5TTS_MODEL"
 
 # ── Step 1: System packages ────────────────────────────────────────────────
 
@@ -258,24 +258,17 @@ else
     log_warn "Web UI dependency install failed — 05_web.sh will not run"
 fi
 
-# ── Step 8d: XTTS-v2 TTS (Idiap fork of Coqui TTS) ───────────────────────────
-# Multilingual zero-shot voice cloning with native French support.
+# ── Step 8d: F5-TTS (flow-matching zero-shot voice cloning) ──────────────────
+# Multilingual (incl. French), more reliable than autoregressive XTTS-v2.
 
-log_step "Installing XTTS-v2 (coqui-tts) …"
+log_step "Installing F5-TTS …"
 
-# coqui-tts imports transformers symbols removed in 5.x (isin_mps_friendly in the
-# tortoise autoregressive layer) — pin to last 4.x. Install transformers first so
-# coqui-tts doesn't pull 5.x as a transitive.
-if $PYTHON -m pip install --no-cache-dir "transformers>=4.57,<5" "coqui-tts>=0.27.5" \
+if $PYTHON -m pip install --no-cache-dir "f5-tts>=1.0.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "coqui-tts (XTTS-v2) installed"
+    log_success "f5-tts installed"
 else
-    log_error "coqui-tts install failed — TTS will not work"
+    log_error "f5-tts install failed — TTS will not work"
 fi
-
-# Auto-accept the XTTS CPML license non-interactively, for setup + runtime.
-export COQUI_TOS_AGREED=1
-echo "export COQUI_TOS_AGREED=1" >> /workspace/.env 2>/dev/null || true
 
 # ── Step 9: Utilities ─────────────────────────────────────────────────────
 
@@ -432,38 +425,35 @@ else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
 
-# ── Step 14: Pre-download XTTS-v2 (~1.9 GB) ──────────────────────────────────
+# ── Step 14: Pre-download F5-TTS weights (~1.5 GB) ───────────────────────────
 
-log_step "Pre-downloading XTTS-v2 model (~1.9 GB) …"
+log_step "Pre-downloading F5-TTS model (~1.5 GB) …"
 
-if COQUI_TOS_AGREED=1 XTTS_MODEL="$XTTS_MODEL" $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
+if F5TTS_MODEL="$F5TTS_MODEL" $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
 import os
 try:
-    from TTS.api import TTS
-    print("Downloading XTTS-v2 weights from HuggingFace …")
-    t = TTS(os.environ["XTTS_MODEL"])
+    from f5_tts.api import F5TTS
+    print("Downloading F5-TTS weights from HuggingFace …")
+    t = F5TTS(model_type=os.environ.get("F5TTS_MODEL", "F5TTS_v1_Multilingual"))
     del t
-    print("✓ XTTS-v2 cached")
+    print("✓ F5-TTS cached")
 except ImportError:
-    print("coqui-tts not installed — skipping XTTS pre-download")
+    print("f5-tts not installed — skipping pre-download")
 except Exception as e:
-    print(f"XTTS-v2 download error: {e}")
+    print(f"F5-TTS download error: {e}")
     raise
 PYEOF
-    log_success "XTTS-v2 cached (or not installed)"
+    log_success "F5-TTS cached (or not installed)"
 else
-    log_warn "XTTS-v2 pre-download failed — it will download on first use"
+    log_warn "F5-TTS pre-download failed — it will download on first use"
 fi
 
 # ── Step 14b: Refresh latest releases for non-pinned packages ────────────────
-# Pulls newest releases of packages without an upper bound. Run after all
-# installs (so transitive deps settle). NOTE: transformers stays pinned <5
-# because coqui-tts uses an internal symbol removed in 5.x.
 
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper pyannote.audio noisereduce \
+       faster-whisper pyannote.audio noisereduce transformers \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"

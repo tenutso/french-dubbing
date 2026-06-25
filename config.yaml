@@ -95,8 +95,10 @@ whisper:
 # shrinking translations — see tts.timing_policy / reading_cps below.
 # ============================================================
 translation:
-  # Qwen3:14b via Ollama. /no_think is sent automatically for qwen3.* tags.
-  model: qwen3:14b
+  # Translation model via Ollama. /no_think is sent automatically for qwen3.* tags.
+  # mistral-small:22b is recommended for French — Mistral is a French company with
+  # native-quality FR training data. Any model available in Ollama can be used here.
+  model: mistral-small:22b
   temperature: 0.3
   # 20 segments per Ollama call. Bigger batches save calls but risk hitting
   # the 4096-token output budget if segments are long.

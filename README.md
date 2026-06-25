@@ -14,7 +14,7 @@ The pipeline does everything from source separation through translation, voice�
 | Transcription | [faster‑whisper `large-v3`](https://github.com/SYSTRAN/faster-whisper) | CTranslate2, float16, word timestamps + VAD, anti‑hallucination tuned |
 | Segment merging | sentence‑scale chunks (2–12 s) | Sub‑second fragments are absorbed into neighbours for natural prosody |
 | Speaker diarization | [pyannote `speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) | On by default; builds a separate voice clone per speaker |
-| Translation | **Qwen3:14b via Ollama** | Single natural pass + targeted compression; glossary prompt‑injection |
+| Translation | **mistral-small:22b via Ollama** | Single natural pass + targeted compression; glossary prompt‑injection; native French quality |
 | English‑echo guard | automatic re‑translation | Detects segments the LLM left in English and re‑translates them individually |
 | TTS | **F5‑TTS** (flow‑matching DiT, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; reliable on names and unusual input |
 | Speaker denoising | noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
@@ -62,7 +62,7 @@ cd french-dubbing
 bash 04_setup.sh
 ```
 
-`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `noisereduce`, `f5-tts`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `qwen3:14b`, pre‑downloads the Whisper + F5‑TTS weights (~1.5 GB), and copies the pipeline into `/workspace/scripts/`.
+`04_setup.sh` is idempotent. It installs system packages (`ffmpeg`, `sox`, audio libs), creates `/workspace/{videos/input,outputs,models,scripts,logs,temp}`, pip‑installs the stack (`faster-whisper`, `demucs`, `pyannote.audio`, `noisereduce`, `f5-tts`, `pysrt`, `fastapi`+`uvicorn`), persists `HF_TOKEN`, starts Ollama with a persisted cache and pulls `mistral-small:22b`, pre‑downloads the Whisper + F5‑TTS weights (~1.5 GB), and copies the pipeline into `/workspace/scripts/`.
 
 ### 3. Verify
 
@@ -144,7 +144,7 @@ diarization:
   max_speakers: 10
 
 translation:
-  model: qwen3:14b
+  model: mistral-small:22b
   review_pass: false       # optional self‑review pass (~2× slower)
   compression_pass: true   # tighten only the over‑budget segments
   compression_rounds: 3    # iterate the compression pass until segments fit
@@ -215,8 +215,8 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + Qw
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Only `SPEAKER_00` on a multi‑speaker clip | `min_speakers: 1` | Set `diarization.min_speakers: 2`; confirm HF token accepted the [model license](https://huggingface.co/pyannote/speaker-diarization-community-1) |
-| Ollama `Read timed out` | First‑batch cold load | Already at 600 s + `keep_alive: 30m`; check `ollama ps` and warm with `ollama run qwen3:14b ""` |
-| `TRANSLATION FAILURE: N/N segments still in English` | Ollama unreachable or wrong model name | `ollama list`; `ollama pull qwen3:14b` |
+| Ollama `Read timed out` | First‑batch cold load | Already at 600 s + `keep_alive: 30m`; check `ollama ps` and warm with `ollama run mistral-small:22b ""` |
+| `TRANSLATION FAILURE: N/N segments still in English` | Ollama unreachable or wrong model name | `ollama list`; `ollama pull mistral-small:22b` |
 | A few words sound English in the dub | Rare stochastic LLM echo | The English‑echo guard re‑translates these automatically; check the log for "Re‑translating … Recovered" |
 | Output too quiet | 0.95 peak‑normalise | `--volume-boost 20` |
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |

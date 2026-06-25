@@ -119,7 +119,7 @@ class PipelineConfig:
     diarization_profile_duration: float = 25.0
 
     # Translation — Qwen via Ollama (single backend)
-    translation_model: str = "qwen3:14b"
+    translation_model: str = "mistral-small:22b"
     translation_temperature: float = 0.3
     translation_batch_size: int = 20
     translation_review: bool = False
@@ -294,7 +294,7 @@ def load_config(path: str) -> PipelineConfig:
         diarization_min_speakers=dia.get("min_speakers", 1),
         diarization_max_speakers=dia.get("max_speakers", 10),
         diarization_profile_duration=dia.get("profile_duration", 25.0),
-        translation_model=t.get("model", "qwen3:14b"),
+        translation_model=t.get("model", "mistral-small:22b"),
         translation_temperature=t.get("temperature", 0.3),
         translation_batch_size=t.get("batch_size", 20),
         translation_review=t.get("review_pass", False),
@@ -1891,7 +1891,7 @@ def _parse_numbered(text: str, count: int) -> List[str]:
     return [result.get(i + 1, "") for i in range(count)]
 
 
-def translate_segments_qwen(
+def translate_segments(
     segments: List[dict],
     model: str,
     temperature: float,
@@ -3603,7 +3603,7 @@ def process_video(
 
     # ── 3. Translate ────────────────────────────────────────────────────────
     log.info(f"\n[3/6] TRANSLATING ({config.translation_model} via Ollama)")
-    segments = translate_segments_qwen(
+    segments = translate_segments(
         segments,
         config.translation_model,
         config.translation_temperature,

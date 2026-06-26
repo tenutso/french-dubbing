@@ -434,7 +434,7 @@ import os
 try:
     from f5_tts.api import F5TTS
     print("Downloading F5-TTS weights from HuggingFace …")
-    t = F5TTS(model_type=os.environ.get("F5TTS_MODEL", "F5TTS_v1_Multilingual"))
+    t = F5TTS(model=os.environ.get("F5TTS_MODEL", "F5TTS_v1_Small"))
     del t
     print("✓ F5-TTS cached")
 except ImportError:

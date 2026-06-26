@@ -433,8 +433,21 @@ if F5TTS_MODEL="$F5TTS_MODEL" $PYTHON - <<'PYEOF' 2>&1 | tee -a "$LOGFILE"; then
 import os
 try:
     from f5_tts.api import F5TTS
-    print("Downloading F5-TTS weights from HuggingFace …")
-    t = F5TTS(model=os.environ.get("F5TTS_MODEL", "F5TTS_v1_Small"))
+    model = os.environ.get("F5TTS_MODEL", "F5TTS_v1_Small")
+    print(f"Downloading F5-TTS model: {model} …")
+    if "/" in model:
+        # HuggingFace repo ID (e.g. RASPIAUDIO/F5-French-MixedSpeakers-reduced).
+        # Download checkpoint + vocab and load with F5TTS_Base architecture.
+        from huggingface_hub import hf_hub_download
+        print(f"  Fetching weights from HuggingFace: {model} …")
+        try:
+            ckpt_file = hf_hub_download(repo_id=model, filename="model_last_reduced.pt")
+        except Exception:
+            ckpt_file = hf_hub_download(repo_id=model, filename="model_last.pt")
+        vocab_file = hf_hub_download(repo_id=model, filename="vocab.txt")
+        t = F5TTS(model="F5TTS_Base", ckpt_file=ckpt_file, vocab_file=vocab_file)
+    else:
+        t = F5TTS(model=model)
     del t
     print("✓ F5-TTS cached")
 except ImportError:

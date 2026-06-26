@@ -148,8 +148,11 @@ translation:
 # autoregressive XTTS-v2 on names, numbers, and unusual input.
 # ============================================================
 tts:
-  # F5TTS_v1_Multilingual → recommended for French and other European languages.
-  # F5TTS_v1_Base → English/Chinese only; marginally faster.
+  # Built-in models:   F5TTS_v1_Base (EN/ZH), F5TTS_v1_Small (faster),
+  #                    F5TTS_v1_Multilingual (recommended for other languages).
+  # HuggingFace model: supply the repo ID (owner/repo) — the pipeline downloads
+  #   the checkpoint and vocab automatically and uses the F5TTS_Base architecture.
+  #   RASPIAUDIO/F5-French-MixedSpeakers-reduced is a French fine-tune of F5TTS_Base.
   f5tts_model: RASPIAUDIO/F5-French-MixedSpeakers-reduced
   # ODE solver steps. 16 = fast draft; 32 = high quality (default); 64 = max quality.
   f5tts_nfe_step: 32

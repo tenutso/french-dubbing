@@ -2188,7 +2188,29 @@ def synthesize_all_segments(
 
     log.info(f"Loading F5-TTS: {config.f5tts_model} …")
     device = "cuda" if _torch.cuda.is_available() else "cpu"
-    f5 = F5TTS(model=config.f5tts_model, device=device)
+
+    if "/" in config.f5tts_model:
+        # HuggingFace repo ID — download checkpoint + vocab, use F5TTS_Base arch.
+        # Community fine-tunes like RASPIAUDIO/F5-French-MixedSpeakers-reduced are
+        # based on the original F5TTS_Base (not v1), so we use that config for the
+        # model architecture while supplying the custom weights.
+        try:
+            from huggingface_hub import hf_hub_download
+            repo_id = config.f5tts_model
+            log.info(f"  Fetching weights from HuggingFace: {repo_id} …")
+            # Try the reduced checkpoint first; fall back to the full one.
+            try:
+                ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last_reduced.pt")
+            except Exception:
+                ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last.pt")
+            vocab_file = hf_hub_download(repo_id=repo_id, filename="vocab.txt")
+            f5 = F5TTS(model="F5TTS_Base", ckpt_file=ckpt_file, vocab_file=vocab_file, device=device)
+        except Exception as e:
+            log.error(f"Failed to load HuggingFace model '{config.f5tts_model}': {e}")
+            return [], 24000
+    else:
+        f5 = F5TTS(model=config.f5tts_model, device=device)
+
     sr = 24000  # F5-TTS/vocos native rate
     log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
 

@@ -13,7 +13,23 @@
       "Bash(wsl.exe -d ubuntu -- bash -lc 'rm -f /tmp/test_rewrite.py /tmp/test_fix.py /tmp/cfg_test.yaml /tmp/cfg_fix.yaml && echo cleaned')",
       "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -c \" *)",
       "Bash(wsl.exe -d ubuntu -- bash -lc 'grep -n \"^acronyms:\\\\|^always:\\\\|^glossary:\\\\|── Core Speaker\\\\|── Always-substitute\\\\|── Acronyms\\\\|breakout session\\\\|follow-up\" /tmp/gloss_out.yaml')",
-      "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -m py_compile web/app.py && echo \"app.py: syntax OK\" && node --check web/static/app.js 2>/dev/null && echo \"app.js: syntax OK\" || echo \"app.js: \\(node not available, skipped\\)\"; rm -f /tmp/test_gloss.py /tmp/gloss_out.yaml && echo cleaned')"
+      "Bash(wsl.exe -d ubuntu -- bash -lc 'cd ~/projects/french-dubbing && python3 -m py_compile web/app.py && echo \"app.py: syntax OK\" && node --check web/static/app.js 2>/dev/null && echo \"app.js: syntax OK\" || echo \"app.js: \\(node not available, skipped\\)\"; rm -f /tmp/test_gloss.py /tmp/gloss_out.yaml && echo cleaned')",
+      "Bash(python3 -c \"import f5_tts; print\\(f5_tts.__file__\\)\")",
+      "Read(//usr/local/lib/python3.12/dist-packages/**)",
+      "Bash(pip show *)",
+      "Bash(python3 -c \"from f5_tts.api import F5TTS; help\\(F5TTS.__init__\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"import inspect; from f5_tts.api import F5TTS; print\\(inspect.signature\\(F5TTS.__init__\\)\\)\")",
+      "Bash(pip3 show *)",
+      "Bash(python -m pip show f5-tts)",
+      "Bash(curl -s https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/api.py)",
+      "Bash(curl -s \"https://huggingface.co/api/models/RASPIAUDIO/F5-French-MixedSpeakers-reduced\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); [print\\(s['rfilename']\\) for s in d.get\\('siblings',[]\\)]\")",
+      "Bash(curl -s \"https://api.github.com/repos/SWivid/F5-TTS/contents/src/f5_tts/configs\")",
+      "Bash(python3 -c \"import sys,json; [print\\(f['name']\\) for f in json.load\\(sys.stdin\\)]\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/configs/F5TTS_v1_Base.yaml\")",
+      "Bash(curl -s \"https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/configs/F5TTS_Base.yaml\")",
+      "Bash(curl -s \"https://huggingface.co/RASPIAUDIO/F5-French-MixedSpeakers-reduced/raw/main/README.md\")"
     ]
   }
 }

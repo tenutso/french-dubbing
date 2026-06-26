@@ -72,7 +72,7 @@ CONFIG_SCHEMA: dict = {
     "diarization.enabled":             ("bool",  "Enable diarization",      "Detect speakers and clone a distinct voice per speaker.", {"group": "Diarization"}),
     "diarization.min_speakers":        ("int",   "Min speakers",            "Set min == max to force an exact count.", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
     "diarization.max_speakers":        ("int",   "Max speakers",            "", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
-    "diarization.profile_duration":    ("int",   "Profile duration (s)",    "Seconds of per-speaker audio used for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "Diarization"}),
+    "diarization.profile_duration":    ("int",   "Profile duration (s)",    "Seconds of per-speaker audio for voice cloning. Must stay ≤ 15s — F5-TTS breaks above 22s (pipeline hard-caps at 15s).", {"min": 5, "max": 15, "step": 1, "group": "Diarization"}),
 
     # Source separation
     "source_separation.enabled":            ("bool",  "Enable source separation", "Separate vocals from music before transcription/cloning.", {"group": "Source separation"}),
@@ -101,7 +101,7 @@ CONFIG_SCHEMA: dict = {
     "tts.timing_policy":               ("str",   "Timing policy",           "anchored holds the source timeline (speed dense runs up, re-anchor drift at pauses) so the dub stays in sync over a full program. no_drop never speeds up and drifts longer than the video. lock truncates overflow.", {"choices": ["anchored", "no_drop", "lock"], "group": "TTS"}),
     "tts.f5tts_nfe_step":              ("int",   "F5-TTS ODE steps",        "More steps = better quality, slower. 16 = fast draft, 32 = high quality, 64 = max.", {"min": 8, "max": 64, "step": 4, "group": "TTS"}),
     "tts.f5tts_cfg_strength":          ("float", "CFG strength",             "Classifier-free guidance. Higher = more faithful to reference voice.", {"min": 0.5, "max": 5.0, "step": 0.25, "group": "TTS"}),
-    "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning.", {"min": 5, "max": 120, "step": 1, "group": "TTS"}),
+    "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning (single-speaker mode). Must stay ≤ 15s.", {"min": 5, "max": 15, "step": 1, "group": "TTS"}),
     "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
     "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
     "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
@@ -171,10 +171,10 @@ CONFIG_PRESETS: dict[str, dict] = {
         "desc": "Optimise speaker fidelity: long reference clip, denoise, tight stretch limits, aggressive compression.",
         "values": {
             "diarization.enabled": True,
-            "diarization.profile_duration": 40,
+            "diarization.profile_duration": 15,
             "translation.compression_pass": True,         # short utterances clone better
             "translation.budget_cps": 16,
-            "tts.speaker_profile_duration": 40,
+            "tts.speaker_profile_duration": 15,
             "tts.use_deepfilter": True,
             "tts.f5tts_nfe_step": 32,
             "tts.f5tts_cfg_strength": 2.5,                # stronger reference adherence
@@ -1137,7 +1137,9 @@ async def get_segments(job_id: str) -> JSONResponse:
         raise HTTPException(404, "job not found")
     if job.status != STATUS_AWAITING_REVIEW:
         raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
-    name = safe_stem(job.video_filename)
+    # Pipeline names outputs after Path(video_path).stem (includes the job-id prefix),
+    # not the original upload filename — use the same derivation here.
+    name = Path(job.video_path).stem if job.video_path else safe_stem(job.video_filename)
     seg_file = Path(job.output_dir) / f"{name}_segments.json"
     if not seg_file.exists():
         raise HTTPException(404, "segments file not found")
@@ -1145,13 +1147,19 @@ async def get_segments(job_id: str) -> JSONResponse:
 
 
 @app.put("/api/jobs/{job_id}/segments")
-async def put_segments(job_id: str, payload: list) -> JSONResponse:
+async def put_segments(job_id: str, request: Request) -> JSONResponse:
     job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     if job.status != STATUS_AWAITING_REVIEW:
         raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
-    name = safe_stem(job.video_filename)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    if not isinstance(payload, list):
+        raise HTTPException(400, "body must be a JSON array")
+    name = Path(job.video_path).stem if job.video_path else safe_stem(job.video_filename)
     seg_file = Path(job.output_dir) / f"{name}_segments.json"
     fd, tmp = tempfile.mkstemp(dir=job.output_dir, prefix=".seg.", suffix=".tmp")
     try:

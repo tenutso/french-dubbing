@@ -756,7 +756,14 @@ async function saveReviewSegments() {
       body: JSON.stringify(reviewSegments),
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) { status.textContent = "save failed: " + (data.detail || r.statusText); return false; }
+    if (!r.ok) {
+      const d = data.detail;
+      const msg = typeof d === "string" ? d
+        : Array.isArray(d) ? d.map(e => e.msg || JSON.stringify(e)).join("; ")
+        : r.statusText;
+      status.textContent = "save failed: " + msg;
+      return false;
+    }
     status.textContent = `saved ${data.count} segments`;
     return true;
   } catch (e) { status.textContent = "network error: " + e; return false; }

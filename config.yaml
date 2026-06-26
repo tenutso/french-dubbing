@@ -50,7 +50,9 @@ diarization:
   min_speakers: 2
   max_speakers: 10
   # Seconds of each speaker's audio to assemble for their voice clone.
-  profile_duration: 25
+  # F5-TTS's duration formula breaks for reference clips > 22s (max_chars goes
+  # negative). Keep this well under 22s; 12s gives good voice quality.
+  profile_duration: 12
 
 # ============================================================
 # Source Separation — Demucs
@@ -118,13 +120,12 @@ translation:
   # no further progress is made. More rounds = tighter fit, slightly more calls.
   compression_rounds: 3
   # Character budget per second of audio that Qwen is asked to fit each segment
-  # into. Set to 14 (below subtitles.max_cps of 17). Tuning history: 15 left no
-  # headroom (final ≈15.2 CPS); 13 fit well but over-compressed
-  # (mean_expansion 0.78 — French 22% shorter than English, fidelity risk); 14
-  # is the middle ground — keeps audio fit healthy while recovering translation
-  # headroom. Track mean_expansion and final_over_readability_pct in
+  # into. Tuning history: 13 over-compressed (mean_expansion 0.78, fidelity risk);
+  # 14 was the prior default but left 62%+ segments over budget with Mistral-small;
+  # 16 gives the model breathing room while remaining under subtitles.max_cps (17).
+  # Track mean_expansion and final_over_readability_pct in
   # _dubbing_metrics_runs.csv after changing. Keep ≤ subtitles.max_cps.
-  budget_cps: 14
+  budget_cps: 16
 
   # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.
@@ -162,7 +163,8 @@ tts:
   f5tts_speed: 1.0
 
   # Speaker reference clip for voice cloning.
-  speaker_profile_duration: 25
+  # Must be < 22s — see diarization.profile_duration comment above.
+  speaker_profile_duration: 12
   # Skip this many seconds from the start (avoids intro music / titles).
   speaker_profile_skip: 20
 

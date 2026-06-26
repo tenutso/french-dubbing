@@ -56,6 +56,9 @@ python-multipart>=0.0.9
 # Vimeo URL ingestion in the web UI (downloads the source video before dubbing).
 yt-dlp>=2024.1.0
 
+# ── Syllabification — pyphen (French syllable budgeting) ─────────────────────
+pyphen>=0.14.0
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
 tqdm>=4.66.0

@@ -116,7 +116,7 @@ class PipelineConfig:
     diarization_model: str = "pyannote/speaker-diarization-community-1"
     diarization_min_speakers: int = 2
     diarization_max_speakers: int = 10
-    diarization_profile_duration: float = 25.0
+    diarization_profile_duration: float = 12.0
 
     # Translation — Qwen via Ollama (single backend)
     translation_model: str = "mistral-small:22b"
@@ -131,7 +131,7 @@ class PipelineConfig:
 
     # Speaker reference
     use_deepfilter: bool = True
-    tts_speaker_duration: float = 25.0
+    tts_speaker_duration: float = 12.0
     tts_speaker_skip: float = 20.0
 
     # TTS — F5-TTS (flow-matching zero-shot voice cloning)
@@ -1181,11 +1181,12 @@ Translate each numbered English segment into natural spoken {language} suitable 
 
 Each segment is tagged:
 
-[N.Ns, ≤M chars]
+[N.Ns, ~W words, ≤M chars]
 
 where:
 
 * N.Ns = target audio duration
+* W = approximate word count at a comfortable spoken pace (self-check: count your words)
 * M = maximum character budget
 
 Your goal is to create dialogue that:
@@ -1302,6 +1303,49 @@ def _looks_like_instruction_leak(text: str) -> bool:
     return bool(_LEAK_SIGNATURE_RE.search(text))
 
 
+# Empirical French syllable density: ~0.32 syllables per character for typical
+# spoken French (content + function words mixed). Used to derive syllable-per-
+# second budgets from the character-per-second config values so that the
+# compression trigger and CPS-split threshold are linguistically grounded
+# rather than relying on character counts, which over-penalise long French
+# words and under-penalise dense short ones.
+_FR_SYL_PER_CHAR: float = 0.32
+
+_pyphen_cache: dict = {}
+
+
+def _count_syllables(text: str, lang: str = "fr") -> int:
+    """Count syllables in `text` using pyphen's hyphenation dictionary.
+
+    Hyphenation points ≈ syllable boundaries for timing purposes.
+    Falls back to a vowel-group count if pyphen is unavailable.
+    """
+    words = re.findall(r"[a-zA-ZÀ-ÿ̀-ͯ']+", text)
+    if not words:
+        return 0
+    try:
+        import pyphen
+        if lang not in _pyphen_cache:
+            _pyphen_cache[lang] = pyphen.Pyphen(lang=lang)
+        dic = _pyphen_cache[lang]
+        return sum(len(dic.positions(w)) + 1 for w in words)
+    except Exception:
+        # Vowel-group fallback — counts runs of French vowels per word
+        vowel_re = re.compile(r"[aeiouyàâéèêëîïôùûüœæ]+", re.IGNORECASE)
+        return max(1, sum(len(vowel_re.findall(w)) for w in words))
+
+
+def _word_budget(seg: dict, wps: float = 3.0) -> int:
+    """Approximate word count a segment should contain at `wps` words/second.
+
+    3.0 WPS is a comfortable dubbing pace for French. LLMs track word counts
+    more reliably during generation than character counts, so including this
+    in the prompt tag gives the model a self-checkable constraint.
+    """
+    dur = max(seg["end"] - seg["start"], 0.5)
+    return max(3, round(dur * wps))
+
+
 # Maximum sustainable characters-per-second of French speech. Beyond this,
 # even max-stretch can't fit the text — the assembler ends up truncating
 # or speeding past intelligibility. Splitting at a sentence boundary lets
@@ -1319,7 +1363,13 @@ def split_overflowing_segments(
     the text, split the segment into two halves and prorate the time
     window by character count. The TTS then synthesises shorter, more
     stable utterances and the assembler can stretch each half locally.
+
+    The over-budget check uses syllables/second (derived from max_cps via
+    _FR_SYL_PER_CHAR) rather than characters/second — syllables correlate
+    more directly with F5-TTS output duration and avoid false triggers on
+    segments that use many long words but few syllables.
     """
+    max_sps = max_cps * _FR_SYL_PER_CHAR  # e.g. 21 CPS → ~6.7 SPS
     SENT_END = re.compile(r"[.!?…»\"'\)]\s+")
     out: List[dict] = []
     splits = 0
@@ -1329,8 +1379,8 @@ def split_overflowing_segments(
         if dur <= 0 or len(fr) < 80:
             out.append(seg)
             continue
-        cps = len(fr) / dur
-        if cps <= max_cps:
+        sps = _count_syllables(fr) / dur
+        if sps <= max_sps:
             out.append(seg)
             continue
 
@@ -1356,11 +1406,22 @@ def split_overflowing_segments(
         share = len(a_fr) / (len(a_fr) + len(b_fr))
         cut_t = seg["start"] + dur * share
 
-        # Mirror split on the English source so SRT/translation diagnostics stay coherent
+        # Mirror split on the English source so SRT/translation diagnostics stay coherent.
+        # Snap to the nearest word boundary so the EN text never splits mid-word.
         en = seg.get("text", "") or ""
         en_share = max(1, int(len(en) * share))
-        a_en = en[:en_share]
-        b_en = en[en_share:]
+        if en_share < len(en):
+            bp = en.rfind(" ", 0, en_share)
+            fp = en.find(" ", en_share)
+            if bp > 0 or fp > 0:
+                if bp <= 0:
+                    en_share = fp + 1
+                elif fp < 0:
+                    en_share = bp + 1
+                else:
+                    en_share = (bp + 1) if (en_share - bp) <= (fp - en_share) else (fp + 1)
+        a_en = en[:en_share].strip()
+        b_en = en[en_share:].strip()
 
         base = {k: v for k, v in seg.items() if k not in ("start", "end", "text", "text_fr", "text_fr_natural", "id", "words")}
         a = dict(base, id=seg.get("id"), start=seg["start"], end=cut_t, text=a_en)
@@ -1471,8 +1532,21 @@ def compress_overflowing_translations(
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
 
     def _budget(seg: dict) -> int:
+        """Character budget sent to the LLM in the compression prompt."""
         dur = max(seg["end"] - seg["start"], 0.5)
         return max(40, int(dur * budget_cps))
+
+    def _syl_budget(seg: dict) -> int:
+        """Syllable budget used to decide whether to trigger compression.
+
+        Syllables correlate more directly with F5-TTS speech duration than
+        characters, so this trigger fires only when the audio would genuinely
+        be too long — not just because the LLM chose polysyllabic synonyms.
+        Derived from budget_cps × _FR_SYL_PER_CHAR so the two budgets stay
+        in sync when budget_cps is tuned.
+        """
+        dur = max(seg["end"] - seg["start"], 0.5)
+        return max(8, int(dur * budget_cps * _FR_SYL_PER_CHAR))
 
     out = [dict(s) for s in segments]
     BATCH = 15
@@ -1484,13 +1558,16 @@ def compress_overflowing_translations(
     for rnd in range(1, max(1, rounds) + 1):
         # Recompute offenders from the *current* text so converged segments drop
         # out and stubborn ones get another, tighter attempt.
-        offenders: List[Tuple[int, int]] = []  # (index, budget)
+        offenders: List[Tuple[int, int]] = []  # (index, char_budget)
         for idx, s in enumerate(out):
             fr = s.get("text_fr") or ""
             if not fr:
                 continue
             b = _budget(s)
-            if len(fr) > int(b * margin):
+            syl_b = _syl_budget(s)
+            # Trigger on syllables (linguistically grounded) but send char
+            # budget to the LLM so it has a concrete counting target.
+            if _count_syllables(fr) > int(syl_b * margin):
                 offenders.append((idx, b))
         if not offenders:
             if rnd == 1:
@@ -1937,7 +2014,7 @@ def translate_segments(
         if not items:
             return []
         numbered = "\n".join(
-            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ≤{_budget(s)} chars] {s['text']}"
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ~{_word_budget(s)} words, ≤{_budget(s)} chars] {s['text']}"
             for i, s in enumerate(items)
         )
         prompt = think_prefix + _TRANSLATE_PROMPT.format(
@@ -2009,7 +2086,7 @@ def review_translations(
     for start in tqdm(range(0, len(segments), batch_size), desc=f"Reviewing ({target_lang})"):
         batch    = segments[start : start + batch_size]
         numbered = "\n".join(
-            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ≤{max(40, int((s['end']-s['start'])*17))} chars] {s.get('text_fr', '')}"
+            f"{i + 1}. [{s['end'] - s['start']:.1f}s, ~{_word_budget(s)} words, ≤{max(40, int((s['end']-s['start'])*17))} chars] {s.get('text_fr', '')}"
             for i, s in enumerate(batch)
         )
         prompt = think_prefix + _REVIEW_PROMPT.format(
@@ -2179,12 +2256,48 @@ def synthesize_all_segments(
 
     import torch as _torch
 
-    def _pick_wav(seg: dict) -> Optional[str]:
+    # F5-TTS's max_chars formula: ref_text_bytes / ref_dur_s * (22 - ref_dur_s) * speed
+    # When ref_dur_s > 22 the result is negative → chunk_text splits every sentence into
+    # its own generation call → cross-fade overlaps accumulate → audio 2-3x too short.
+    # Cap all reference clips at 15s regardless of config.
+    _F5_REF_MAX_S = 15.0
+    _ref_wav_trunc: dict = {}  # original path → safe (possibly truncated) path
+
+    def _prepare_ref_wavs() -> None:
+        unique = {
+            _raw_pick_wav(s) for s in segments
+            if _raw_pick_wav(s) and os.path.exists(_raw_pick_wav(s))
+        }
+        for wav_path in unique:
+            try:
+                import soundfile as _sf
+                data, rate = _sf.read(wav_path, always_2d=False)
+                max_samp = int(_F5_REF_MAX_S * rate)
+                if len(data) <= max_samp:
+                    _ref_wav_trunc[wav_path] = wav_path
+                else:
+                    trunc = os.path.join(os.path.dirname(wav_path),
+                                         Path(wav_path).stem + "_trunc.wav")
+                    _sf.write(trunc, data[:max_samp], rate)
+                    _ref_wav_trunc[wav_path] = trunc
+                    log.info(
+                        f"  Ref clip {Path(wav_path).name}: "
+                        f"{len(data)/rate:.1f}s → {_F5_REF_MAX_S:.0f}s (F5-TTS 22s limit)"
+                    )
+            except Exception as e:
+                log.warning(f"  Ref clip truncation failed for {wav_path}: {e}")
+                _ref_wav_trunc[wav_path] = wav_path
+
+    def _raw_pick_wav(seg: dict) -> Optional[str]:
         if speaker_profiles:
             profile = speaker_profiles.get(seg.get("speaker", "SPEAKER_00"))
             if profile and os.path.exists(profile):
                 return profile
         return speaker_wav
+
+    def _pick_wav(seg: dict) -> Optional[str]:
+        raw = _raw_pick_wav(seg)
+        return _ref_wav_trunc.get(raw, raw) if raw else raw
 
     log.info(f"Loading F5-TTS: {config.f5tts_model} …")
     device = "cuda" if _torch.cuda.is_available() else "cpu"
@@ -2252,6 +2365,7 @@ def synthesize_all_segments(
             log.warning(f"  faster-whisper ref-text prefetch failed: {e} — "
                         f"F5-TTS will transcribe references internally")
 
+    _prepare_ref_wavs()
     _prefetch_ref_texts()
 
     # 180 ms silence between sentence chunks — inter-sentence pause.

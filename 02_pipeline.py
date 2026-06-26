@@ -2237,7 +2237,7 @@ def synthesize_all_segments(
             for wav_path in sorted(unique_refs):
                 try:
                     segs_iter, _ = _m.transcribe(
-                        wav_path, language=config.target_lang,
+                        wav_path, language=None,  # auto-detect: clips are source-language (English)
                         beam_size=1, condition_on_previous_text=False,
                     )
                     _ref_text_cache[wav_path] = " ".join(

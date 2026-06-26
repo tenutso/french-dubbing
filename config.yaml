@@ -89,7 +89,7 @@ whisper:
   log_prob_threshold: -1.0
 
 # ============================================================
-# Translation — Qwen3 via Ollama
+# Translation — Minstral via Ollama
 # Single backend, single natural pass + targeted compression. Overflow is
 # handled downstream by the assembler's timing policy (no_drop) rather than by
 # shrinking translations — see tts.timing_policy / reading_cps below.
@@ -150,7 +150,7 @@ translation:
 tts:
   # F5TTS_v1_Multilingual → recommended for French and other European languages.
   # F5TTS_v1_Base → English/Chinese only; marginally faster.
-  f5tts_model: F5TTS_v1_Multilingual
+  f5tts_model: RASPIAUDIO/F5-French-MixedSpeakers-reduced
   # ODE solver steps. 16 = fast draft; 32 = high quality (default); 64 = max quality.
   f5tts_nfe_step: 32
   # Classifier-free guidance strength. 2.0 is a reliable default.

@@ -2214,6 +2214,46 @@ def synthesize_all_segments(
     sr = 24000  # F5-TTS/vocos native rate
     log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
 
+    # Pre-transcribe every unique reference WAV with faster-whisper so we can
+    # pass ref_text to f5.infer().  This avoids F5-TTS's internal Whisper, which
+    # uses torchcodec for audio loading — a library that fails on systems where
+    # the matching libnvrtc.so.N is absent (e.g. PyTorch 2.8+cu128 vs CUDA 12.x).
+    _ref_text_cache: dict = {}
+
+    def _prefetch_ref_texts() -> None:
+        unique_refs = {
+            _pick_wav(s)
+            for s in segments
+            if _pick_wav(s) and os.path.exists(_pick_wav(s))
+        }
+        if not unique_refs:
+            return
+        log.info(f"  Pre-transcribing {len(unique_refs)} reference clip(s) with faster-whisper …")
+        try:
+            from faster_whisper import WhisperModel as _WM
+            # "small" on CPU/int8 is fast enough for short reference clips.
+            _m = _WM("small", device="cpu", compute_type="int8",
+                     download_root=config.models_folder)
+            for wav_path in sorted(unique_refs):
+                try:
+                    segs_iter, _ = _m.transcribe(
+                        wav_path, language=config.target_lang,
+                        beam_size=1, condition_on_previous_text=False,
+                    )
+                    _ref_text_cache[wav_path] = " ".join(
+                        s.text.strip() for s in segs_iter
+                    ).strip()
+                    log.info(f"    {Path(wav_path).name}: {_ref_text_cache[wav_path][:80]!r}")
+                except Exception as e:
+                    log.warning(f"    ref-text transcription failed for {Path(wav_path).name}: {e}")
+                    _ref_text_cache[wav_path] = ""
+            del _m
+        except Exception as e:
+            log.warning(f"  faster-whisper ref-text prefetch failed: {e} — "
+                        f"F5-TTS will transcribe references internally")
+
+    _prefetch_ref_texts()
+
     # 180 ms silence between sentence chunks — inter-sentence pause.
     # _split_for_tts always splits on sentence endings so every boundary gets this gap.
     chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
@@ -2221,7 +2261,7 @@ def synthesize_all_segments(
     def _synth_one(text: str, ref_wav: str) -> np.ndarray:
         wav, _, _ = f5.infer(
             ref_file=ref_wav,
-            ref_text="",          # empty → F5-TTS auto-transcribes the reference
+            ref_text=_ref_text_cache.get(ref_wav, ""),
             gen_text=text,
             nfe_step=config.f5tts_nfe_step,
             cfg_strength=config.f5tts_cfg_strength,
@@ -3368,6 +3408,32 @@ def create_srt(
         return False
 
 
+def create_english_srt(
+    segments: List[dict],
+    output_path: str,
+    log: logging.Logger,
+) -> bool:
+    """Write a simple SRT from English source segments using their original timing."""
+    try:
+        subs = pysrt.SubRipFile()
+        for idx, seg in enumerate(segments, 1):
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            subs.append(SubRipItem(
+                index=idx,
+                start=SubRipTime(seconds=max(0.0, seg["start"])),
+                end=SubRipTime(seconds=max(0.0, seg["end"])),
+                text=text,
+            ))
+        subs.save(output_path, encoding="utf-8")
+        log.info(f"  English SRT: {len(subs)} cues → {Path(output_path).name}")
+        return True
+    except Exception as e:
+        log.warning(f"Failed to write English SRT: {e}")
+        return False
+
+
 def _create_srt_legacy(
     segments: List[dict],
     output_path: str,
@@ -3862,6 +3928,488 @@ def process_video(
     return True
 
 
+def process_video_phase1(
+    video_path: str,
+    output_dir: str,
+    config: PipelineConfig,
+    log: logging.Logger,
+    force: bool = False,
+) -> bool:
+    """Steps 1–3: source separation, transcription, translation.
+
+    Writes ``{output_dir}/{name}_segments.json`` and
+    ``{output_dir}/{name}_english.srt``.  Temp files are intentionally
+    preserved so Phase 2 can reuse ``vocals.wav``.
+    """
+    name = Path(video_path).stem
+    os.makedirs(output_dir, exist_ok=True)
+    temp_dir = os.path.join(config.temp_folder, name)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    seg_file    = os.path.join(output_dir, f"{name}_segments.json")
+    eng_srt     = os.path.join(output_dir, f"{name}_english.srt")
+
+    if not force and os.path.exists(seg_file) and os.path.exists(eng_srt):
+        log.info(f"SKIP {name} Phase 1 — segments already exist (use --force to reprocess)")
+        return True
+
+    log.info(f"\n{'=' * 60}\nPipeline v1.0 Phase 1: {name}\n{'=' * 60}")
+
+    metrics = MetricsCollector(
+        enabled=config.metrics_enabled,
+        output_dir=output_dir,
+        name=name,
+        log=log,
+        budget_cps=config.translation_budget_cps,
+        cps_split_threshold=config.cps_split_threshold,
+        max_stretch=config.tts_max_stretch,
+        readability_cap=config.subtitle_max_cps,
+    )
+
+    if not check_ollama(config.translation_model, log):
+        return False
+
+    glossary = (
+        load_glossary(config.glossary_path, log)
+        if config.locale == "fr-ca"
+        else Glossary([], [], [])
+    )
+    glossary_section = _build_glossary_section(glossary, config.locale)
+    if glossary.has_content:
+        always_n  = sum(1 for e in glossary.entries if e.mode == "always")
+        suggest_n = sum(1 for e in glossary.entries if e.mode == "suggest")
+        log.info(
+            f"  Locale: {config.locale} — {always_n} always-substitute, "
+            f"{suggest_n} suggest-only terms, "
+            f"{len(glossary.formatting_rules)} formatting rules, "
+            f"{len(glossary.inclusive_language)} inclusive language rules"
+        )
+
+    # ── 1. Source separation ────────────────────────────────────────────────
+    vocals_wav:    Optional[str] = None
+    no_vocals_wav: Optional[str] = None  # noqa: F841 (not needed by phase 1, but kept for symmetry)
+
+    if config.use_demucs:
+        log.info("\n[1/6] SOURCE SEPARATION (Demucs)")
+        vocals_wav, no_vocals_wav = separate_vocals(
+            video_path, temp_dir, config.demucs_model, log
+        )
+
+    if not vocals_wav:
+        log.info("\n[1/6] EXTRACTING AUDIO")
+        raw_wav = os.path.join(temp_dir, f"{name}.wav")
+        if not extract_audio(video_path, raw_wav, config.synthesis_sample_rate, log):
+            return False
+        vocals_wav = raw_wav
+
+    # ── 2. Transcribe + merge into sentence chunks ──────────────────────────
+    log.info("\n[2/6] TRANSCRIBING (faster-whisper)")
+    segments = transcribe_audio(
+        vocals_wav,
+        config.whisper_model,
+        config.whisper_device,
+        config.whisper_compute_type,
+        config.models_folder,
+        log,
+        condition_on_previous_text=config.whisper_condition_on_previous_text,
+        compression_ratio_threshold=config.whisper_compression_ratio_threshold,
+        no_speech_threshold=config.whisper_no_speech_threshold,
+        log_prob_threshold=config.whisper_log_prob_threshold,
+    )
+    if not segments:
+        return False
+    free_vram(log)
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "01_whisper_raw", log)
+
+    segments = dedupe_whisper_segments(segments, log)
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "02_deduped", log)
+
+    segments = collapse_intrasegment_loops(segments, log)
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "02b_loop_collapsed", log)
+
+    segments = merge_segments(
+        segments,
+        max_gap=config.segment_merge_gap,
+        max_duration=config.segment_merge_max_duration,
+        min_duration=config.segment_merge_min_duration,
+        log=log,
+    )
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "03_merged", log)
+
+    metrics.snapshot("merged_source", segments)
+
+    diarization_turns: Optional[List[Tuple[float, float, str]]] = None
+    if config.use_diarization:
+        log.info("\n[2b/6] SPEAKER DIARIZATION (pyannote.audio)")
+        diarization_turns = diarize_audio(
+            vocals_wav,
+            config.diarization_model,
+            config.huggingface_token,
+            config.diarization_min_speakers,
+            config.diarization_max_speakers,
+            log,
+        )
+        if diarization_turns:
+            segments = assign_speakers(segments, diarization_turns)
+            speaker_counts: dict = {}
+            for seg in segments:
+                spk = seg.get("speaker", "?")
+                speaker_counts[spk] = speaker_counts.get(spk, 0) + 1
+            for spk, n in sorted(speaker_counts.items()):
+                log.info(f"  {spk}: {n} segment(s)")
+            if config.keep_temp:
+                _dump_segments(segments, temp_dir, "04_diarized", log)
+        else:
+            log.warning("  Diarization failed — all segments assigned to SPEAKER_00")
+            for seg in segments:
+                seg["speaker"] = "SPEAKER_00"
+
+    # ── 3. Translate ────────────────────────────────────────────────────────
+    log.info(f"\n[3/6] TRANSLATING ({config.translation_model} via Ollama)")
+    segments = translate_segments(
+        segments,
+        config.translation_model,
+        config.translation_temperature,
+        config.translation_batch_size,
+        log,
+        target_lang=config.target_lang,
+        locale=config.target_locale,
+        glossary_section=glossary_section,
+        budget_cps=config.translation_budget_cps,
+    )
+    _verify_translation_quality(segments, log)
+    segments = _retranslate_leftover_english(
+        segments, config.translation_model, log,
+        target_lang=config.target_lang, locale=config.locale,
+        glossary_section=glossary_section,
+    )
+
+    segments = _scan_and_fix_hallucinations(
+        segments, config.translation_model, log,
+        target_lang=config.target_lang, locale=config.locale,
+        glossary_section=glossary_section,
+    )
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "05_translated", log)
+
+    metrics.snapshot("translated", segments)
+
+    if config.translation_review:
+        log.info(f"\n[3b/6] REVIEWING TRANSLATIONS ({config.translation_model})")
+        segments = review_translations(
+            segments,
+            config.translation_model,
+            config.translation_temperature,
+            log,
+            batch_size=config.translation_batch_size,
+            target_lang=config.target_lang,
+            locale=config.locale,
+            glossary_section=glossary_section,
+        )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06_reviewed", log)
+        metrics.snapshot("reviewed", segments)
+
+    if config.translation_compression_pass:
+        log.info("\n[3d/6] COMPRESSING OVER-BUDGET SEGMENTS")
+        segments = compress_overflowing_translations(
+            segments,
+            config.translation_model,
+            config.translation_temperature,
+            log,
+            budget_cps=config.translation_budget_cps,
+            target_lang=config.target_lang,
+            rounds=config.translation_compression_rounds,
+        )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06b_compressed", log)
+        metrics.snapshot("compressed", segments)
+
+    if glossary.entries:
+        log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
+        segments = apply_glossary(segments, glossary.entries, log)
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "07_glossary", log)
+        metrics.snapshot("glossary", segments)
+
+    if config.cps_split_threshold > 0:
+        segments = split_overflowing_segments(
+            segments, log, max_cps=config.cps_split_threshold,
+        )
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "07b_cps_split", log)
+        metrics.snapshot("cps_split", segments)
+
+    _tag_hits = 0
+    for s in segments:
+        for k in ("text_fr", "text_fr_natural"):
+            v = s.get(k)
+            if v:
+                cleaned = _strip_budget_tag(v)
+                if cleaned != v:
+                    s[k] = cleaned
+                    _tag_hits += 1
+    if _tag_hits:
+        log.warning(f"  Stripped {_tag_hits} leaked character-budget tag(s) from translations")
+
+    # Persist translated segments so Phase 2 (and the review editor) can load them.
+    import tempfile as _tf
+    fd, tmp = _tf.mkstemp(dir=output_dir, prefix=".seg.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(segments, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, seg_file)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        log.error(f"Failed to write segments file: {e}")
+        return False
+
+    create_english_srt(segments, eng_srt, log)
+
+    log.info(f"\n{'=' * 60}")
+    log.info(f"PHASE 1 DONE: {name}")
+    log.info(f"  Segments: {seg_file}")
+    log.info(f"  English SRT: {eng_srt}")
+    log.info(f"  Temp files preserved at: {temp_dir}  (Phase 2 needs vocals.wav)")
+    log.info(f"{'=' * 60}\n")
+    return True
+
+
+def process_video_phase2(
+    video_path: str,
+    output_dir: str,
+    config: PipelineConfig,
+    log: logging.Logger,
+    segments_file: Optional[str] = None,
+    force: bool = False,
+) -> bool:
+    """Steps 4–6: speaker profiles, TTS synthesis, assemble + encode + SRT.
+
+    Reads segments from ``segments_file`` (defaults to
+    ``{output_dir}/{name}_segments.json``).  Recovers ``vocals.wav`` from
+    the Phase 1 temp directory; re-runs extraction if it is missing.
+    """
+    name = Path(video_path).stem
+    os.makedirs(output_dir, exist_ok=True)
+    temp_dir = os.path.join(config.temp_folder, name)
+    os.makedirs(temp_dir, exist_ok=True)
+
+    final_aac = os.path.join(output_dir, f"{name}_french.m4a")
+    final_srt = os.path.join(output_dir, f"{name}_french.srt")
+
+    if not force and os.path.exists(final_aac) and os.path.exists(final_srt):
+        log.info(f"SKIP {name} Phase 2 — outputs exist (use --force to reprocess)")
+        return True
+
+    log.info(f"\n{'=' * 60}\nPipeline v1.0 Phase 2: {name}\n{'=' * 60}")
+
+    if segments_file is None:
+        segments_file = os.path.join(output_dir, f"{name}_segments.json")
+
+    if not os.path.exists(segments_file):
+        log.error(f"Segments file not found: {segments_file}  (run Phase 1 first)")
+        return False
+
+    with open(segments_file, encoding="utf-8") as f:
+        segments = json.load(f)
+    log.info(f"  Loaded {len(segments)} segments from {Path(segments_file).name}")
+
+    total_duration = get_duration(video_path, log)
+
+    # Recover vocals.wav written by Phase 1.
+    vocals_wav:    Optional[str] = None
+    no_vocals_wav: Optional[str] = None
+
+    vocals_files = sorted(Path(temp_dir).rglob("vocals.wav"))
+    if vocals_files:
+        vocals_wav = str(vocals_files[-1])
+
+    no_vocals_files = sorted(Path(temp_dir).rglob("no_vocals.wav"))
+    if no_vocals_files:
+        no_vocals_wav = str(no_vocals_files[-1])
+
+    if not vocals_wav:
+        raw = Path(temp_dir) / f"{name}.wav"
+        if raw.exists():
+            vocals_wav = str(raw)
+
+    if not vocals_wav:
+        log.warning("  vocals.wav not found in temp dir — re-extracting audio")
+        if config.use_demucs:
+            vocals_wav, no_vocals_wav = separate_vocals(
+                video_path, temp_dir, config.demucs_model, log
+            )
+        if not vocals_wav:
+            raw_wav = os.path.join(temp_dir, f"{name}.wav")
+            if not extract_audio(video_path, raw_wav, config.synthesis_sample_rate, log):
+                return False
+            vocals_wav = raw_wav
+
+    metrics = MetricsCollector(
+        enabled=config.metrics_enabled,
+        output_dir=output_dir,
+        name=name,
+        log=log,
+        budget_cps=config.translation_budget_cps,
+        cps_split_threshold=config.cps_split_threshold,
+        max_stretch=config.tts_max_stretch,
+        readability_cap=config.subtitle_max_cps,
+    )
+    metrics.snapshot("phase2_input", segments)
+
+    # ── 4. Speaker reference(s) ─────────────────────────────────────────────
+    log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")
+    speaker_wav: Optional[str] = None
+    speaker_profiles: Optional[dict] = None
+
+    raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
+    if extract_speaker_sample(
+        vocals_wav,
+        config.tts_speaker_duration,
+        raw_speaker_wav,
+        log,
+        skip_seconds=config.tts_speaker_skip,
+    ):
+        if config.use_deepfilter:
+            denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
+            speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
+        else:
+            speaker_wav = raw_speaker_wav
+    else:
+        log.warning("Voice cloning disabled — no speaker reference available")
+
+    if config.use_diarization and any("speaker" in s for s in segments):
+        speaker_profiles = build_speaker_profiles(
+            vocals_wav,
+            segments,
+            temp_dir,
+            config.diarization_profile_duration,
+            log,
+            use_deepfilter=config.use_deepfilter,
+            diarization_turns=None,  # speaker labels already embedded in segments
+        )
+        valid = sum(1 for v in speaker_profiles.values() if v)
+        log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
+
+    # ── 5. TTS synthesis ────────────────────────────────────────────────────
+    log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")
+    synthesized, actual_sr = synthesize_all_segments(
+        segments,
+        speaker_wav,
+        config,
+        log,
+        speaker_profiles=speaker_profiles,
+    )
+    if not synthesized:
+        return False
+    free_vram(log)
+
+    metrics.record_synthesis_fit(segments, synthesized, actual_sr)
+
+    # ── 6. Assemble + encode + SRT ──────────────────────────────────────────
+    log.info("\n[6/6] ASSEMBLING & ENCODING")
+    interim_wav = os.path.join(temp_dir, f"{name}_french.wav")
+
+    placements: Dict[int, Tuple[float, float]] = {}
+    seg_text_chars = {
+        round(s["start"] * 1000): len((s.get("text_fr") or "").replace("\n", " "))
+        for s in segments
+    }
+    if not assemble_and_encode(
+        synthesized,
+        total_duration,
+        interim_wav,
+        final_aac,
+        src_rate=actual_sr,
+        out_rate=config.output_sample_rate,
+        max_stretch=config.tts_max_stretch,
+        min_stretch=config.tts_min_stretch,
+        temp_dir=temp_dir,
+        log=log,
+        volume_boost_pct=config.output_volume_boost_pct,
+        group_gap=config.tts_group_gap,
+        stretcher=config.tts_stretcher,
+        placements_out=placements,
+        timing_policy=config.timing_policy,
+        seg_text_chars=seg_text_chars,
+        read_cps=config.tts_reading_cps,
+        max_slowdown=config.tts_max_slowdown,
+    ):
+        return False
+
+    mux_audio = final_aac
+    if config.preserve_background and no_vocals_wav and os.path.exists(no_vocals_wav):
+        remixed_aac = os.path.join(output_dir, f"{name}_french_full.m4a")
+        if remix_with_background(
+            interim_wav, no_vocals_wav, remixed_aac, log,
+            volume_boost_pct=config.output_volume_boost_pct,
+        ):
+            log.info(f"  Full mix (vocals + background): {Path(remixed_aac).name}")
+            mux_audio = remixed_aac
+
+    srt_segments = retime_segments_to_audio(
+        segments, synthesized, actual_sr, total_duration, log,
+        placements=placements,
+    )
+
+    if config.keep_temp:
+        _dump_segments(srt_segments, temp_dir, "08_retimed", log)
+
+    metrics.snapshot("final_retimed", srt_segments)
+    metrics.finalize()
+
+    create_srt(
+        srt_segments, final_srt, log,
+        offset_ms=config.subtitle_offset_ms,
+        standard=config.subtitle_standard,
+        max_cpl=config.subtitle_max_cpl,
+        max_lines=config.subtitle_max_lines,
+        max_cps=config.subtitle_max_cps,
+        min_dur=config.subtitle_min_dur,
+        max_dur=config.subtitle_max_dur,
+        min_gap=config.subtitle_min_gap,
+        max_lag=config.subtitle_max_lag,
+        condense_model=(config.translation_model if config.subtitle_condense else None),
+        condense_temperature=config.translation_temperature,
+        target_lang=config.target_lang,
+    )
+
+    final_mp4: Optional[str] = None
+    if config.mux_video:
+        candidate = os.path.join(output_dir, f"{name}_french.mp4")
+        if mux_final_video(
+            video_path, mux_audio, final_srt, candidate, log,
+            burn_subs=config.burn_subs,
+        ):
+            final_mp4 = candidate
+
+    if config.keep_temp:
+        log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
+    else:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+    log.info(f"\n{'=' * 60}")
+    log.info(f"PHASE 2 DONE: {name}")
+    log.info(f"  Audio : {final_aac}")
+    log.info(f"  Subs  : {final_srt}")
+    if final_mp4:
+        log.info(f"  Video : {final_mp4}")
+    log.info(f"{'=' * 60}\n")
+    return True
+
+
 # ============================================================================
 # CLI
 # ============================================================================
@@ -3890,6 +4438,18 @@ def process_video(
     default=False,
     help="Keep all temp files and dump intermediate segment JSON for debugging.",
 )
+@click.option(
+    "--phase",
+    type=click.Choice(["1", "2"]),
+    default=None,
+    help="Run only phase 1 (translate+save) or phase 2 (TTS+dub).",
+)
+@click.option(
+    "--segments-file",
+    type=click.Path(),
+    default=None,
+    help="Phase 2: load segments from this path instead of the default location.",
+)
 def main(
     video: str,
     output_dir: str,
@@ -3898,11 +4458,17 @@ def main(
     locale: Optional[str],
     volume_boost: Optional[float],
     keep_temp: bool,
+    phase: Optional[str],
+    segments_file: Optional[str],
 ) -> None:
     """Dub a video to French (audio track + SRT subtitles).
 
     Canadian French:
       --locale fr-ca
+
+    Two-phase (for web review):
+      --phase 1   run transcription + translation, then stop
+      --phase 2   run TTS + assembly (reads segments file from phase 1)
     """
     try:
         config = load_config(config_path)
@@ -3915,8 +4481,16 @@ def main(
         config.output_volume_boost_pct = float(volume_boost)
     if keep_temp:
         config.keep_temp = True
-    log     = setup_logging(config.logs_folder, Path(video).stem)
-    success = process_video(video, output_dir, config, log, force=force)
+    log = setup_logging(config.logs_folder, Path(video).stem)
+    if phase == "1":
+        success = process_video_phase1(video, output_dir, config, log, force=force)
+    elif phase == "2":
+        success = process_video_phase2(
+            video, output_dir, config, log,
+            segments_file=segments_file, force=force,
+        )
+    else:
+        success = process_video(video, output_dir, config, log, force=force)
     sys.exit(0 if success else 1)
 
 

@@ -270,6 +270,42 @@ else
     log_error "f5-tts install failed — TTS will not work"
 fi
 
+# F5-TTS pulls in torchcodec which links against libnvrtc.so.N (where N matches
+# the CUDA major version torchcodec was built for).  On PyTorch cu128 the library
+# is libnvrtc.so.12 but torchcodec may expect .13.  Create a compatibility symlink
+# so torchcodec loads without raising an OSError that crashes segment synthesis.
+log_step "Checking torchcodec / libnvrtc compatibility …"
+NVRTC_SO=$(find /usr/local/cuda/lib64 \
+               /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib \
+               /usr/local/lib/python3.12/dist-packages/nvidia/nvrtc/lib \
+           -maxdepth 1 -name "libnvrtc.so.1[0-9]*" ! -type l 2>/dev/null | sort -V | tail -1)
+if [ -n "$NVRTC_SO" ]; then
+    EXISTING_VER=$(basename "$NVRTC_SO" | sed 's/libnvrtc.so.//')
+    MAJOR=${EXISTING_VER%%.*}
+    NEED_VER=$(python3 -c "
+try:
+    import torchcodec, os, ctypes
+    print('')  # already loads fine
+except OSError as e:
+    msg = str(e)
+    import re; m = re.search(r'libnvrtc\.so\.(\d+)', msg)
+    print(m.group(1) if m else '')
+except Exception:
+    print('')
+" 2>/dev/null)
+    if [ -n "$NEED_VER" ] && [ "$NEED_VER" != "$MAJOR" ]; then
+        TARGET="/usr/local/lib/libnvrtc.so.${NEED_VER}"
+        if [ ! -e "$TARGET" ]; then
+            ln -sf "$NVRTC_SO" "$TARGET" && ldconfig 2>/dev/null || true
+            log_success "Created libnvrtc.so.${NEED_VER} → ${NVRTC_SO}"
+        fi
+    else
+        log_success "torchcodec libnvrtc OK (no symlink needed)"
+    fi
+else
+    log_warn "libnvrtc.so not found — torchcodec GPU decoding may fail (pipeline pre-transcribes refs with faster-whisper as fallback)"
+fi
+
 # ── Step 9: Utilities ─────────────────────────────────────────────────────
 
 log_step "Installing utility packages …"

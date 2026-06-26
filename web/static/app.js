@@ -9,6 +9,10 @@ const streams = new Map();        // job_id -> EventSource
 const logBuffers = new Map();     // job_id -> string[]
 let lastJobsHash = "";
 
+// Translation review state
+let reviewJobId = null;
+let reviewSegments = [];
+
 // ── Options ──────────────────────────────────────────────────────────────────
 async function loadOptions() {
   const r = await fetch("/api/options");
@@ -116,6 +120,7 @@ $("#submit-form").addEventListener("submit", e => {
   fd.append("locale", $("#locale").value);
   fd.append("volume_boost", $("#volume_boost").value);
   if ($("#force").checked) fd.append("force", "on");
+  if ($("#review").checked) fd.append("review", "on");
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
@@ -189,6 +194,18 @@ function renderJobs(jobs) {
       streams.delete(id);
     }
   }
+
+  // Show review editor for awaiting_review jobs
+  const awaitingJob = active.find(j => j.status === "awaiting_review");
+  if (awaitingJob) {
+    if (reviewJobId !== awaitingJob.id) {
+      loadReviewSegments(awaitingJob.id, awaitingJob);
+    }
+  } else if (reviewJobId) {
+    $("#review-section").hidden = true;
+    reviewJobId = null;
+    reviewSegments = [];
+  }
 }
 
 function renderList(selector, list, emptyMsg) {
@@ -244,7 +261,10 @@ function renderCard(job) {
 
   // Downloads
   const dl = $(".job-downloads", root);
-  for (const [kind, label] of [["video", "Video (MP4)"], ["audio", "Audio"], ["srt", "SRT"], ["full", "Full mix"]]) {
+  for (const [kind, label] of [
+    ["video", "Video (MP4)"], ["audio", "Audio"],
+    ["srt", "French SRT"], ["full", "Full mix"], ["english_srt", "English SRT"],
+  ]) {
     if (job.outputs && job.outputs[kind]) {
       const a = document.createElement("a");
       a.href = `/api/jobs/${job.id}/download/${kind}`;
@@ -286,6 +306,17 @@ function renderCard(job) {
     await fetch(url, { method: "DELETE" });
     refreshJobs();
   });
+
+  // "Open review" button for awaiting_review jobs
+  if (job.status === "awaiting_review") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Open review";
+    btn.addEventListener("click", () =>
+      document.getElementById("review-section").scrollIntoView({ behavior: "smooth" })
+    );
+    $(".job-actions", root).insertBefore(btn, $(".show-log", root));
+  }
 
   return root;
 }
@@ -655,6 +686,99 @@ async function saveGlossary() {
   } catch (e) { status.textContent = "network error: " + e; }
 }
 
+// ── Translation review ───────────────────────────────────────────────────────
+async function loadReviewSegments(jobId, job) {
+  const status = $("#review-status");
+  status.textContent = "loading segments…";
+  try {
+    const r = await fetch(`/api/jobs/${jobId}/segments`);
+    if (!r.ok) { status.textContent = "failed to load: " + await r.text(); return; }
+    reviewJobId = jobId;
+    reviewSegments = await r.json();
+    $("#review-job-info").textContent =
+      `${job ? job.video_filename : jobId} · ${reviewSegments.length} segments`;
+    const dlArea = $("#review-downloads");
+    dlArea.innerHTML = "";
+    if (job?.outputs?.english_srt) {
+      const a = document.createElement("a");
+      a.href = `/api/jobs/${jobId}/download/english_srt`;
+      a.textContent = "Download English SRT";
+      a.className = "dl";
+      a.download = "";
+      dlArea.appendChild(a);
+    }
+    renderReviewTable();
+    status.textContent = `${reviewSegments.length} segments loaded`;
+    $("#review-section").hidden = false;
+    document.getElementById("review-section").scrollIntoView({ behavior: "smooth" });
+  } catch (e) { status.textContent = "network error: " + e; }
+}
+
+function renderReviewTable() {
+  const tbody = $("#review-tbody");
+  tbody.innerHTML = "";
+  for (let i = 0; i < reviewSegments.length; i++) {
+    const seg = reviewSegments[i];
+    const tr = document.createElement("tr");
+    // English column
+    const tdEn = document.createElement("td");
+    tdEn.className = "review-en";
+    const ts = document.createElement("div");
+    ts.className = "review-ts muted";
+    ts.textContent = `${seg.start.toFixed(1)}s – ${seg.end.toFixed(1)}s`;
+    const enDiv = document.createElement("div");
+    enDiv.textContent = seg.text || "";
+    tdEn.append(ts, enDiv);
+    tr.appendChild(tdEn);
+    // French editable column
+    const tdFr = document.createElement("td");
+    const ta = document.createElement("textarea");
+    ta.className = "review-fr-input";
+    ta.value = seg.text_fr || seg.text_fr_natural || "";
+    ta.rows = Math.max(2, Math.ceil(ta.value.length / 55));
+    ta.addEventListener("input", e => {
+      reviewSegments[i].text_fr = e.target.value;
+      reviewSegments[i].text_fr_natural = e.target.value;
+    });
+    tdFr.appendChild(ta);
+    tr.appendChild(tdFr);
+    tbody.appendChild(tr);
+  }
+}
+
+async function saveReviewSegments() {
+  const status = $("#review-status");
+  status.textContent = "saving…";
+  try {
+    const r = await fetch(`/api/jobs/${reviewJobId}/segments`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reviewSegments),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = "save failed: " + (data.detail || r.statusText); return false; }
+    status.textContent = `saved ${data.count} segments`;
+    return true;
+  } catch (e) { status.textContent = "network error: " + e; return false; }
+}
+
+async function approveReview() {
+  if (!confirm("Approve translations and start TTS synthesis?")) return;
+  if (!await saveReviewSegments()) return;
+  const status = $("#review-status");
+  status.textContent = "approving…";
+  try {
+    const r = await fetch(`/api/jobs/${reviewJobId}/approve`, { method: "POST" });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = "failed: " + (data.detail || r.statusText); return; }
+    status.textContent = "Phase 2 queued — TTS synthesis starting…";
+    $("#review-section").hidden = true;
+    reviewJobId = null;
+    reviewSegments = [];
+    await refreshJobs();
+  } catch (e) { status.textContent = "network error: " + e; }
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
   await loadOptions();
@@ -664,6 +788,8 @@ async function init() {
   await refreshJobs();
   $("#config-save").addEventListener("click", () => saveConfig(false));
   $("#config-revert").addEventListener("click", revertConfig);
+  $("#review-save").addEventListener("click", () => saveReviewSegments());
+  $("#review-approve").addEventListener("click", approveReview);
   $("#glossary-add").addEventListener("click", () => {
     glossaryTerms.push({ en: "", fr_ca: "", mode: "suggest" });
     renderGlossary();

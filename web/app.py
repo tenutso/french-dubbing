@@ -7,6 +7,7 @@ also the pipeline's own log) over Server-Sent Events.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -14,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from pathlib import Path
@@ -29,8 +31,8 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from .jobs import (
-    Job, JOBS_FILE, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED,
-    STATUS_QUEUED, STATUS_RUNNING, TERMINAL,
+    Job, JOBS_FILE, STATUS_AWAITING_REVIEW, STATUS_CANCELLED, STATUS_COMPLETED,
+    STATUS_FAILED, STATUS_QUEUED, STATUS_RUNNING, TERMINAL,
     load_jobs, new_job_id, safe_stem, save_jobs, sorted_jobs,
 )
 
@@ -287,19 +289,26 @@ async def _run_job(job: Job) -> None:
         if not await _download_vimeo(job):
             return  # _download_vimeo marked the job failed and saved state
 
+    opts = job.options or {}
+    _is_phase1 = opts.get("review") and not opts.get("_p2")
+    _is_phase2 = bool(opts.get("_p2"))
+
     cmd = [
         sys.executable, str(PIPELINE_PY),
         "--video",      job.video_path,
         "--output-dir", job.output_dir,
         "--config",     str(CONFIG_PATH),
     ]
-    opts = job.options or {}
     if opts.get("force"):
         cmd.append("--force")
     if opts.get("locale"):
         cmd += ["--locale", opts["locale"]]
     if opts.get("volume_boost") not in (None, ""):
         cmd += ["--volume-boost", str(opts["volume_boost"])]
+    if _is_phase1:
+        cmd += ["--phase", "1"]
+    elif _is_phase2:
+        cmd += ["--phase", "2"]
 
     state.publish(job.id, "$ " + " ".join(cmd))
 
@@ -346,8 +355,11 @@ async def _run_job(job: Job) -> None:
     if job.status == STATUS_CANCELLED:
         pass  # cancel already set status
     elif rc == 0:
-        job.status = STATUS_COMPLETED
         _collect_outputs(job)
+        if _is_phase1:
+            job.status = STATUS_AWAITING_REVIEW
+        else:
+            job.status = STATUS_COMPLETED
     else:
         job.status = STATUS_FAILED
         job.error = job.error or f"pipeline exited with code {rc}"
@@ -450,10 +462,11 @@ def _collect_outputs(job: Job) -> None:
     od = Path(job.output_dir)
     if not od.exists():
         return
-    video = sorted(od.glob("*_french.mp4"))
-    audio = sorted(od.glob("*_french.m4a"))
-    srt   = sorted(od.glob("*_french.srt"))
-    full  = sorted(od.glob("*_french_full.m4a"))
+    video   = sorted(od.glob("*_french.mp4"))
+    audio   = sorted(od.glob("*_french.m4a"))
+    srt     = sorted(od.glob("*_french.srt"))
+    full    = sorted(od.glob("*_french_full.m4a"))
+    eng_srt = sorted(od.glob("*_english.srt"))
     if video:
         job.outputs["video"] = str(video[0])
     if audio:
@@ -462,6 +475,8 @@ def _collect_outputs(job: Job) -> None:
         job.outputs["srt"] = str(srt[0])
     if full:
         job.outputs["full"] = str(full[0])
+    if eng_srt:
+        job.outputs["english_srt"] = str(eng_srt[0])
 
 
 async def _queue_worker() -> None:
@@ -772,6 +787,7 @@ async def submit(
     locale: str = Form(""),
     volume_boost: str = Form(""),
     force: str = Form(""),
+    review: str = Form(""),
 ) -> JSONResponse:
     # Validate options against allow-lists (empty = use config default)
     if locale and locale not in LOCALE_CHOICES:
@@ -796,6 +812,7 @@ async def submit(
         "locale": locale or None,
         "volume_boost": vb,
         "force": force.lower() in ("1", "true", "on", "yes"),
+        "review": review.lower() in ("1", "true", "on", "yes"),
     }
     output_dir = OUTPUT_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -953,7 +970,13 @@ def _download(job: Job, kind: str) -> FileResponse:
         raise HTTPException(404, f"no {kind} output for this job")
     stem = safe_stem(job.video_filename) or "dub"
     ext = Path(path).suffix
-    base = {"video": "_french", "audio": "_french", "srt": "_french", "full": "_french_full"}[kind]
+    base = {
+        "video": "_french",
+        "audio": "_french",
+        "srt": "_french",
+        "full": "_french_full",
+        "english_srt": "_english",
+    }[kind]
     download_name = f"{stem}{base}{ext}"
     return FileResponse(path, filename=download_name)
 
@@ -1099,12 +1122,64 @@ def _rewrite_glossary_sections(path: Path, suggest_map: dict, always_map: dict) 
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:
-    if kind not in ("video", "audio", "srt", "full"):
-        raise HTTPException(400, "kind must be video|audio|srt|full")
+    if kind not in ("video", "audio", "srt", "full", "english_srt"):
+        raise HTTPException(400, "kind must be video|audio|srt|full|english_srt")
     job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     return _download(job, kind)
+
+
+@app.get("/api/jobs/{job_id}/segments")
+async def get_segments(job_id: str) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status != STATUS_AWAITING_REVIEW:
+        raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
+    name = safe_stem(job.video_filename)
+    seg_file = Path(job.output_dir) / f"{name}_segments.json"
+    if not seg_file.exists():
+        raise HTTPException(404, "segments file not found")
+    return JSONResponse(json.loads(seg_file.read_text(encoding="utf-8")))
+
+
+@app.put("/api/jobs/{job_id}/segments")
+async def put_segments(job_id: str, payload: list) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status != STATUS_AWAITING_REVIEW:
+        raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
+    name = safe_stem(job.video_filename)
+    seg_file = Path(job.output_dir) / f"{name}_segments.json"
+    fd, tmp = tempfile.mkstemp(dir=job.output_dir, prefix=".seg.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(seg_file))
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise HTTPException(500, f"failed to save segments: {e}")
+    return JSONResponse({"ok": True, "count": len(payload)})
+
+
+@app.post("/api/jobs/{job_id}/approve")
+async def approve_job(job_id: str) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status != STATUS_AWAITING_REVIEW:
+        raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
+    job.options["_p2"] = True
+    job.status = STATUS_QUEUED
+    job.ended_at = 0.0
+    state.save()
+    await state.queue.put(job_id)
+    return JSONResponse({"ok": True, "queued": job_id})
 
 
 @app.get("/api/health")

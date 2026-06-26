@@ -43,6 +43,9 @@
         <label class="check">
           <input type="checkbox" id="force" name="force"> Force re-process
         </label>
+        <label class="check">
+          <input type="checkbox" id="review" name="review" checked> Pause for translation review
+        </label>
       </div>
 
       <div class="actions">
@@ -103,6 +106,28 @@
         <span id="glossary-status" class="muted"></span>
       </div>
     </details>
+  </section>
+
+  <section class="card" id="review-section" hidden>
+    <h2>Translation review</h2>
+    <div id="review-job-info" class="muted"></div>
+    <div id="review-downloads"></div>
+    <div id="review-table-wrap">
+      <table id="review-table">
+        <thead>
+          <tr>
+            <th>English (source &mdash; read only)</th>
+            <th>French (edit)</th>
+          </tr>
+        </thead>
+        <tbody id="review-tbody"></tbody>
+      </table>
+    </div>
+    <div class="actions">
+      <button type="button" id="review-save">Save edits</button>
+      <button type="button" id="review-approve" class="approve">Approve &amp; start dubbing</button>
+      <span id="review-status" class="muted"></span>
+    </div>
   </section>
 
   <section class="card">

@@ -17,6 +17,7 @@
   --status-completed: #2ecc71;
   --status-failed: #e74c3c;
   --status-cancelled: #95a5a6;
+  --status-awaiting-review: #f39c12;
 }
 
 * { box-sizing: border-box; }
@@ -154,6 +155,8 @@ button.cancel, button.show-log {
   padding: 4px 10px;
 }
 button.cancel:hover, button.show-log:hover { color: var(--text); border-color: var(--accent); }
+button.approve { background: var(--ok); color: white; }
+button.approve:hover { filter: brightness(1.1); }
 
 progress {
   width: 100%;
@@ -193,11 +196,12 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
   font-weight: 600;
   background: var(--border);
 }
-.status-pill[data-status=running]   { background: var(--status-running); color: white; }
-.status-pill[data-status=queued]    { background: var(--status-queued); color: white; }
-.status-pill[data-status=completed] { background: var(--status-completed); color: white; }
-.status-pill[data-status=failed]    { background: var(--status-failed); color: white; }
-.status-pill[data-status=cancelled] { background: var(--status-cancelled); color: white; }
+.status-pill[data-status=running]          { background: var(--status-running); color: white; }
+.status-pill[data-status=queued]           { background: var(--status-queued); color: white; }
+.status-pill[data-status=completed]        { background: var(--status-completed); color: white; }
+.status-pill[data-status=failed]           { background: var(--status-failed); color: white; }
+.status-pill[data-status=cancelled]        { background: var(--status-cancelled); color: white; }
+.status-pill[data-status=awaiting_review]  { background: var(--status-awaiting-review); color: white; }
 
 .job-progress {
   height: 4px;
@@ -402,6 +406,59 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
 #glossary-table input, #glossary-table select { width: 100%; }
 #glossary-table td:last-child { width: 32px; text-align: right; }
 #glossary-table td:last-child button { padding: 2px 8px; }
+
+/* ── Review editor ───────────────────────────────────────────────────────── */
+#review-section { display: flex; flex-direction: column; gap: 12px; }
+#review-downloads { display: flex; flex-wrap: wrap; gap: 8px; }
+
+#review-table-wrap {
+  max-height: 60vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+#review-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: fixed;
+}
+
+#review-table thead th {
+  position: sticky; top: 0;
+  background: var(--panel);
+  z-index: 1;
+  color: var(--muted);
+  font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left; width: 50%;
+}
+
+#review-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top; width: 50%;
+}
+
+#review-table td.review-en {
+  color: var(--muted);
+  font-family: var(--mono); font-size: 12px;
+  white-space: pre-wrap; word-break: break-word;
+}
+
+.review-ts { font-size: 10px; margin-bottom: 3px; }
+
+.review-fr-input {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 4px;
+  color: var(--text); padding: 4px 8px;
+  font: inherit; font-size: 13px;
+  resize: vertical; min-height: 36px;
+}
+.review-fr-input:focus { outline: 1px solid var(--accent); }
 
 @media (max-width: 600px) {
   main { padding: 12px; }

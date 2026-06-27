@@ -2345,11 +2345,31 @@ def synthesize_all_segments(
     sr = 24000  # F5-TTS/vocos native rate
     log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
 
-    # Pre-transcribe every unique reference WAV with faster-whisper so we can
-    # pass ref_text to f5.infer().  This avoids F5-TTS's internal Whisper, which
-    # uses torchcodec for audio loading — a library that fails on systems where
-    # the matching libnvrtc.so.N is absent (e.g. PyTorch 2.8+cu128 vs CUDA 12.x).
+    # When ref_text="" F5-TTS auto-transcribes its reference clips internally.
+    # That path uses torchcodec, which fails on systems missing the matching
+    # libnvrtc.so.N (e.g. PyTorch 2.8+cu128 vs CUDA 12.x).
+    #
+    # Preferred path: ref_text="" — F5-TTS auto-transcribes, no vocabulary
+    #   bleeds from the reference clip into the generated speech.
+    # Fallback path (torchcodec broken): pre-transcribe with faster-whisper and
+    #   pass the result as ref_text so F5-TTS never calls torchcodec.
+    #
+    # Vocabulary bleed is the cause of artifacts like "vidéo" appearing after
+    # sentences that don't contain that word: when the reference clip contains
+    # "vidéo" and ref_text is passed, F5-TTS's combined ref+gen sequence can
+    # echo that word near sentence boundaries.
     _ref_text_cache: dict = {}
+
+    def _torchcodec_ok() -> bool:
+        """Return True if torchcodec's shared library loads successfully."""
+        try:
+            from torchcodec._internally_replaced_utils import (  # type: ignore
+                load_torchcodec_shared_libraries,
+            )
+            load_torchcodec_shared_libraries()
+            return True
+        except Exception:
+            return False
 
     def _prefetch_ref_texts() -> None:
         unique_refs = {
@@ -2384,7 +2404,13 @@ def synthesize_all_segments(
                         f"F5-TTS will transcribe references internally")
 
     _prepare_ref_wavs()
-    _prefetch_ref_texts()
+    _use_ref_text_cache = not _torchcodec_ok()
+    if _use_ref_text_cache:
+        log.warning("  torchcodec shared library unavailable — pre-transcribing reference clips "
+                    "to avoid internal Whisper (vocabulary-bleed artifacts possible)")
+        _prefetch_ref_texts()
+    else:
+        log.info("  torchcodec OK — using F5-TTS auto-transcription (ref_text='' for clean synthesis)")
 
     # 180 ms silence between sentence chunks — inter-sentence pause.
     # _split_for_tts always splits on sentence endings so every boundary gets this gap.
@@ -2394,9 +2420,12 @@ def synthesize_all_segments(
         t = text.rstrip()
         if t and t[-1] not in ".!?…":
             t += "."
+        # Use pre-transcribed ref_text only as a torchcodec fallback; otherwise
+        # pass "" so F5-TTS auto-transcribes and vocabulary bleed cannot occur.
+        ref_text_val = _ref_text_cache.get(ref_wav, "") if _use_ref_text_cache else ""
         wav, _, _ = f5.infer(
             ref_file=ref_wav,
-            ref_text=_ref_text_cache.get(ref_wav, ""),
+            ref_text=ref_text_val,
             gen_text=t,
             nfe_step=config.f5tts_nfe_step,
             cfg_strength=config.f5tts_cfg_strength,

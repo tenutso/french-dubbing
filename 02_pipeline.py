@@ -1878,6 +1878,24 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
         return None
 
 
+def _ollama_unload(model: str, log: logging.Logger) -> None:
+    """Tell Ollama to immediately unload *model* from VRAM (keep_alive=0).
+
+    Called after all translation calls are done so the LLM doesn't compete
+    with F5-TTS for GPU memory during synthesis.  Non-fatal if Ollama is
+    unreachable (it may already have unloaded the model on its own).
+    """
+    try:
+        requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "prompt": "", "keep_alive": 0},
+            timeout=(5, 30),
+        )
+        log.info(f"  Ollama: unloaded {model} from VRAM")
+    except Exception as e:
+        log.debug(f"  Ollama unload skipped: {e}")
+
+
 # Budget/length tags the translator is told NOT to emit but sometimes echoes,
 # e.g. "[≤92 chars]", "[2.3s, ≤39 chars]", "(MAX 50 chars)", "[≤ 80 caractères]".
 _BUDGET_BRACKET_RE = re.compile(
@@ -2373,10 +2391,13 @@ def synthesize_all_segments(
     chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
 
     def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+        t = text.rstrip()
+        if t and t[-1] not in ".!?…":
+            t += "."
         wav, _, _ = f5.infer(
             ref_file=ref_wav,
             ref_text=_ref_text_cache.get(ref_wav, ""),
-            gen_text=text,
+            gen_text=t,
             nfe_step=config.f5tts_nfe_step,
             cfg_strength=config.f5tts_cfg_strength,
             speed=config.f5tts_speed,
@@ -2644,7 +2665,7 @@ def assemble_and_encode(
     fade_out_samples = int(_FADE_OUT_MS / 1000.0 * src_rate)
     xfade_s          = _CROSSFADE_MS / 1000.0
 
-    trimmed = [_trim_silence(a) for a, _, _ in ordered]
+    trimmed = [_trim_silence(a, top_db=40) for a, _, _ in ordered]
 
     # In no_drop mode the timeline can extend past the source, so size the
     # buffer for the worst case (everything placed back-to-back after the
@@ -2756,7 +2777,7 @@ def assemble_and_encode(
             if speed != 1.0:
                 a = _stretch_audio(a, speed, src_rate, temp_dir, log, stretcher)
             a = _apply_fade_in(a, fade_in_samples)
-            a = _apply_fade_out(a, fade_in_samples)
+            a = _apply_fade_out(a, fade_out_samples)
             audios.append(a)
 
         if no_drop:
@@ -3899,6 +3920,9 @@ def process_video(
     if _tag_hits:
         log.warning(f"  Stripped {_tag_hits} leaked character-budget tag(s) from translations")
 
+    # Unload the translation LLM from VRAM before F5-TTS loads.
+    _ollama_unload(config.translation_model, log)
+
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")
     speaker_wav: Optional[str] = None
@@ -4275,6 +4299,10 @@ def process_video_phase1(
     if _tag_hits:
         log.warning(f"  Stripped {_tag_hits} leaked character-budget tag(s) from translations")
 
+    # Translation is complete — unload the LLM from VRAM now so Phase 2's
+    # F5-TTS has the full GPU budget when it starts (possibly minutes later).
+    _ollama_unload(config.translation_model, log)
+
     # Persist translated segments so Phase 2 (and the review editor) can load them.
     import tempfile as _tf
     fd, tmp = _tf.mkstemp(dir=output_dir, prefix=".seg.", suffix=".tmp")
@@ -4382,6 +4410,9 @@ def process_video_phase2(
         readability_cap=config.subtitle_max_cps,
     )
     metrics.snapshot("phase2_input", segments)
+
+    # Ensure the translation LLM is not still resident from Phase 1.
+    _ollama_unload(config.translation_model, log)
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")

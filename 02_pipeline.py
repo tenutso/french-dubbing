@@ -1003,17 +1003,6 @@ def diarize_audio(
 
             log.info(f"  Pyannote params: {diarize_kwargs}")
 
-            # Workaround for pyannote.audio name 'AudioDecoder' is not defined bug:
-            # We inject a mock into the pyannote.audio.core.io module if it's missing.
-            try:
-                import pyannote.audio.core.io as py_io
-                if not hasattr(py_io, "AudioDecoder"):
-                    class MockAudioDecoder:
-                        def __init__(self, *args, **kwargs): pass
-                    py_io.AudioDecoder = MockAudioDecoder
-            except ImportError:
-                pass
-
             # Pass the file path directly — the stable API across all pyannote versions.
             # Passing a waveform dict caused pyannote ≥ 3.4 to treat the dict as a
             # batch iterable (iterating its keys), yielding an empty generator.

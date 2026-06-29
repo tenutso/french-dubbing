@@ -240,7 +240,7 @@ fi
 
 log_step "Installing pyannote.audio (speaker diarization) …"
 
-if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=3.3.0" \
+if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=3.3.0,<4.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "pyannote.audio installed"
 else
@@ -502,7 +502,7 @@ fi
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper pyannote.audio noisereduce transformers \
+       faster-whisper "pyannote.audio>=3.3.0,<4.0" noisereduce transformers \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"

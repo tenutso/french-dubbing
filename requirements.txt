@@ -20,7 +20,7 @@ demucs>=4.0.0
 faster-whisper>=1.1.0
 
 # ── Speaker Diarization — pyannote.audio (optional, gated HF model) ───────────
-pyannote.audio>=3.3.0
+pyannote.audio>=3.3.0,<4.0
 
 # ── Speaker Denoising (noisereduce primary, FFmpeg anlmdn fallback) ────────────
 # DeepFilterNet was dropped: it has no cp312 wheel (needs a Rust toolchain to

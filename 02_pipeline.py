@@ -991,7 +991,13 @@ def diarize_audio(
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
-            pipeline = PyannotePipeline.from_pretrained(model_name, token=hf_token)
+            # The HF-token kwarg was renamed between pyannote versions: 4.x uses
+            # `token=`, 3.x uses `use_auth_token=`. Pick whichever the installed
+            # version accepts so the call works on either.
+            import inspect
+            _params = inspect.signature(PyannotePipeline.from_pretrained).parameters
+            _tok_kw = "token" if "token" in _params else "use_auth_token"
+            pipeline = PyannotePipeline.from_pretrained(model_name, **{_tok_kw: hf_token})
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             pipeline.to(device)
 
@@ -1003,13 +1009,21 @@ def diarize_audio(
 
             log.info(f"  Pyannote params: {diarize_kwargs}")
 
-            # Pass the file path directly — the stable API across all pyannote versions.
-            # Passing a waveform dict caused pyannote ≥ 3.4 to treat the dict as a
-            # batch iterable (iterating its keys), yielding an empty generator.
-            result = pipeline(wav_path, **diarize_kwargs)
+            # pyannote 4.x turned __call__ into a batch/streaming generator that
+            # yields nothing for a single file — use the .apply() method instead,
+            # which returns the diarization directly. .apply() reads file["uri"],
+            # so pass the AudioFile *dict* form ({"audio": path, "uri": name}); a
+            # bare path string raises `TypeError: string indices must be integers`.
+            # On pyannote 3.x (no .apply) fall back to calling the pipeline directly.
+            uri = os.path.splitext(os.path.basename(wav_path))[0]
+            audio_file = {"audio": wav_path, "uri": uri}
+            if hasattr(pipeline, "apply"):
+                result = pipeline.apply(audio_file, **diarize_kwargs)
+            else:
+                result = pipeline(wav_path, **diarize_kwargs)
 
-        # Defensive generator drain — kept in case a future pyannote version wraps
-        # file-path results in a generator too.
+        # Defensive generator drain — kept in case a pyannote version wraps the
+        # result in a generator (the 3.x __call__ path can).
         if isinstance(result, types.GeneratorType):
             try:
                 result = next(result)
@@ -2363,12 +2377,17 @@ def synthesize_all_segments(
     _ref_text_cache: dict = {}
 
     def _torchcodec_ok() -> bool:
-        """Return True if torchcodec's shared library loads successfully."""
+        """Return True if torchcodec's shared library loads successfully.
+
+        Importing torchcodec eagerly loads its native libs and raises OSError when
+        the matching libnvrtc.so is missing (the cu128-vs-CUDA13 mismatch), so a
+        clean `import torchcodec` + AudioDecoder import is a reliable signal across
+        torchcodec versions. (The old `_internally_replaced_utils` symbol was
+        removed in torchcodec 0.7+, so the previous check always returned False.)
+        """
         try:
-            from torchcodec._internally_replaced_utils import (  # type: ignore
-                load_torchcodec_shared_libraries,
-            )
-            load_torchcodec_shared_libraries()
+            import torchcodec  # noqa: F401
+            from torchcodec.decoders import AudioDecoder  # noqa: F401
             return True
         except Exception:
             return False

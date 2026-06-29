@@ -6,8 +6,16 @@
 # If installing outside RunPod, add:
 #   pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 
+# torchcodec MUST match torch 2.8 / CUDA 12.8 — the compatibility matrix maps
+# torch 2.8 ↔ torchcodec 0.6/0.7. Newer torchcodec (0.14.x, pulled in transitively
+# by f5-tts) targets torch 2.11 / CUDA 13 and links libnvrtc.so.13, which is absent
+# on cu128 → OSError on import → pyannote 4.x "AudioDecoder NameError" + degraded F5-TTS.
+torchcodec>=0.6,<0.8
+
 # ── Audio / Video ──────────────────────────────────────────────────────────────
-numpy>=1.26.4
+# Upper bound: pyannote.audio 4.x would otherwise pull numpy 2.5.x, which breaks
+# numba (requires numpy<2.5) and therefore librosa/demucs.
+numpy>=1.26.4,<2.5
 scipy>=1.13.1
 librosa>=0.10.2
 soundfile>=0.12.1
@@ -20,7 +28,9 @@ demucs>=4.0.0
 faster-whisper>=1.1.0
 
 # ── Speaker Diarization — pyannote.audio (optional, gated HF model) ───────────
-pyannote.audio>=3.3.0,<4.0
+# 4.x is required by the speaker-diarization-community-1 model and uses the
+# token= kwarg + torchcodec audio I/O (see torchcodec pin above).
+pyannote.audio>=4.0,<5.0
 
 # ── Speaker Denoising (noisereduce primary, FFmpeg anlmdn fallback) ────────────
 # DeepFilterNet was dropped: it has no cp312 wheel (needs a Rust toolchain to

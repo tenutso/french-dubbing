@@ -240,7 +240,7 @@ fi
 
 log_step "Installing pyannote.audio (speaker diarization) …"
 
-if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=3.3.0,<4.0" \
+if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=4.0,<5.0" \
        2>&1 | tail -3 | tee -a "$LOGFILE"; then
     log_success "pyannote.audio installed"
 else
@@ -268,6 +268,21 @@ if $PYTHON -m pip install --no-cache-dir "f5-tts>=1.0.0" \
     log_success "f5-tts installed"
 else
     log_error "f5-tts install failed — TTS will not work"
+fi
+
+# ── Step 8d-codec: Pin torchcodec to the torch-2.8-compatible wheel ──────────
+# f5-tts (above) pulls in the latest torchcodec (0.14.x), which targets torch 2.11
+# / CUDA 13 and fails to load on this cu128 image (libnvrtc.so.13 missing). The
+# matrix maps torch 2.8 ↔ torchcodec 0.6/0.7. Force the correct wheel AFTER f5-tts
+# so its transitive pin is overridden — this fixes both pyannote 4.x diarization
+# (AudioDecoder) and F5-TTS reference auto-transcription.
+log_step "Pinning torchcodec to torch-2.8-compatible version (>=0.6,<0.8) …"
+if $PYTHON -m pip install --no-cache-dir "torchcodec>=0.6,<0.8" \
+       2>&1 | tail -3 | tee -a "$LOGFILE" \
+   && $PYTHON -c "import torchcodec" 2>/dev/null; then
+    log_success "torchcodec loads cleanly ($($PYTHON -c 'import torchcodec; print(torchcodec.__version__)' 2>/dev/null))"
+else
+    log_warn "torchcodec install/import failed — diarization & F5-TTS auto-transcription may be degraded"
 fi
 
 # F5-TTS pulls in torchcodec which links against libnvrtc.so.N (where N matches
@@ -502,7 +517,7 @@ fi
 log_step "Upgrading non-pinned packages to latest …"
 
 $PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper "pyannote.audio>=3.3.0,<4.0" noisereduce transformers \
+       faster-whisper "pyannote.audio>=4.0,<5.0" noisereduce transformers \
        2>&1 | tail -5 | tee -a "$LOGFILE" \
     && log_success "Packages upgraded" \
     || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"

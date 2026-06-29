@@ -165,12 +165,23 @@ tts:
   # Speaker reference clip for voice cloning.
   # Must be < 22s — see diarization.profile_duration comment above.
   speaker_profile_duration: 12
-  # Skip this many seconds from the start (avoids intro music / titles).
+  # Skip this many seconds from the start (avoids intro music / titles). Used as a
+  # floor — the pipeline scans past this point and picks the cleanest voiced window.
   speaker_profile_skip: 20
+  # Sample rate of the reference clip fed to F5-TTS. F5-TTS works at 24000 Hz; a
+  # lower rate band-limits the cloned voice and makes it sound muffled/"underwater".
+  speaker_profile_sr: 24000
 
   # Denoise the speaker reference clip before voice cloning
   # (noisereduce, with an FFmpeg anlmdn fallback). Key name kept for back-compat.
   use_deepfilter: true
+  # noisereduce strength (0 = off, 1 = max). Kept gentle — aggressive denoise
+  # produces the watery/"underwater" artifact that bleeds into the cloned voice.
+  reference_denoise_strength: 0.5
+
+  # Folder of curated clean reference clips ("preset voices") selectable per
+  # speaker in the web review UI when the source audio is too degraded to clone.
+  voices_dir: /workspace/voices
 
   # Per-group speed-up cap. In timing_policy=anchored this is how much a dense
   # run may be sped up to stay inside the source timeline (1.30 ≈ inaudible on

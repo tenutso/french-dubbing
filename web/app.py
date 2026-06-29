@@ -43,6 +43,8 @@ WORKSPACE    = Path(os.environ.get("DUBBING_WORKSPACE", "/workspace"))
 UPLOAD_DIR   = WORKSPACE / "web" / "uploads"
 OUTPUT_DIR   = WORKSPACE / "web" / "outputs"
 LOG_DIR      = WORKSPACE / "logs"
+TEMP_DIR     = WORKSPACE / "temp"
+VOICES_DIR   = WORKSPACE / "voices"   # curated clean reference clips ("preset voices")
 CONFIG_PATH  = WORKSPACE / "config.yaml"
 PIPELINE_PY  = WORKSPACE / "scripts" / "02_pipeline.py"
 
@@ -55,6 +57,7 @@ CONFIG_MIRRORS = [
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Choices (mirror Click definitions in 02_pipeline.py) ──────────────────────
 LOCALE_CHOICES = ["fr", "fr-ca"]
@@ -1224,6 +1227,161 @@ async def approve_job(job_id: str) -> JSONResponse:
     state.save()
     await state.queue.put(job_id)
     return JSONResponse({"ok": True, "queued": job_id})
+
+
+# ── Voice reference selection (review stage) ─────────────────────────────────
+
+def _job_name(job: Job) -> str:
+    """The stem the pipeline derives outputs from (matches Path(video_path).stem)."""
+    return Path(job.video_path).stem if job.video_path else safe_stem(job.video_filename)
+
+
+def _locate_vocals(job: Job) -> Optional[Path]:
+    """Find the Demucs vocals.wav preserved from Phase 1 for this job."""
+    name = _job_name(job)
+    matches = sorted((TEMP_DIR / name).glob("**/vocals.wav"))
+    return matches[-1] if matches else None
+
+
+def _audio_duration(path: Path) -> float:
+    try:
+        import soundfile as sf
+        return float(sf.info(str(path)).duration)
+    except Exception:
+        return 0.0
+
+
+@app.get("/api/jobs/{job_id}/voices/speakers")
+async def voice_speakers(job_id: str) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    name = _job_name(job)
+    seg_file = Path(job.output_dir) / f"{name}_segments.json"
+    speakers: list = []
+    if seg_file.exists():
+        try:
+            segs = json.loads(seg_file.read_text(encoding="utf-8"))
+            speakers = sorted({s.get("speaker") for s in segs if s.get("speaker")})
+        except Exception:
+            speakers = []
+    if not speakers:
+        speakers = ["default"]
+    vocals = _locate_vocals(job)
+    # Existing saved selections, if any.
+    refs_file = Path(job.output_dir) / f"{name}_voice_refs.json"
+    saved = {}
+    if refs_file.exists():
+        try:
+            saved = json.loads(refs_file.read_text(encoding="utf-8"))
+        except Exception:
+            saved = {}
+    return JSONResponse({
+        "speakers": speakers,
+        "vocals_available": bool(vocals),
+        "vocals_duration": round(_audio_duration(vocals), 2) if vocals else 0.0,
+        "saved": saved,
+    })
+
+
+@app.get("/api/jobs/{job_id}/vocals-clip")
+async def vocals_clip(job_id: str, start: float = 0.0, dur: float = 10.0) -> StreamingResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    vocals = _locate_vocals(job)
+    if not vocals:
+        raise HTTPException(404, "vocals not found (job has no preserved Phase 1 audio)")
+    start = max(0.0, float(start))
+    dur = max(0.5, min(float(dur), 30.0))  # cap preview length
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(start), "-t", str(dur), "-i", str(vocals),
+             "-ac", "1", "-ar", "24000", "-f", "wav", "pipe:1"],
+            check=True, capture_output=True, timeout=60,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"clip extraction failed: {e}")
+    return StreamingResponse(iter([proc.stdout]), media_type="audio/wav")
+
+
+@app.get("/api/voices/library")
+async def voices_library() -> JSONResponse:
+    exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+    clips = sorted(
+        p.name for p in VOICES_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in exts
+    ) if VOICES_DIR.exists() else []
+    return JSONResponse({"voices": clips, "dir": str(VOICES_DIR)})
+
+
+@app.get("/api/voices/library/{filename}")
+async def voices_library_clip(filename: str) -> FileResponse:
+    target = (VOICES_DIR / filename).resolve()
+    if VOICES_DIR.resolve() not in target.parents or not target.is_file():
+        raise HTTPException(404, "voice clip not found")
+    return FileResponse(str(target))
+
+
+@app.put("/api/jobs/{job_id}/voice-refs")
+async def put_voice_refs(job_id: str, request: Request) -> JSONResponse:
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status != STATUS_AWAITING_REVIEW:
+        raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "body must be a JSON object keyed by speaker")
+
+    vocals = _locate_vocals(job)
+    vdur = _audio_duration(vocals) if vocals else 0.0
+    cleaned: dict = {}
+    for spk, ov in payload.items():
+        if not isinstance(ov, dict):
+            raise HTTPException(400, f"{spk}: selection must be an object")
+        src = ov.get("source")
+        if src == "auto":
+            continue  # auto = no override; omit from the sidecar
+        if src == "range":
+            try:
+                start = float(ov.get("start", 0.0)); dur = float(ov.get("duration", 0.0))
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"{spk}: start/duration must be numbers")
+            if dur <= 0:
+                raise HTTPException(400, f"{spk}: duration must be > 0")
+            if vdur and start + dur > vdur + 0.5:
+                raise HTTPException(400, f"{spk}: range exceeds vocals length ({vdur:.1f}s)")
+            cleaned[spk] = {"source": "range", "start": start, "duration": dur,
+                            "denoise": bool(ov.get("denoise", False))}
+        elif src == "library":
+            fname = os.path.basename(ov.get("path") or ov.get("file") or "")
+            target = (VOICES_DIR / fname).resolve()
+            if VOICES_DIR.resolve() not in target.parents or not target.is_file():
+                raise HTTPException(400, f"{spk}: library clip not found: {fname}")
+            cleaned[spk] = {"source": "library", "path": str(target),
+                            "denoise": bool(ov.get("denoise", False))}
+        else:
+            raise HTTPException(400, f"{spk}: unknown source '{src}'")
+
+    name = _job_name(job)
+    refs_file = Path(job.output_dir) / f"{name}_voice_refs.json"
+    if cleaned:
+        fd, tmp = tempfile.mkstemp(dir=job.output_dir, prefix=".vref.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cleaned, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, str(refs_file))
+        except Exception as e:
+            try: os.unlink(tmp)
+            except OSError: pass
+            raise HTTPException(500, f"failed to save voice refs: {e}")
+    else:
+        refs_file.unlink(missing_ok=True)  # all auto → clear any prior selection
+    return JSONResponse({"ok": True, "overrides": len(cleaned)})
 
 
 @app.get("/api/health")

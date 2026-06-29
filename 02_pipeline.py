@@ -134,6 +134,13 @@ class PipelineConfig:
     use_deepfilter: bool = True
     tts_speaker_duration: float = 12.0
     tts_speaker_skip: float = 20.0
+    # Reference clips are fed to F5-TTS for voice cloning. F5-TTS works at 24 kHz,
+    # so references must be ≥24 kHz or the cloned voice inherits the band-limit and
+    # sounds muffled/"underwater". reference_denoise_strength is noisereduce's
+    # prop_decrease (0=off, 1=max); 0.5 is gentle enough to avoid watery artifacts.
+    tts_speaker_profile_sr: int = 24000
+    tts_reference_denoise_strength: float = 0.5
+    voices_dir: str = "/workspace/voices"
 
     # TTS — F5-TTS (flow-matching zero-shot voice cloning)
     # In "anchored" mode tts_max_stretch is the per-group *speed-up* cap used to
@@ -304,6 +311,9 @@ def load_config(path: str) -> PipelineConfig:
         use_deepfilter=tts.get("use_deepfilter", True),
         tts_speaker_duration=tts.get("speaker_profile_duration", 25.0),
         tts_speaker_skip=tts.get("speaker_profile_skip", 20.0),
+        tts_speaker_profile_sr=int(tts.get("speaker_profile_sr", 24000)),
+        tts_reference_denoise_strength=float(tts.get("reference_denoise_strength", 0.5)),
+        voices_dir=tts.get("voices_dir", "/workspace/voices"),
         f5tts_model=tts.get("f5tts_model", "F5TTS_v1_Multilingual"),
         f5tts_nfe_step=int(tts.get("f5tts_nfe_step", 32)),
         f5tts_cfg_strength=float(tts.get("f5tts_cfg_strength", 2.0)),
@@ -1110,11 +1120,15 @@ def build_speaker_profiles(
     log: logging.Logger,
     use_deepfilter: bool = True,
     diarization_turns: Optional[List[Tuple[float, float, str]]] = None,
+    target_sr: int = 24000,
+    denoise_strength: float = 0.5,
 ) -> dict:
     """Build a per-speaker voice-clone reference clip from the cleanest turns."""
     from collections import defaultdict
 
-    TARGET_SR = 16000
+    # F5-TTS synthesizes at 24 kHz — extract at ≥24 kHz so the cloned voice keeps
+    # its full bandwidth instead of sounding band-limited/muffled.
+    TARGET_SR = max(int(target_sr), 24000)
     MIN_PROFILE_S = 3.0
 
     log.info(f"  Loading vocals at {TARGET_SR} Hz for profile extraction …")
@@ -1170,7 +1184,9 @@ def build_speaker_profiles(
 
         if use_deepfilter:
             denoised_path = os.path.join(temp_dir, f"profile_{speaker}_denoised.wav")
-            profiles[speaker] = denoise_audio(raw_path, denoised_path, log)
+            profiles[speaker] = denoise_audio(
+                raw_path, denoised_path, log, prop_decrease=denoise_strength
+            )
         else:
             profiles[speaker] = raw_path
 
@@ -2146,27 +2162,62 @@ def review_translations(
 # Step 5: Speaker Reference — extraction + denoising
 # ============================================================================
 
+def _best_voiced_offset(
+    wav_path: str,
+    duration: float,
+    skip_seconds: float,
+    log: logging.Logger,
+) -> float:
+    """Scan candidate windows ≥ skip_seconds and return the start (s) of the one
+    with the highest voiced RMS energy — avoids landing on silence/music/faded
+    regions. Falls back to skip_seconds if scanning fails."""
+    try:
+        y, sr = librosa.load(wav_path, sr=16000, mono=True)  # 16k is plenty for energy
+        total = len(y) / sr
+        if total <= skip_seconds + duration:
+            return skip_seconds
+        # Step across the file in half-window hops; score each candidate by RMS.
+        hop = max(duration / 2.0, 2.0)
+        best_off, best_rms = skip_seconds, -1.0
+        off = skip_seconds
+        while off + duration <= total:
+            seg = y[int(off * sr):int((off + duration) * sr)]
+            rms = float(np.sqrt(np.mean(seg ** 2))) if seg.size else 0.0
+            if rms > best_rms:
+                best_rms, best_off = rms, off
+            off += hop
+        log.info(f"  Reference auto-pick: best voiced window at {best_off:.0f} s (RMS {best_rms:.3f})")
+        return best_off
+    except Exception as e:
+        log.debug(f"  voiced-offset scan failed ({e}) — using fixed skip {skip_seconds:.0f} s")
+        return skip_seconds
+
+
 def extract_speaker_sample(
     wav_path: str,
     duration: float,
     output_path: str,
     log: logging.Logger,
     skip_seconds: float = 20.0,
+    target_sr: int = 24000,
 ) -> bool:
-    """Extract a 25s speaker reference clip skipping past intro music / titles."""
+    """Extract a speaker reference clip, auto-picking the cleanest voiced window
+    past skip_seconds. Extracts at ≥24 kHz so the cloned voice keeps full bandwidth."""
+    sr = max(int(target_sr), 24000)
+    offset = _best_voiced_offset(wav_path, duration, skip_seconds, log)
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", wav_path,
-                "-ss", str(skip_seconds),
+                "-ss", str(offset),
                 "-t",  str(duration),
-                "-ar", "16000",
+                "-ar", str(sr),
                 "-ac", "1",
                 output_path,
             ],
             check=True, capture_output=True, timeout=60,
         )
-        log.info(f"✓ Speaker sample: {duration:.0f} s at {skip_seconds:.0f} s offset")
+        log.info(f"✓ Speaker sample: {duration:.0f} s at {offset:.0f} s offset ({sr} Hz)")
         return True
     except Exception as e:
         log.error(f"Speaker sample extraction failed: {e}")
@@ -2177,15 +2228,23 @@ def denoise_audio(
     audio_path: str,
     output_path: str,
     log: logging.Logger,
+    prop_decrease: float = 0.5,
 ) -> str:
-    """Denoise speaker reference. Tries noisereduce → FFmpeg anlmdn."""
+    """Denoise speaker reference. Tries noisereduce → FFmpeg anlmdn.
+
+    prop_decrease controls how much noise is removed (0=off, 1=max). Kept gentle
+    by default — aggressive spectral gating produces the watery/"underwater"
+    artifact that bleeds into the cloned voice."""
+    if prop_decrease <= 0:
+        log.info("  Reference denoise disabled (strength 0) — using raw reference")
+        return audio_path
     try:
         import noisereduce as nr
         import soundfile as _sf
 
-        log.info("Denoising with noisereduce …")
+        log.info(f"Denoising with noisereduce (strength {prop_decrease:.2f}) …")
         data, rate = _sf.read(audio_path)
-        reduced    = nr.reduce_noise(y=data, sr=rate, prop_decrease=0.75)
+        reduced    = nr.reduce_noise(y=data, sr=rate, prop_decrease=float(prop_decrease))
         _sf.write(output_path, reduced, rate)
         log.info("✓ Speaker reference denoised (noisereduce)")
         return output_path
@@ -2209,6 +2268,124 @@ def denoise_audio(
     except Exception as e:
         log.warning(f"FFmpeg anlmdn failed ({e}) — using raw speaker reference")
         return audio_path
+
+
+def _ref_from_override(
+    ov: dict,
+    vocals_wav: str,
+    temp_dir: str,
+    key: str,
+    config: "PipelineConfig",
+    log: logging.Logger,
+) -> Optional[str]:
+    """Build a reference clip from a user override (a vocals time-range or a
+    library clip), resampled to the F5-TTS rate. Returns None to signal the
+    caller should fall back to the automatic reference."""
+    sr = max(int(config.tts_speaker_profile_sr), 24000)
+    out = os.path.join(temp_dir, f"ref_override_{key}.wav")
+    src = ov.get("source")
+    try:
+        if src == "range":
+            start = float(ov.get("start", 0.0))
+            dur   = float(ov.get("duration", config.tts_speaker_duration))
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", vocals_wav, "-ss", str(start), "-t", str(dur),
+                 "-ar", str(sr), "-ac", "1", out],
+                check=True, capture_output=True, timeout=60,
+            )
+        elif src == "library":
+            libpath = ov.get("path") or ""
+            if not os.path.exists(libpath):
+                log.warning(f"  {key}: library reference not found ({libpath}) — using auto")
+                return None
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", libpath, "-ar", str(sr), "-ac", "1", out],
+                check=True, capture_output=True, timeout=60,
+            )
+        else:
+            return None
+    except Exception as e:
+        log.warning(f"  {key}: override reference build failed ({e}) — using auto")
+        return None
+
+    # Manual picks are assumed clean, so denoise is opt-in per override.
+    if ov.get("denoise"):
+        dn = os.path.join(temp_dir, f"ref_override_{key}_dn.wav")
+        out = denoise_audio(out, dn, log, prop_decrease=config.tts_reference_denoise_strength)
+    log.info(f"  {key}: using '{src}' reference override → {out}")
+    return out
+
+
+def resolve_speaker_references(
+    vocals_wav: str,
+    segments: List[dict],
+    temp_dir: str,
+    output_dir: str,
+    name: str,
+    config: "PipelineConfig",
+    log: logging.Logger,
+    diarization_turns: Optional[List[Tuple[float, float, str]]] = None,
+) -> Tuple[Optional[str], Optional[dict]]:
+    """Prepare the F5-TTS voice-clone reference(s) for synthesis.
+
+    Honors per-speaker overrides written by the web review UI to
+    ``{output_dir}/{name}_voice_refs.json`` (keys: speaker label or "default";
+    each {"source": "range"|"library", ...}). Falls back to automatic extraction
+    (now at the F5-TTS sample rate) for any speaker without an override.
+    Returns (speaker_wav, speaker_profiles)."""
+    overrides: dict = {}
+    refs_path = os.path.join(output_dir, f"{name}_voice_refs.json")
+    if os.path.exists(refs_path):
+        try:
+            with open(refs_path, encoding="utf-8") as f:
+                overrides = json.load(f) or {}
+            log.info(f"  Voice-reference overrides loaded: {sorted(overrides)}")
+        except Exception as e:
+            log.warning(f"  voice_refs.json unreadable ({e}) — ignoring")
+
+    speaker_wav: Optional[str] = None
+    speaker_profiles: Optional[dict] = None
+
+    # Multi-speaker: auto-build all profiles, then apply per-speaker overrides.
+    if config.use_diarization and any("speaker" in s for s in segments):
+        speaker_profiles = build_speaker_profiles(
+            vocals_wav, segments, temp_dir, config.diarization_profile_duration, log,
+            use_deepfilter=config.use_deepfilter,
+            diarization_turns=diarization_turns,
+            target_sr=config.tts_speaker_profile_sr,
+            denoise_strength=config.tts_reference_denoise_strength,
+        )
+        for spk in list(speaker_profiles.keys()):
+            ov = overrides.get(spk)
+            if ov:
+                built = _ref_from_override(ov, vocals_wav, temp_dir, spk, config, log)
+                if built:
+                    speaker_profiles[spk] = built
+        valid = sum(1 for v in speaker_profiles.values() if v)
+        log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
+
+    # Single/default reference (fallback for any segment without a profile).
+    default_ov = overrides.get("default") or overrides.get("SPEAKER_00")
+    if default_ov:
+        speaker_wav = _ref_from_override(default_ov, vocals_wav, temp_dir, "default", config, log)
+    if speaker_wav is None:
+        raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
+        if extract_speaker_sample(
+            vocals_wav, config.tts_speaker_duration, raw_speaker_wav, log,
+            skip_seconds=config.tts_speaker_skip, target_sr=config.tts_speaker_profile_sr,
+        ):
+            if config.use_deepfilter:
+                denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
+                speaker_wav = denoise_audio(
+                    raw_speaker_wav, denoised_wav, log,
+                    prop_decrease=config.tts_reference_denoise_strength,
+                )
+            else:
+                speaker_wav = raw_speaker_wav
+        else:
+            log.warning("Voice cloning disabled — no speaker reference available")
+
+    return speaker_wav, speaker_profiles
 
 
 # ============================================================================
@@ -3975,37 +4152,10 @@ def process_video(
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")
-    speaker_wav: Optional[str] = None
-    speaker_profiles: Optional[dict] = None
-
-    raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
-    if extract_speaker_sample(
-        vocals_wav,
-        config.tts_speaker_duration,
-        raw_speaker_wav,
-        log,
-        skip_seconds=config.tts_speaker_skip,
-    ):
-        if config.use_deepfilter:
-            denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
-            speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
-        else:
-            speaker_wav = raw_speaker_wav
-    else:
-        log.warning("Voice cloning disabled — no speaker reference available")
-
-    if config.use_diarization and any("speaker" in s for s in segments):
-        speaker_profiles = build_speaker_profiles(
-            vocals_wav,
-            segments,
-            temp_dir,
-            config.diarization_profile_duration,
-            log,
-            use_deepfilter=config.use_deepfilter,
-            diarization_turns=diarization_turns,
-        )
-        valid = sum(1 for v in speaker_profiles.values() if v)
-        log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
+    speaker_wav, speaker_profiles = resolve_speaker_references(
+        vocals_wav, segments, temp_dir, output_dir, name, config, log,
+        diarization_turns=diarization_turns,
+    )
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
     log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")
@@ -4466,37 +4616,10 @@ def process_video_phase2(
 
     # ── 4. Speaker reference(s) ─────────────────────────────────────────────
     log.info("\n[4/6] PREPARING SPEAKER REFERENCE(S)")
-    speaker_wav: Optional[str] = None
-    speaker_profiles: Optional[dict] = None
-
-    raw_speaker_wav = os.path.join(temp_dir, "speaker_raw.wav")
-    if extract_speaker_sample(
-        vocals_wav,
-        config.tts_speaker_duration,
-        raw_speaker_wav,
-        log,
-        skip_seconds=config.tts_speaker_skip,
-    ):
-        if config.use_deepfilter:
-            denoised_wav = os.path.join(temp_dir, "speaker_denoised.wav")
-            speaker_wav  = denoise_audio(raw_speaker_wav, denoised_wav, log)
-        else:
-            speaker_wav = raw_speaker_wav
-    else:
-        log.warning("Voice cloning disabled — no speaker reference available")
-
-    if config.use_diarization and any("speaker" in s for s in segments):
-        speaker_profiles = build_speaker_profiles(
-            vocals_wav,
-            segments,
-            temp_dir,
-            config.diarization_profile_duration,
-            log,
-            use_deepfilter=config.use_deepfilter,
-            diarization_turns=None,  # speaker labels already embedded in segments
-        )
-        valid = sum(1 for v in speaker_profiles.values() if v)
-        log.info(f"  Built {valid}/{len(speaker_profiles)} speaker profile(s)")
+    speaker_wav, speaker_profiles = resolve_speaker_references(
+        vocals_wav, segments, temp_dir, output_dir, name, config, log,
+        diarization_turns=None,  # speaker labels already embedded in segments
+    )
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
     log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")

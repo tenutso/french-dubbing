@@ -465,3 +465,11 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
   header { padding: 10px 14px; flex-direction: column; align-items: flex-start; gap: 4px; }
   .grid { grid-template-columns: 1fr 1fr; }
 }
+
+/* Voice reference selection (review stage) */
+#voice-ref-section { margin: 14px 0; padding-top: 10px; border-top: 1px solid var(--border, #2a2a2a); }
+#voice-ref-section h3 { margin: 0 0 4px; font-size: 1rem; }
+.voice-panel { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 0; }
+.voice-panel strong { min-width: 110px; }
+.voice-panel input[type="number"] { width: 64px; }
+.voice-panel .vr-audio { height: 32px; vertical-align: middle; }

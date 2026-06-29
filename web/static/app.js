@@ -211,6 +211,7 @@ function renderJobs(jobs) {
     }
   } else if (reviewJobId) {
     $("#review-section").hidden = true;
+    $("#voice-ref-section").hidden = true;
     reviewJobId = null;
     reviewSegments = [];
   }
@@ -716,6 +717,7 @@ async function loadReviewSegments(jobId, job) {
       dlArea.appendChild(a);
     }
     renderReviewTable();
+    await loadVoiceRefs(jobId);
     status.textContent = `${reviewSegments.length} segments loaded`;
     $("#review-section").hidden = false;
     document.getElementById("review-section").scrollIntoView({ behavior: "smooth" });
@@ -772,6 +774,7 @@ async function saveReviewSegments() {
       status.textContent = "save failed: " + msg;
       return false;
     }
+    if (!await saveVoiceRefs()) return false;
     status.textContent = `saved ${data.count} segments`;
     return true;
   } catch (e) { status.textContent = "network error: " + e; return false; }
@@ -788,10 +791,134 @@ async function approveReview() {
     if (!r.ok) { status.textContent = "failed: " + (data.detail || r.statusText); return; }
     status.textContent = "Phase 2 queued — TTS synthesis starting…";
     $("#review-section").hidden = true;
+    $("#voice-ref-section").hidden = true;
     reviewJobId = null;
     reviewSegments = [];
     await refreshJobs();
   } catch (e) { status.textContent = "network error: " + e; }
+}
+
+// ── Voice reference selection ────────────────────────────────────────────────
+let voiceLibrary = [];
+let vocalsDuration = 0;
+
+async function loadVoiceRefs(jobId) {
+  const section = $("#voice-ref-section");
+  const panels = $("#voice-ref-panels");
+  panels.innerHTML = "";
+  try {
+    const [spkRes, libRes] = await Promise.all([
+      fetch(`/api/jobs/${jobId}/voices/speakers`),
+      fetch(`/api/voices/library`),
+    ]);
+    if (!spkRes.ok) { section.hidden = true; return; }
+    const data = await spkRes.json();
+    voiceLibrary = libRes.ok ? (await libRes.json()).voices || [] : [];
+    vocalsDuration = data.vocals_duration || 0;
+    if (!data.vocals_available) {
+      $("#voice-ref-hint").textContent =
+        "Source vocals not available for this job — voice reference is auto-selected.";
+      section.hidden = false;
+      return;
+    }
+    $("#voice-ref-hint").textContent =
+      `Pick the cleanest sample of each speaker's voice (source is ${vocalsDuration.toFixed(0)}s). Leave on Auto to let the pipeline choose.`;
+    for (const spk of data.speakers) {
+      panels.appendChild(buildVoicePanel(jobId, spk, (data.saved || {})[spk]));
+    }
+    section.hidden = false;
+  } catch (e) { section.hidden = true; }
+}
+
+function buildVoicePanel(jobId, speaker, saved) {
+  const wrap = document.createElement("div");
+  wrap.className = "voice-panel";
+  wrap.dataset.speaker = speaker;
+
+  const mode = saved?.source || "auto";
+  const libOpts = voiceLibrary.map(v =>
+    `<option value="${v}" ${saved?.source === "library" && (saved.path || "").endsWith(v) ? "selected" : ""}>${v}</option>`
+  ).join("");
+
+  wrap.innerHTML = `
+    <strong>${speaker}</strong>
+    <select class="vr-mode">
+      <option value="auto" ${mode === "auto" ? "selected" : ""}>Auto</option>
+      <option value="range" ${mode === "range" ? "selected" : ""}>Pick range</option>
+      <option value="library" ${mode === "library" ? "selected" : ""} ${voiceLibrary.length ? "" : "disabled"}>Library</option>
+    </select>
+    <span class="vr-range" ${mode === "range" ? "" : "hidden"}>
+      start <input type="number" class="vr-start" min="0" step="1" value="${saved?.start ?? 20}"> s,
+      length <input type="number" class="vr-dur" min="1" max="30" step="1" value="${saved?.duration ?? 12}"> s
+    </span>
+    <span class="vr-library" ${mode === "library" ? "" : "hidden"}>
+      <select class="vr-lib">${libOpts || "<option>(no clips)</option>"}</select>
+    </span>
+    <button type="button" class="vr-preview">▶ Preview</button>
+    <audio class="vr-audio" controls hidden></audio>
+  `;
+
+  const modeSel = wrap.querySelector(".vr-mode");
+  const rangeBox = wrap.querySelector(".vr-range");
+  const libBox = wrap.querySelector(".vr-library");
+  const preview = wrap.querySelector(".vr-preview");
+  const audio = wrap.querySelector(".vr-audio");
+  modeSel.addEventListener("change", () => {
+    rangeBox.hidden = modeSel.value !== "range";
+    libBox.hidden = modeSel.value !== "library";
+    preview.hidden = modeSel.value === "auto";
+    audio.hidden = true;
+  });
+  preview.hidden = mode === "auto";
+  preview.addEventListener("click", () => {
+    if (modeSel.value === "range") {
+      const s = parseFloat(wrap.querySelector(".vr-start").value) || 0;
+      const d = parseFloat(wrap.querySelector(".vr-dur").value) || 12;
+      audio.src = `/api/jobs/${jobId}/vocals-clip?start=${s}&dur=${d}`;
+    } else if (modeSel.value === "library") {
+      const f = wrap.querySelector(".vr-lib").value;
+      audio.src = `/api/voices/library/${encodeURIComponent(f)}`;
+    } else { return; }
+    audio.hidden = false;
+    audio.play().catch(() => {});
+  });
+  return wrap;
+}
+
+function collectVoiceRefs() {
+  const out = {};
+  document.querySelectorAll("#voice-ref-panels .voice-panel").forEach(p => {
+    const spk = p.dataset.speaker;
+    const mode = p.querySelector(".vr-mode").value;
+    if (mode === "range") {
+      out[spk] = {
+        source: "range",
+        start: parseFloat(p.querySelector(".vr-start").value) || 0,
+        duration: parseFloat(p.querySelector(".vr-dur").value) || 12,
+      };
+    } else if (mode === "library") {
+      out[spk] = { source: "library", path: p.querySelector(".vr-lib").value };
+    }
+    // "auto" → omit
+  });
+  return out;
+}
+
+async function saveVoiceRefs() {
+  if ($("#voice-ref-section").hidden) return true;
+  try {
+    const r = await fetch(`/api/jobs/${reviewJobId}/voice-refs`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(collectVoiceRefs()),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      $("#review-status").textContent = "voice ref save failed: " + (d.detail || r.statusText);
+      return false;
+    }
+    return true;
+  } catch (e) { $("#review-status").textContent = "network error: " + e; return false; }
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────────

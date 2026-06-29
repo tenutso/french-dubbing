@@ -1014,17 +1014,18 @@ def diarize_audio(
             except ImportError:
                 pass
 
-            waveform, sample_rate = torchaudio.load(wav_path)
-            result = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **diarize_kwargs)
+            # Pass the file path directly — the stable API across all pyannote versions.
+            # Passing a waveform dict caused pyannote ≥ 3.4 to treat the dict as a
+            # batch iterable (iterating its keys), yielding an empty generator.
+            result = pipeline(wav_path, **diarize_kwargs)
 
-        # pyannote ≥ 3.4 returns a generator when called with a waveform dict.
-        # Consume it to get the single Annotation result.
+        # Defensive generator drain — kept in case a future pyannote version wraps
+        # file-path results in a generator too.
         if isinstance(result, types.GeneratorType):
             try:
                 result = next(result)
             except StopIteration:
                 raise RuntimeError("pyannote pipeline returned an empty generator")
-            # Some generator variants yield (uri, annotation) pairs; unwrap if so.
             if isinstance(result, tuple) and len(result) >= 2 and hasattr(result[-1], "itertracks"):
                 result = result[-1]
 

@@ -83,20 +83,24 @@ function updateDropText() {
   }
 }
 
-// ── Source toggle: upload file vs. Vimeo URL ──────────────────────────────────
+// ── Source toggle: upload file vs. Vimeo URL vs. on-pod path ──────────────────
 const vimeoField = $("#vimeo-field");
 const vimeoInput = $("#vimeo_url");
+const pathField = $("#path-field");
+const pathInput = $("#local_path");
 function sourceMode() {
   const checked = document.querySelector('input[name="source"]:checked');
   return checked ? checked.value : "file";
 }
 function updateSourceMode() {
-  const url = sourceMode() === "vimeo";
-  dropEl.hidden = url;
-  vimeoField.hidden = !url;
-  // Only the active input is required so the form doesn't block the other mode.
-  fileInput.required = !url;
-  vimeoInput.required = url;
+  const mode = sourceMode();
+  dropEl.hidden = mode !== "file";
+  vimeoField.hidden = mode !== "vimeo";
+  pathField.hidden = mode !== "path";
+  // Only the active input is required so the form doesn't block the other modes.
+  fileInput.required = mode === "file";
+  vimeoInput.required = mode === "vimeo";
+  pathInput.required = mode === "path";
 }
 document.querySelectorAll('input[name="source"]').forEach(r =>
   r.addEventListener("change", updateSourceMode)
@@ -105,17 +109,21 @@ updateSourceMode();
 
 $("#submit-form").addEventListener("submit", e => {
   e.preventDefault();
-  const isUrl = sourceMode() === "vimeo";
+  const mode = sourceMode();
+  const isUpload = mode === "file";
   const status = $("#upload-status");
-  if (isUrl) {
+  if (mode === "vimeo") {
     if (!vimeoInput.value.trim()) { status.textContent = "enter a Vimeo URL"; return; }
+  } else if (mode === "path") {
+    if (!pathInput.value.trim()) { status.textContent = "enter a path to a file on the pod"; return; }
   } else if (!fileInput.files.length) {
     return;
   }
 
-  // Send only the fields for the active mode (skip the empty other input).
+  // Send only the fields for the active mode (skip the empty other inputs).
   const fd = new FormData();
-  if (isUrl) fd.append("vimeo_url", vimeoInput.value.trim());
+  if (mode === "vimeo") fd.append("vimeo_url", vimeoInput.value.trim());
+  else if (mode === "path") fd.append("local_path", pathInput.value.trim());
   else fd.append("video", fileInput.files[0]);
   fd.append("locale", $("#locale").value);
   fd.append("volume_boost", $("#volume_boost").value);
@@ -125,9 +133,9 @@ $("#submit-form").addEventListener("submit", e => {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
   const prog = $("#upload-progress");
-  prog.hidden = isUrl;  // upload progress is meaningless for a URL submit
+  prog.hidden = !isUpload;  // progress only meaningful for a browser upload
   prog.value = 0;
-  status.textContent = isUrl ? "submitting…" : "uploading…";
+  status.textContent = isUpload ? "uploading…" : "submitting…";
   $("#submit-btn").disabled = true;
 
   xhr.upload.onprogress = e => {

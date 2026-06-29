@@ -784,6 +784,7 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
 async def submit(
     video: UploadFile = File(None),
     vimeo_url: str = Form(""),
+    local_path: str = Form(""),
     locale: str = Form(""),
     volume_boost: str = Form(""),
     force: str = Form(""),
@@ -799,13 +800,20 @@ async def submit(
         except ValueError:
             raise HTTPException(400, "volume_boost must be a number")
 
-    # Exactly one source: an uploaded file OR a Vimeo URL.
+    # Exactly one source: a browser upload, a Vimeo URL, or a path to a file
+    # already on the pod. The on-pod path bypasses the browser/proxy upload
+    # entirely (copy big files in via runpodctl/scp/volume), avoiding the
+    # Cloudflare proxy 502 that kills large uploads.
     has_file = bool(video and video.filename)
     vimeo_url = vimeo_url.strip()
-    if has_file and vimeo_url:
-        raise HTTPException(400, "provide either a file or a Vimeo URL, not both")
-    if not has_file and not vimeo_url:
-        raise HTTPException(400, "no file uploaded and no Vimeo URL provided")
+    local_path = local_path.strip()
+    active = [n for n, on in
+              (("file", has_file), ("vimeo", bool(vimeo_url)), ("path", bool(local_path)))
+              if on]
+    if len(active) > 1:
+        raise HTTPException(400, "provide exactly one source: a file, a Vimeo URL, or an on-pod path")
+    if not active:
+        raise HTTPException(400, "no source provided: upload a file, give a Vimeo URL, or an on-pod path")
 
     job_id = new_job_id()
     options = {
@@ -831,6 +839,34 @@ async def submit(
             log_path=str(log_path),
             options=options,
             source_url=vimeo_url,
+        )
+    elif local_path:
+        # On-pod path branch — the file is already on the pod (copied in via
+        # runpodctl/scp/volume), so no bytes flow through the browser/proxy.
+        # Symlink it into UPLOAD_DIR under the usual {job_id}__{stem}.mp4 name so
+        # all downstream output naming (which derives from Path(video_path).stem)
+        # behaves exactly like a normal upload.
+        src = Path(local_path).expanduser()
+        try:
+            resolved = src.resolve()
+        except Exception:
+            raise HTTPException(400, f"invalid path: {local_path}")
+        root = WORKSPACE.resolve()
+        if root not in resolved.parents and resolved != root:
+            raise HTTPException(400, f"path must be inside {root}")
+        if not resolved.is_file():
+            raise HTTPException(400, f"file not found on pod: {resolved}")
+        stem = safe_stem(resolved.name) or "video"
+        dest = UPLOAD_DIR / f"{job_id}__{stem}.mp4"
+        dest.symlink_to(resolved)
+        log_path = LOG_DIR / f"{dest.stem}.log"
+        job = Job(
+            id=job_id,
+            video_filename=resolved.name,
+            video_path=str(dest),
+            output_dir=str(output_dir),
+            log_path=str(log_path),
+            options=options,
         )
     else:
         # File branch — stream upload to disk with a hard size cap.

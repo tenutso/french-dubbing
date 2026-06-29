@@ -19,6 +19,7 @@
       <div class="source-toggle" id="source-toggle">
         <label><input type="radio" name="source" value="file" checked> Upload file</label>
         <label><input type="radio" name="source" value="vimeo"> Vimeo URL</label>
+        <label><input type="radio" name="source" value="path"> File on pod</label>
       </div>
 
       <label class="drop" id="drop">
@@ -30,6 +31,12 @@
       <label class="vimeo-field" id="vimeo-field" hidden>Vimeo URL
         <input type="url" id="vimeo_url" name="vimeo_url"
                placeholder="https://vimeo.com/123456789">
+      </label>
+
+      <label class="path-field" id="path-field" hidden>Path to file on the pod
+        <input type="text" id="local_path" name="local_path"
+               placeholder="/workspace/videos/input/myvideo.mp4">
+        <span class="muted">Copy large files onto the pod first (runpodctl / scp / volume), then point here — no upload size limit.</span>
       </label>
 
       <div class="grid">

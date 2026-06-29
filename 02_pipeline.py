@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1015,6 +1016,17 @@ def diarize_audio(
 
             waveform, sample_rate = torchaudio.load(wav_path)
             result = pipeline({"waveform": waveform, "sample_rate": sample_rate}, **diarize_kwargs)
+
+        # pyannote ≥ 3.4 returns a generator when called with a waveform dict.
+        # Consume it to get the single Annotation result.
+        if isinstance(result, types.GeneratorType):
+            try:
+                result = next(result)
+            except StopIteration:
+                raise RuntimeError("pyannote pipeline returned an empty generator")
+            # Some generator variants yield (uri, annotation) pairs; unwrap if so.
+            if isinstance(result, tuple) and len(result) >= 2 and hasattr(result[-1], "itertracks"):
+                result = result[-1]
 
         # pyannote ≥ 3.3 wraps the output in a namedtuple whose annotation field
         # has been renamed across versions — probe known shapes.

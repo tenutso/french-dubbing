@@ -1283,6 +1283,58 @@ def _audio_duration(path: Path) -> float:
         return 0.0
 
 
+# Default reference length to suggest, in seconds (mirrors
+# diarization.profile_duration / tts.speaker_profile_duration = 12s).
+_SUGGESTED_REF_S = 12.0
+
+
+def _speaker_turns(segs: list, gap: float = 1.0) -> dict:
+    """Merge consecutive same-speaker segments into turns, so the UI can show
+    *when each speaker actually talks*. Returns {speaker: [(start, end), ...]}
+    sorted longest-first."""
+    from collections import defaultdict
+    turns: dict = defaultdict(list)
+    cur = None  # [speaker, start, end]
+    for s in sorted(segs, key=lambda x: float(x.get("start", 0.0))):
+        spk = s.get("speaker")
+        if not spk:
+            continue
+        st = float(s.get("start", 0.0))
+        en = float(s.get("end", st))
+        if cur and cur[0] == spk and st - cur[2] <= gap:
+            cur[2] = max(cur[2], en)
+        else:
+            if cur:
+                turns[cur[0]].append((cur[1], cur[2]))
+            cur = [spk, st, en]
+    if cur:
+        turns[cur[0]].append((cur[1], cur[2]))
+    for spk in turns:
+        turns[spk].sort(key=lambda r: r[1] - r[0], reverse=True)
+    return turns
+
+
+def _speaker_ranges(segs: list) -> dict:
+    """Per-speaker reference guidance: a suggested start/duration (anchored to the
+    speaker's longest turn) plus their longest turns, so the picker defaults to a
+    window where THAT speaker actually speaks instead of a shared fixed offset."""
+    turns = _speaker_turns(segs)
+    ranges: dict = {}
+    for spk, tl in turns.items():
+        if tl:
+            s0, e0 = tl[0]
+            sug = {"start": round(s0, 1),
+                   "duration": round(max(1.0, min(e0 - s0, _SUGGESTED_REF_S)), 1)}
+        else:
+            sug = {"start": 0.0, "duration": _SUGGESTED_REF_S}
+        ranges[spk] = {
+            "suggested": sug,
+            "turns": [[round(a, 1), round(b, 1)] for a, b in tl[:6]],
+            "n_turns": len(tl),
+        }
+    return ranges
+
+
 @app.get("/api/jobs/{job_id}/voices/speakers")
 async def voice_speakers(job_id: str) -> JSONResponse:
     job = state.jobs.get(job_id)
@@ -1291,10 +1343,12 @@ async def voice_speakers(job_id: str) -> JSONResponse:
     name = _job_name(job)
     seg_file = Path(job.output_dir) / f"{name}_segments.json"
     speakers: list = []
+    ranges: dict = {}
     if seg_file.exists():
         try:
             segs = json.loads(seg_file.read_text(encoding="utf-8"))
             speakers = sorted({s.get("speaker") for s in segs if s.get("speaker")})
+            ranges = _speaker_ranges(segs)
         except Exception:
             speakers = []
     if not speakers:
@@ -1310,6 +1364,7 @@ async def voice_speakers(job_id: str) -> JSONResponse:
             saved = {}
     return JSONResponse({
         "speakers": speakers,
+        "ranges": ranges,
         "vocals_available": bool(vocals),
         "vocals_duration": round(_audio_duration(vocals), 2) if vocals else 0.0,
         "saved": saved,

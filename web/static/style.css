@@ -473,3 +473,7 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
 .voice-panel strong { min-width: 110px; }
 .voice-panel input[type="number"] { width: 64px; }
 .voice-panel .vr-audio { height: 32px; vertical-align: middle; }
+.vr-range { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.vr-turns { flex-basis: 100%; font-size: 0.82rem; opacity: 0.85; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.vr-turn { font-size: 0.78rem; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border, #2a2a2a); background: transparent; color: inherit; cursor: pointer; }
+.vr-turn:hover { background: var(--border, #2a2a2a); }

@@ -851,21 +851,39 @@ async function loadVoiceRefs(jobId) {
     $("#voice-ref-hint").textContent =
       `Pick the cleanest sample of each speaker's voice (source is ${vocalsDuration.toFixed(0)}s). Leave on Auto to let the pipeline choose.`;
     for (const spk of data.speakers) {
-      panels.appendChild(buildVoicePanel(jobId, spk, (data.saved || {})[spk]));
+      panels.appendChild(
+        buildVoicePanel(jobId, spk, (data.saved || {})[spk], (data.ranges || {})[spk])
+      );
     }
     section.hidden = false;
   } catch (e) { section.hidden = true; }
 }
 
-function buildVoicePanel(jobId, speaker, saved) {
+function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
   const wrap = document.createElement("div");
   wrap.className = "voice-panel";
   wrap.dataset.speaker = speaker;
 
   const mode = saved?.source || "auto";
+  // Default this speaker's range to a window where THEY actually speak (their
+  // longest turn), not a shared fixed offset — picking a generic time on the
+  // mixed vocals can land on another speaker and collapse the voices together.
+  const sug = rangeInfo?.suggested || {};
+  const defStart = saved?.start ?? sug.start ?? 20;
+  const defDur = saved?.duration ?? sug.duration ?? 12;
   const libOpts = voiceLibrary.map(v =>
     `<option value="${v}" ${saved?.source === "library" && (saved.path || "").endsWith(v) ? "selected" : ""}>${v}</option>`
   ).join("");
+
+  // Clickable chips for this speaker's longest turns, so the user can drop the
+  // range onto a known-good window in one click.
+  const turns = rangeInfo?.turns || [];
+  const chips = turns.map(([a, b]) =>
+    `<button type="button" class="vr-turn" data-start="${a}" data-dur="${Math.min(Math.round(b - a), 12)}">${a}–${b}s</button>`
+  ).join("");
+  const turnsRow = turns.length
+    ? `<div class="vr-turns">talks at: ${chips}</div>`
+    : "";
 
   wrap.innerHTML = `
     <strong>${speaker}</strong>
@@ -875,8 +893,9 @@ function buildVoicePanel(jobId, speaker, saved) {
       <option value="library" ${mode === "library" ? "selected" : ""} ${voiceLibrary.length ? "" : "disabled"}>Library</option>
     </select>
     <span class="vr-range" ${mode === "range" ? "" : "hidden"}>
-      start <input type="number" class="vr-start" min="0" step="1" value="${saved?.start ?? 20}"> s,
-      length <input type="number" class="vr-dur" min="1" max="30" step="1" value="${saved?.duration ?? 12}"> s
+      start <input type="number" class="vr-start" min="0" step="1" value="${defStart}"> s,
+      length <input type="number" class="vr-dur" min="1" max="30" step="1" value="${defDur}"> s
+      ${turnsRow}
     </span>
     <span class="vr-library" ${mode === "library" ? "" : "hidden"}>
       <select class="vr-lib">${libOpts || "<option>(no clips)</option>"}</select>
@@ -895,6 +914,14 @@ function buildVoicePanel(jobId, speaker, saved) {
     libBox.hidden = modeSel.value !== "library";
     preview.hidden = modeSel.value === "auto";
     audio.hidden = true;
+  });
+  // Talk-time chip → set the range to that turn and preview it immediately.
+  wrap.querySelectorAll(".vr-turn").forEach(chip => {
+    chip.addEventListener("click", () => {
+      wrap.querySelector(".vr-start").value = chip.dataset.start;
+      wrap.querySelector(".vr-dur").value = chip.dataset.dur;
+      preview.click();
+    });
   });
   preview.hidden = mode === "auto";
   preview.addEventListener("click", () => {

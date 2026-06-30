@@ -302,7 +302,10 @@ async def _run_job(job: Job) -> None:
         "--output-dir", job.output_dir,
         "--config",     str(CONFIG_PATH),
     ]
-    if opts.get("force"):
+    # Phase 2 is always a deliberate "synthesize now" action from the UI, so it must
+    # run even when prior outputs exist (re-generation after re-opening review). On
+    # the first approve no outputs exist yet, so --force is a harmless no-op there.
+    if opts.get("force") or _is_phase2:
         cmd.append("--force")
     if opts.get("locale"):
         cmd += ["--locale", opts["locale"]]
@@ -1227,6 +1230,35 @@ async def approve_job(job_id: str) -> JSONResponse:
     state.save()
     await state.queue.put(job_id)
     return JSONResponse({"ok": True, "queued": job_id})
+
+
+@app.post("/api/jobs/{job_id}/reopen")
+async def reopen_job(job_id: str) -> JSONResponse:
+    """Step a finished job back to the review stage so the user can edit segments
+    / voices and re-run Phase 2 (TTS + assembly) WITHOUT redoing Phase 1
+    (transcription, diarization, translation). Phase 2 reads only
+    ``{name}_segments.json``, so re-opening is safe as long as that file survives."""
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status not in (STATUS_COMPLETED, STATUS_FAILED):
+        raise HTTPException(409, f"job cannot be re-opened (status: {job.status})")
+    name = Path(job.video_path).stem if job.video_path else safe_stem(job.video_filename)
+    seg_file = Path(job.output_dir) / f"{name}_segments.json"
+    if not seg_file.exists():
+        raise HTTPException(
+            409,
+            "Phase-1 segments are no longer on disk — re-run the full pipeline to regenerate.",
+        )
+    # Drop the phase-2 marker so the job re-enters the review stage rather than
+    # re-queuing straight into synthesis; approve() will set it again.
+    job.options.pop("_p2", None)
+    job.options["review"] = True
+    job.status = STATUS_AWAITING_REVIEW
+    job.error = ""
+    job.ended_at = 0.0
+    state.save()
+    return JSONResponse({"ok": True, "reopened": job_id})
 
 
 # ── Voice reference selection (review stage) ─────────────────────────────────

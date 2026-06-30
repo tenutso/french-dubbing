@@ -327,6 +327,33 @@ function renderCard(job) {
     $(".job-actions", root).insertBefore(btn, $(".show-log", root));
   }
 
+  // "Re-open review" for finished jobs — step back to the review stage and
+  // re-run Phase 2 (TTS) without redoing Phase 1 (transcription/translation).
+  if (job.status === "completed" || job.status === "failed") {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Re-open review";
+    btn.title = "Edit segments / voices and regenerate the dub without re-processing the source video";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/jobs/${job.id}/reopen`, { method: "POST" });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          alert(err.detail || `Could not re-open review (HTTP ${res.status})`);
+          btn.disabled = false;
+          return;
+        }
+        await refreshJobs();
+        document.getElementById("review-section").scrollIntoView({ behavior: "smooth" });
+      } catch (e) {
+        alert("Network error re-opening review");
+        btn.disabled = false;
+      }
+    });
+    $(".job-actions", root).insertBefore(btn, $(".show-log", root));
+  }
+
   return root;
 }
 

@@ -22,99 +22,87 @@ acronyms:
 # these right via the prompt; this is the deterministic safety net.
 
 always:
-  # courriel (masc, like "email") — safe one-to-one
-  e-mail:                 courriel
-  email:                  courriel
-  courrier électronique:  courriel
-  # fin de semaine is FEMININE but "week-end" is masculine — list article forms
-  # FIRST (they run before the bare fallback) so gender agreement stays correct.
-  le week-end:            la fin de semaine
-  le weekend:             la fin de semaine
-  un week-end:            une fin de semaine
-  un weekend:             une fin de semaine
-  ce week-end:            cette fin de semaine
-  ce weekend:             cette fin de semaine
-  du week-end:            de la fin de semaine
-  au week-end:            à la fin de semaine
-  des week-ends:          des fins de semaine
-  week-ends:              fins de semaine
-  weekends:               fins de semaine
-  week-end:               fin de semaine
-  weekend:                fin de semaine
-  # same-gender, consonant-initial swaps (no article/elision hazard)
-  parking:                stationnement
-  shopping:               magasinage
-  smartphone:             téléphone intelligent
-  podcasts:               balados
-  podcast:                balado
-  spam:                   pourriel
-  # vowel-initial targets: elide "la" → "l'" via article-aware forms first
-  la newsletter:          l'infolettre
-  une newsletter:         une infolettre
-  newsletters:            infolettres
-  newsletter:             infolettre
-  la deadline:            l'échéance
-  une deadline:           une échéance
-  deadline:               échéance
+  e-mail: courriel
+  email: courriel
+  courrier électronique: courriel
+  le week-end: la fin de semaine
+  le weekend: la fin de semaine
+  un week-end: une fin de semaine
+  un weekend: une fin de semaine
+  ce week-end: cette fin de semaine
+  ce weekend: cette fin de semaine
+  du week-end: de la fin de semaine
+  au week-end: à la fin de semaine
+  des week-ends: des fins de semaine
+  week-ends: fins de semaine
+  weekends: fins de semaine
+  week-end: fin de semaine
+  weekend: fin de semaine
+  parking: stationnement
+  shopping: magasinage
+  smartphone: téléphone intelligent
+  podcasts: balados
+  podcast: balado
+  spam: pourriel
+  la newsletter: "l'infolettre"
+  une newsletter: une infolettre
+  newsletters: infolettres
+  newsletter: infolettre
+  la deadline: "l'échéance"
+  une deadline: une échéance
+  deadline: échéance
+  CAPS: CAPS
 
 # ── Core Speaker Terms ────────────────────────────────────────────────────────
 
 glossary:
-  speaker:                            conférencier·ère
-  speakers:                           conférencier·ères
-  Speaker:                            Conférencier·ère
-  Speakers:                           Conférencier·ères
-  keynote speaker:                    conférencier·ère principal·e
-  keynote speakers:                   conférencier·ères principaux·ales
-  professional speaker:               conférencier·ère professionnel·le
-  thought leader:                     leader d'opinion
-  facilitator:                        facilitateur·trice
-  trainer:                            formateur·trice
-  coach:                              coach
-
-  # ── CAPS Organization & Events ────────────────────────────────────────────
-
-  Canadian Association of Professional Speakers:    Association canadienne des conférencier·ères professionnel·les
-  Canadian Speaking Hall of Fame:                   Temple de la renommée canadien des conférencier·ères
-  Hall of Fame:                                     Temple de la renommée
-  Global Speakers Federation:                       Fédération mondiale des conférencier·ères
-  Speaker Academy:                                  Académie des conférencier·ères
-  CAPS Academy:                                     Académie CAPS
-  CAPS Atlantic:                                    CAPS Atlantique
-  CAPS BC:                                          CAPS Colombie-Britannique
-  CAPS Convention:                                  Convention de CAPS
-  CAPS Foundation:                                  Fondation CAPS
-  CAPS Quebec:                                      CAPS Québec
-  Learn, Share, Grow, Belong:                       Apprendre, Partager, Grandir, Appartenir
-
-  # ── Speaking & Business Terms ────────────────────────────────────────────
-
-  speaking engagement:                mandat de conférence
-  speaking business:                  entreprise de conférencier·ères
-  speaker fee:                        honoraires
-  preferred rate:                     tarif préférentiel
-  networking:                         réseautage
-  workshop:                           atelier
-  workshops:                          ateliers
-  onboarding:                         intégration
-  meeting:                            réunion
-  membership:                         adhésion
-  chapter:                            chapitre
-  directory:                          répertoire
-  accountability group:               groupe d'imputabilité
-  accountability groups:              groupes d'imputabilité
-
-  # ── Programs & Events ─────────────────────────────────────────────────────
-
-  Main Stage:                         Scène principale
-  mastermind:                         groupe de réflexion stratégique
-  Multi-Year Mastermind:              Groupe de réflexion stratégique pluriannuel
-  learning track:                     parcours d'apprentissage
-  self-guided learning track:         parcours d'apprentissage autonome
-  Business Starter Track:             Parcours « Démarrage d'entreprise »
-  hybrid event:                       événement hybride
-  in-person event:                    événement en présentiel
-  in-person:                          en présentiel
-  on-demand:                          sur demande
-  early bird:                         inscription anticipée
-  audience reach:                     portée auprès de l'auditoire
+  speaker: conférencier·ère
+  speakers: conférencier·ères
+  Speaker: Conférencier·ère
+  Speakers: Conférencier·ères
+  keynote speaker: conférencier·ère principal·e
+  keynote speakers: conférencier·ères principaux·ales
+  professional speaker: conférencier·ère professionnel·le
+  thought leader: "leader d'opinion"
+  facilitator: facilitateur·trice
+  trainer: formateur·trice
+  coach: coach
+  Canadian Association of Professional Speakers: Association canadienne des conférencier·ères professionnel·les
+  Canadian Speaking Hall of Fame: Temple de la renommée canadien des conférencier·ères
+  Hall of Fame: Temple de la renommée
+  Global Speakers Federation: Fédération mondiale des conférencier·ères
+  Speaker Academy: Académie des conférencier·ères
+  CAPS Academy: Académie CAPS
+  CAPS Atlantic: CAPS Atlantique
+  CAPS BC: CAPS Colombie-Britannique
+  CAPS Convention: Convention de CAPS
+  CAPS Foundation: Fondation CAPS
+  CAPS Quebec: CAPS Québec
+  "Learn, Share, Grow, Belong": "Apprendre, Partager, Grandir, Appartenir"
+  speaking engagement: mandat de conférence
+  speaking business: entreprise de conférencier·ères
+  speaker fee: honoraires
+  preferred rate: tarif préférentiel
+  networking: réseautage
+  workshop: atelier
+  workshops: ateliers
+  onboarding: intégration
+  meeting: réunion
+  membership: adhésion
+  chapter: chapitre
+  directory: répertoire
+  accountability group: "groupe d'imputabilité"
+  accountability groups: "groupes d'imputabilité"
+  Main Stage: Scène principale
+  mastermind: groupe de réflexion stratégique
+  Multi-Year Mastermind: Groupe de réflexion stratégique pluriannuel
+  learning track: "parcours d'apprentissage"
+  self-guided learning track: "parcours d'apprentissage autonome"
+  Business Starter Track: "Parcours « Démarrage d'entreprise »"
+  hybrid event: événement hybride
+  in-person event: événement en présentiel
+  in-person: en présentiel
+  on-demand: sur demande
+  early bird: inscription anticipée
+  audience reach: "portée auprès de l'auditoire"
+  CAPS National: national de CAPS

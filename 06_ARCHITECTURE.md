@@ -109,6 +109,13 @@ denoised through noisereduce → FFmpeg `anlmdn` (whichever is available). F5‑
 from this clip, so a clean reference is what preserves the original voice. Clips are hard‑
 capped at 15 s: F5‑TTS's duration formula breaks above 22 s reference length.
 
+**Pause condensing** (`_condense_silences`): F5‑TTS also clones the reference's *pace* — a
+pause‑heavy reference makes every generated line for that speaker slow (measured: ~9.6 chars/s
+vs ~16 for a dense reference, an unfittable 1.7× timing deficit). Silent gaps inside every
+reference (auto profiles, single‑speaker samples, and review‑UI range picks) are therefore
+capped at 300 ms; extra raw audio is collected first so the condensed clip still reaches the
+target length. Curated library clips are used as‑is.
+
 ## 7. TTS — F5‑TTS (flow‑matching zero‑shot voice cloning)
 
 Multilingual flow‑matching TTS with native French, 24 kHz output
@@ -123,6 +130,14 @@ Before synthesis, written‑only conventions are normalized to a **spoken form**
 subtitles by the CAPS style guide — are unpronounceable, so the TTS receives the collapsed
 base form (re‑pluralised when the suffix carried the plural). Guillemets are stripped. The
 subtitles keep the full inclusive written forms.
+
+**Adaptive re‑synthesis**: when a segment's natural audio would need more than
+`tts.max_stretch` to fit its time window, it is re‑synthesized once at a higher F5‑TTS speed
+(capped at 1.35×). F5's speed parameter is generative — it *speaks* faster — which sounds far
+better than Rubber Band at 1.7–2.3×, and costs one extra call only for the offending segments.
+After synthesis, each cloned voice's measured pace is logged per speaker, with a warning below
+12 chars/s (the signature of a slow/pause‑heavy reference; `synthesis_fit.csv` also carries a
+`speaker` column so this is diagnosable per run).
 
 ## 8. Assembly, timing, and subtitles
 

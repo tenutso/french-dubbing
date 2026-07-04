@@ -309,6 +309,7 @@ class MetricsCollector:
                 fr = _seg_fr(seg)
                 rows.append({
                     "id": seg.get("id", ""),
+                    "speaker": seg.get("speaker", ""),
                     "start_s": round(start, 3),
                     "duration_s": round(window, 3),
                     "fr_chars": len(fr),
@@ -324,7 +325,7 @@ class MetricsCollector:
 
             path = os.path.join(self.metrics_dir, "synthesis_fit.csv")
             fields = [
-                "id", "start_s", "duration_s", "fr_chars", "tts_natural_s",
+                "id", "speaker", "start_s", "duration_s", "fr_chars", "tts_natural_s",
                 "required_stretch", "max_stretch", "fits", "text_fr",
             ]
             with open(path, "w", newline="", encoding="utf-8") as f:

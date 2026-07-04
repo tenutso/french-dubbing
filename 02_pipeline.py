@@ -1174,20 +1174,25 @@ def build_speaker_profiles(
 
     profiles: dict = {}
 
+    # Collect extra raw audio so that after pause-condensing the profile still
+    # reaches profile_duration of actual speech.
+    RAW_FACTOR = 1.5
+
     for speaker, windows in by_speaker.items():
         windows = sorted(windows, key=lambda w: w[1] - w[0], reverse=True)
         chunks: List[np.ndarray] = []
         collected = 0.0
+        raw_target = profile_duration * RAW_FACTOR
 
         for (w_start, w_end) in windows:
-            if collected >= profile_duration:
+            if collected >= raw_target:
                 break
             s_start = max(0.0, w_start)
             s_end   = min(total_s, w_end)
             dur     = s_end - s_start
             if dur < 0.3:
                 continue
-            want      = min(dur, profile_duration - collected)
+            want      = min(dur, raw_target - collected)
             idx_start = int(s_start * TARGET_SR)
             idx_end   = int((s_start + want) * TARGET_SR)
             chunks.append(full_audio[idx_start:idx_end])
@@ -1202,6 +1207,16 @@ def build_speaker_profiles(
             continue
 
         combined = np.concatenate(chunks)
+        # Condense pauses so F5-TTS inherits a natural speaking pace, then trim
+        # back to the target profile length.
+        condensed, removed = _condense_silences(combined, TARGET_SR)
+        if len(condensed) >= int(MIN_PROFILE_S * TARGET_SR):
+            if removed > 0.5:
+                log.info(f"  {speaker}: condensed {removed:.1f}s of pauses out of the reference")
+            combined = condensed
+        max_samples = int(profile_duration * TARGET_SR)
+        if len(combined) > max_samples:
+            combined = combined[:max_samples]
         raw_path = os.path.join(temp_dir, f"profile_{speaker}_raw.wav")
         sf.write(raw_path, combined, TARGET_SR)
 
@@ -1213,7 +1228,10 @@ def build_speaker_profiles(
         else:
             profiles[speaker] = raw_path
 
-        log.info(f"  {speaker}: {collected:.1f}s profile built → {profiles[speaker]}")
+        log.info(
+            f"  {speaker}: {len(combined) / TARGET_SR:.1f}s profile built "
+            f"(from {collected:.1f}s raw) → {profiles[speaker]}"
+        )
 
     return profiles
 
@@ -2197,6 +2215,44 @@ def review_translations(
 # Step 5: Speaker Reference — extraction + denoising
 # ============================================================================
 
+def _condense_silences(
+    audio: np.ndarray,
+    sr: int,
+    top_db: int = 35,
+    max_pause_s: float = 0.30,
+) -> Tuple[np.ndarray, float]:
+    """Cap every silent gap in a reference clip at max_pause_s.
+
+    F5-TTS paces its output from the reference clip's overall speech density:
+    a pause-heavy reference makes EVERY generated line for that speaker slow.
+    Measured on a 3-speaker panel: one speaker's reference produced ~9.6
+    chars/s of synthesis vs ~16 for a dense reference — a 1.7× timing deficit
+    no post-hoc stretching can absorb. Short pauses (300 ms) are kept so the
+    reference still sounds like natural speech, not a word salad.
+
+    Returns (condensed_audio, seconds_removed).
+    """
+    try:
+        intervals = librosa.effects.split(audio, top_db=top_db)
+    except Exception:
+        return audio, 0.0
+    if len(intervals) == 0:
+        return audio, 0.0
+    max_gap = int(max_pause_s * sr)
+    pieces: List[np.ndarray] = []
+    prev_end = 0
+    for (s, e) in intervals:
+        gap = s - prev_end
+        if gap > 0:
+            pieces.append(audio[s - min(gap, max_gap):s])
+        pieces.append(audio[s:e])
+        prev_end = e
+    tail = min(len(audio) - prev_end, max_gap)
+    if tail > 0:
+        pieces.append(audio[prev_end:prev_end + tail])
+    out = np.concatenate(pieces) if pieces else audio
+    return out, (len(audio) - len(out)) / sr
+
 def _best_voiced_offset(
     wav_path: str,
     duration: float,
@@ -2237,21 +2293,37 @@ def extract_speaker_sample(
     target_sr: int = 24000,
 ) -> bool:
     """Extract a speaker reference clip, auto-picking the cleanest voiced window
-    past skip_seconds. Extracts at ≥24 kHz so the cloned voice keeps full bandwidth."""
+    past skip_seconds. Extracts at ≥24 kHz so the cloned voice keeps full bandwidth.
+    Pauses are condensed so F5-TTS inherits a natural speaking pace (see
+    _condense_silences); extra raw audio is pulled to compensate."""
     sr = max(int(target_sr), 24000)
+    raw_duration = duration * 1.5
     offset = _best_voiced_offset(wav_path, duration, skip_seconds, log)
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", wav_path,
                 "-ss", str(offset),
-                "-t",  str(duration),
+                "-t",  str(raw_duration),
                 "-ar", str(sr),
                 "-ac", "1",
                 output_path,
             ],
             check=True, capture_output=True, timeout=60,
         )
+        try:
+            y, _ = librosa.load(output_path, sr=sr, mono=True)
+            condensed, removed = _condense_silences(y, sr)
+            if len(condensed) >= sr * 2:
+                y = condensed
+                if removed > 0.5:
+                    log.info(f"  Reference: condensed {removed:.1f}s of pauses")
+            max_samples = int(duration * sr)
+            if len(y) > max_samples:
+                y = y[:max_samples]
+            sf.write(output_path, y, sr)
+        except Exception as ce:
+            log.debug(f"  Reference pause-condensing skipped: {ce}")
         log.info(f"✓ Speaker sample: {duration:.0f} s at {offset:.0f} s offset ({sr} Hz)")
         return True
     except Exception as e:
@@ -2342,6 +2414,18 @@ def _ref_from_override(
     except Exception as e:
         log.warning(f"  {key}: override reference build failed ({e}) — using auto")
         return None
+
+    # Range picks come straight from the vocals track — condense pauses so the
+    # cloned voice keeps a natural pace (library clips are curated; left as-is).
+    if src == "range":
+        try:
+            y, _ = librosa.load(out, sr=sr, mono=True)
+            condensed, removed = _condense_silences(y, sr)
+            if len(condensed) >= sr * 2 and removed > 0.25:
+                sf.write(out, condensed, sr)
+                log.info(f"  {key}: condensed {removed:.1f}s of pauses in range reference")
+        except Exception as ce:
+            log.debug(f"  {key}: pause-condensing skipped: {ce}")
 
     # Manual picks are assumed clean, so denoise is opt-in per override.
     if ov.get("denoise"):
@@ -2469,6 +2553,18 @@ _TTS_EXPECTED_CPS = 13.0          # chars/sec of natural synthesized speech
 _TTS_RUNAWAY_FACTOR = 2.5         # natural > 2.5x expected → suspect runaway
 _TTS_RUNAWAY_MIN_EXCESS_S = 2.0   # …and at least this many seconds over expected
 _TTS_MAX_RETRIES = 2
+
+# Adaptive re-synthesis: when a segment's natural audio would need more than
+# max_stretch to fit its window, re-synthesize once at a higher F5-TTS speed
+# instead of leaving rubberband to cap out (the residue then lags the video).
+# F5's speed parameter is generative — it *speaks* faster, which sounds far
+# better than rubberband at 1.7-2.3x. Capped: beyond ~1.35x F5 starts slurring.
+_F5_MAX_SPEEDUP = 1.35
+
+# A cloned voice speaking below this pace cannot fit a typical dub timeline
+# (budget_cps 16 needs ≥ ~12.5 chars/s). Usually caused by a pause-heavy or
+# slow-spoken reference clip; surfaced as a per-speaker warning after synthesis.
+_TTS_SLOW_PACE_CPS = 12.0
 
 
 def _split_for_tts(text: str, limit: int) -> List[str]:
@@ -2674,7 +2770,7 @@ def synthesize_all_segments(
     # _split_for_tts always splits on sentence endings so every boundary gets this gap.
     chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
 
-    def _synth_one(text: str, ref_wav: str) -> np.ndarray:
+    def _synth_one(text: str, ref_wav: str, speed: Optional[float] = None) -> np.ndarray:
         t = text.rstrip()
         if t and t[-1] not in ".!?…":
             t += "."
@@ -2687,16 +2783,16 @@ def synthesize_all_segments(
             gen_text=t,
             nfe_step=config.f5tts_nfe_step,
             cfg_strength=config.f5tts_cfg_strength,
-            speed=config.f5tts_speed,
+            speed=config.f5tts_speed if speed is None else speed,
             remove_silence=False,
             file_wave=None,
             seed=None,            # None → random each call, so retries are independent
         )
         return np.asarray(wav, dtype=np.float32)
 
-    def _synth_guarded(text: str, ref_wav: str, seg_id) -> np.ndarray:
+    def _synth_guarded(text: str, ref_wav: str, seg_id, speed: Optional[float] = None) -> np.ndarray:
         """Synthesize `text`, regenerating on runaway duration or near-silent output."""
-        wav = _synth_one(text, ref_wav)
+        wav = _synth_one(text, ref_wav, speed=speed)
         expected = max(len(text) / _TTS_EXPECTED_CPS, 0.4)
         natural = len(wav) / sr
 
@@ -2706,7 +2802,7 @@ def synthesize_all_segments(
             best = wav
             for _ in range(_TTS_MAX_RETRIES):
                 try:
-                    cand = _synth_one(text, ref_wav)
+                    cand = _synth_one(text, ref_wav, speed=speed)
                 except Exception as e:
                     log.debug(f"Segment {seg_id}: runaway retry failed: {e}")
                     continue
@@ -2733,7 +2829,7 @@ def synthesize_all_segments(
                       else f"too short ({len(wav)/sr:.2f}s, expected ≥{min_dur:.2f}s)")
             for _ in range(_TTS_MAX_RETRIES):
                 try:
-                    cand = _synth_one(text, ref_wav)
+                    cand = _synth_one(text, ref_wav, speed=speed)
                 except Exception as e:
                     log.debug(f"Segment {seg_id}: quality retry failed: {e}")
                     continue
@@ -2747,7 +2843,20 @@ def synthesize_all_segments(
 
         return wav
 
+    def _synth_segment(chunks: List[str], ref_wav: str, seg_id, speed: Optional[float] = None) -> np.ndarray:
+        parts = [_synth_guarded(c, ref_wav, seg_id, speed=speed) for c in chunks]
+        if len(parts) == 1:
+            return parts[0]
+        return np.concatenate(
+            [p for i, part in enumerate(parts) for p in
+             ((part,) if i == 0 else (chunk_gap, part))]
+        )
+
     synthesized: List[Tuple[np.ndarray, float, float]] = []
+    resynth_count = 0
+    # Per-speaker pace accounting on the FIRST pass (reflects the reference
+    # clip's pace, before any adaptive speed-up masks it).
+    pace: Dict[str, List[float]] = {}   # speaker -> [chars, natural_seconds]
     with tqdm(total=len(segments), desc="Synthesizing (F5-TTS)") as pbar:
         for seg in segments:
             text = _tts_spoken_form(_seg_text(seg))
@@ -2766,17 +2875,59 @@ def synthesize_all_segments(
                         f"Segment {seg['id']}: split into {len(chunks)} chunks "
                         f"({len(text)} chars, limit={_F5TTS_CHUNK_LIMIT})"
                     )
-                parts = [_synth_guarded(c, ref_wav, seg["id"]) for c in chunks]
-                wav = parts[0] if len(parts) == 1 else np.concatenate(
-                    [p for i, part in enumerate(parts) for p in
-                     ((part,) if i == 0 else (chunk_gap, part))]
-                )
+                wav = _synth_segment(chunks, ref_wav, seg["id"])
+
+                natural = len(wav) / sr
+                spk = seg.get("speaker", "default")
+                acc = pace.setdefault(spk, [0.0, 0.0])
+                acc[0] += len(text)
+                acc[1] += natural
+
+                # Adaptive re-synthesis: if the natural audio can't fit its
+                # window even at max_stretch, speak it faster instead of
+                # letting rubberband cap out and lag the video.
+                window = max(float(seg["end"]) - float(seg["start"]), 0.1)
+                need = natural / window
+                if need > config.tts_max_stretch * 1.02:
+                    factor = min(need, _F5_MAX_SPEEDUP)
+                    faster_speed = config.f5tts_speed * factor
+                    try:
+                        cand = _synth_segment(chunks, ref_wav, seg["id"], speed=faster_speed)
+                        if len(cand) < len(wav):
+                            log.info(
+                                f"Segment {seg['id']}: natural {natural:.1f}s needs "
+                                f"{need:.2f}x for its {window:.1f}s window — re-synthesized "
+                                f"at speed {faster_speed:.2f} → {len(cand) / sr:.1f}s"
+                            )
+                            wav = cand
+                            resynth_count += 1
+                    except Exception as re_e:
+                        log.debug(f"Segment {seg['id']}: adaptive re-synthesis failed: {re_e}")
+
                 synthesized.append((wav, seg["start"], seg["end"]))
             except Exception as e:
                 log.warning(f"Segment {seg['id']} F5-TTS failed: {e}")
             pbar.update(1)
 
-    log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz")
+    log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz"
+             + (f" ({resynth_count} re-synthesized faster to fit)" if resynth_count else ""))
+
+    # Per-speaker pace report — a slow cloned voice means its reference clip
+    # is pause-heavy or slow-spoken; no downstream stretching can absorb it.
+    for spk in sorted(pace):
+        chars, secs = pace[spk]
+        if secs < 3.0:
+            continue
+        rate = chars / secs
+        if rate < _TTS_SLOW_PACE_CPS:
+            log.warning(
+                f"  {spk}: cloned voice speaks at {rate:.1f} chars/s "
+                f"(< {_TTS_SLOW_PACE_CPS:.0f}) — reference clip is slow or pause-heavy; "
+                f"pick a denser reference range for this speaker in the review UI"
+            )
+        else:
+            log.info(f"  {spk}: cloned voice pace {rate:.1f} chars/s")
+
     del f5
     free_vram(log)
     return synthesized, sr

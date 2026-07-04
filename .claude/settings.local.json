@@ -39,7 +39,15 @@
       "Bash(./venv/bin/pip -q install fastapi httpx pyyaml python-multipart)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git push *)"
+      "Bash(git push *)",
+      "Bash(git config *)",
+      "Bash(gh auth *)",
+      "Read(//home/anijmeh/.ssh/**)",
+      "Bash(ssh -o BatchMode=yes -o ConnectTimeout=5 -T git@github.com)",
+      "Bash(find / -type d -name \"d76e9c0559c4*\")",
+      "Bash(find / -type d -name \"*d76e9c0559c4*\" -not -path \"*/proc/*\")",
+      "Bash(ls /workspace)",
+      "Read(//home/anijmeh/**)"
     ]
   }
 }

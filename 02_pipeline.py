@@ -1571,6 +1571,34 @@ Output ONLY the numbered rewrites, one per line, preserving the original numberi
 {language} segments:
 {segments}"""
 
+def _glossary_preserve_note(glossary_section: str) -> str:
+    """Compact, arrow-free terminology note for rewrite prompts.
+
+    The full glossary block uses "english → français" arrow lines. Injecting
+    those into a *rewrite* prompt teaches the model to answer in the same
+    arrow notation, which the leak guard then rejects — a whole compression
+    round can silently apply nothing. Rewrites only need to know which target
+    terms to keep, so list the French forms plainly."""
+    if not glossary_section:
+        return ""
+    terms: List[str] = []
+    for line in glossary_section.splitlines():
+        if "→" not in line:
+            continue
+        rhs = line.split("→", 1)[1]
+        rhs = re.sub(r"\(NOT:.*?\)", "", rhs)
+        rhs = re.sub(r"\[.*?\]", "", rhs).strip()
+        if rhs:
+            terms.append(rhs)
+    if not terms:
+        return ""
+    uniq = list(dict.fromkeys(terms))[:40]
+    return (
+        "ESTABLISHED TERMINOLOGY — these forms are already correct; keep them "
+        "unchanged in your rewrites:\n  " + "; ".join(uniq) + "\n"
+    )
+
+
 def compress_overflowing_translations(
     segments: List[dict],
     model: str,
@@ -1606,6 +1634,7 @@ def compress_overflowing_translations(
     """
     language = _LANG_NAMES.get(target_lang, target_lang.upper())
     think_prefix = "/no_think\n" if "qwen3" in model.lower() else ""
+    glossary_note = _glossary_preserve_note(glossary_section)
 
     def _budget(seg: dict) -> int:
         """Character budget sent to the LLM in the compression prompt."""
@@ -1665,7 +1694,7 @@ def compress_overflowing_translations(
                 for i, (idx, b) in enumerate(chunk)
             )
             prompt = think_prefix + _COMPRESS_PROMPT.format(
-                language=language, segments=numbered, glossary_section=glossary_section,
+                language=language, segments=numbered, glossary_section=glossary_note,
             )
             response = _ollama_call(prompt, model, temperature, log)
             if not response:
@@ -1952,7 +1981,12 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
             timeout=(15, 600),
         )
         if r.status_code == 200:
-            return r.json().get("response", "").strip()
+            resp = r.json().get("response", "").strip()
+            # Head of every response at debug level — without this, a pass that
+            # silently applies nothing (bad format, echoed instructions) is
+            # undiagnosable after the fact.
+            log.debug(f"Ollama response ({len(resp)} chars): {resp[:400]!r}")
+            return resp
         log.warning(f"Ollama HTTP {r.status_code}")
         return None
     except requests.exceptions.ConnectionError:
@@ -2045,6 +2079,13 @@ def _parse_numbered(text: str, count: int) -> List[str]:
         # meta-commentary rather than a real translation. The caller's
         # `if result[i]:` fallback then keeps the prior good text. Protects
         # every LLM pass that routes through _parse_numbered.
+        # Arrow-echo tolerance: models sometimes answer in the glossary's
+        # "old → new" notation. The rewrite is the right-hand side — keep it
+        # when it's clean instead of losing the whole item to the leak guard.
+        if content and "→" in content:
+            tail = content.rsplit("→", 1)[1].strip(" \t\"'")
+            if tail and not _looks_like_instruction_leak(tail):
+                content = tail
         if content and _looks_like_instruction_leak(content):
             return
         if content:
@@ -2554,12 +2595,18 @@ _TTS_RUNAWAY_FACTOR = 2.5         # natural > 2.5x expected → suspect runaway
 _TTS_RUNAWAY_MIN_EXCESS_S = 2.0   # …and at least this many seconds over expected
 _TTS_MAX_RETRIES = 2
 
-# Adaptive re-synthesis: when a segment's natural audio would need more than
-# max_stretch to fit its window, re-synthesize once at a higher F5-TTS speed
-# instead of leaving rubberband to cap out (the residue then lags the video).
-# F5's speed parameter is generative — it *speaks* faster, which sounds far
-# better than rubberband at 1.7-2.3x. Capped: beyond ~1.35x F5 starts slurring.
-_F5_MAX_SPEEDUP = 1.35
+# F5-TTS clones the reference clip's speaking rate, so pace is managed in two
+# layers (both generative — F5 *speaks* faster, which sounds far better than
+# rubberband at 1.7-2.3x):
+#   1. Calibration: one fixed sentence is synthesized per reference; a slow
+#      voice gets its base speed raised toward _TTS_TARGET_CPS (≤ _CAL_MAX_FACTOR).
+#   2. Adaptive re-synthesis: a segment whose natural audio still can't fit its
+#      window at max_stretch is re-synthesized once, faster.
+# _F5_MAX_SPEEDUP caps the TOTAL speed-up (calibration × adaptive) relative to
+# the configured f5tts_speed — beyond ~1.45x F5 starts slurring.
+_TTS_TARGET_CPS = 14.0
+_CAL_MAX_FACTOR = 1.25
+_F5_MAX_SPEEDUP = 1.45
 
 # A cloned voice speaking below this pace cannot fit a typical dub timeline
 # (budget_cps 16 needs ≥ ~12.5 chars/s). Usually caused by a pause-heavy or
@@ -2770,6 +2817,10 @@ def synthesize_all_segments(
     # _split_for_tts always splits on sentence endings so every boundary gets this gap.
     chunk_gap = np.zeros(int(sr * 0.18), dtype=np.float32)
 
+    # Per-reference base-speed factors from pace calibration (filled in below,
+    # read at call time by _synth_one's default-speed path).
+    ref_speed: Dict[str, float] = {}
+
     def _synth_one(text: str, ref_wav: str, speed: Optional[float] = None) -> np.ndarray:
         t = text.rstrip()
         if t and t[-1] not in ".!?…":
@@ -2777,13 +2828,15 @@ def synthesize_all_segments(
         # Use pre-transcribed ref_text only as a torchcodec fallback; otherwise
         # pass "" so F5-TTS auto-transcribes and vocabulary bleed cannot occur.
         ref_text_val = _ref_text_cache.get(ref_wav, "") if _use_ref_text_cache else ""
+        if speed is None:
+            speed = config.f5tts_speed * ref_speed.get(ref_wav, 1.0)
         wav, _, _ = f5.infer(
             ref_file=ref_wav,
             ref_text=ref_text_val,
             gen_text=t,
             nfe_step=config.f5tts_nfe_step,
             cfg_strength=config.f5tts_cfg_strength,
-            speed=config.f5tts_speed if speed is None else speed,
+            speed=speed,
             remove_silence=False,
             file_wave=None,
             seed=None,            # None → random each call, so retries are independent
@@ -2852,10 +2905,34 @@ def synthesize_all_segments(
              ((part,) if i == 0 else (chunk_gap, part))]
         )
 
+    # Pace calibration: measure each cloned voice once on a fixed sentence and
+    # raise slow voices' base speed toward the target pace. This normalizes the
+    # deficit at its source (a slow reference slows EVERY line of that speaker);
+    # the per-segment adaptive pass below then only handles residual overruns.
+    _CALIBRATION_TEXT = (
+        "Bonjour à tous et merci de votre présence aujourd'hui "
+        "pour cette discussion très importante."
+    )
+    _cal_refs = sorted({
+        _pick_wav(s) for s in segments
+        if _pick_wav(s) and os.path.exists(_pick_wav(s))
+    })
+    for rw in _cal_refs:
+        try:
+            cal = _synth_one(_CALIBRATION_TEXT, rw, speed=config.f5tts_speed)
+            rate = len(_CALIBRATION_TEXT) / max(len(cal) / sr, 0.1)
+            factor = min(max(_TTS_TARGET_CPS / max(rate, 1.0), 1.0), _CAL_MAX_FACTOR)
+            ref_speed[rw] = factor
+            note = f" → base speed x{factor:.2f}" if factor > 1.001 else ""
+            log.info(f"  Pace calibration {Path(rw).name}: {rate:.1f} chars/s{note}")
+        except Exception as e:
+            log.debug(f"  Pace calibration failed for {Path(rw).name}: {e}")
+            ref_speed[rw] = 1.0
+
     synthesized: List[Tuple[np.ndarray, float, float]] = []
     resynth_count = 0
-    # Per-speaker pace accounting on the FIRST pass (reflects the reference
-    # clip's pace, before any adaptive speed-up masks it).
+    # Per-speaker pace accounting on the FIRST pass (reflects the calibrated
+    # voice, before any per-segment adaptive speed-up masks it).
     pace: Dict[str, List[float]] = {}   # speaker -> [chars, natural_seconds]
     with tqdm(total=len(segments), desc="Synthesizing (F5-TTS)") as pbar:
         for seg in segments:
@@ -2885,12 +2962,13 @@ def synthesize_all_segments(
 
                 # Adaptive re-synthesis: if the natural audio can't fit its
                 # window even at max_stretch, speak it faster instead of
-                # letting rubberband cap out and lag the video.
+                # letting rubberband cap out and lag the video. The total
+                # speed-up (calibration x adaptive) is capped at _F5_MAX_SPEEDUP.
                 window = max(float(seg["end"]) - float(seg["start"]), 0.1)
                 need = natural / window
-                if need > config.tts_max_stretch * 1.02:
-                    factor = min(need, _F5_MAX_SPEEDUP)
-                    faster_speed = config.f5tts_speed * factor
+                base_speed = config.f5tts_speed * ref_speed.get(ref_wav, 1.0)
+                faster_speed = min(base_speed * need, config.f5tts_speed * _F5_MAX_SPEEDUP)
+                if need > config.tts_max_stretch * 1.02 and faster_speed > base_speed * 1.02:
                     try:
                         cand = _synth_segment(chunks, ref_wav, seg["id"], speed=faster_speed)
                         if len(cand) < len(wav):

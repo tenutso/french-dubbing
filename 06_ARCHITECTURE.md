@@ -131,10 +131,16 @@ subtitles by the CAPS style guide — are unpronounceable, so the TTS receives t
 base form (re‑pluralised when the suffix carried the plural). Guillemets are stripped. The
 subtitles keep the full inclusive written forms.
 
-**Adaptive re‑synthesis**: when a segment's natural audio would need more than
-`tts.max_stretch` to fit its time window, it is re‑synthesized once at a higher F5‑TTS speed
-(capped at 1.35×). F5's speed parameter is generative — it *speaks* faster — which sounds far
-better than Rubber Band at 1.7–2.3×, and costs one extra call only for the offending segments.
+**Pace management** (two generative layers — F5's speed parameter *speaks* faster, which
+sounds far better than Rubber Band at 1.7–2.3×):
+
+1. **Calibration** — one fixed sentence is synthesized per unique reference; a voice measured
+   slower than the 14 chars/s target gets its base speed raised (≤ 1.25×). This normalizes a
+   slow‑spoken reference at the source, since F5 clones the reference's delivery rate.
+2. **Adaptive re‑synthesis** — a segment whose natural audio still can't fit its window at
+   `tts.max_stretch` is re‑synthesized once, faster. Total speed‑up (calibration × adaptive)
+   is capped at 1.45× of the configured `f5tts_speed`; beyond that F5 slurs.
+
 After synthesis, each cloned voice's measured pace is logged per speaker, with a warning below
 12 chars/s (the signature of a slow/pause‑heavy reference; `synthesis_fit.csv` also carries a
 `speaker` column so this is diagnosable per run).

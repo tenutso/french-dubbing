@@ -47,7 +47,9 @@
       "Bash(find / -type d -name \"d76e9c0559c4*\")",
       "Bash(find / -type d -name \"*d76e9c0559c4*\" -not -path \"*/proc/*\")",
       "Bash(ls /workspace)",
-      "Read(//home/anijmeh/**)"
+      "Read(//home/anijmeh/**)",
+      "Bash(cd /home/anijmeh/projects/french-dubbing/dddd6ce486a0)",
+      "Bash(cat _dubbing_metrics_runs.csv)"
     ]
   }
 }

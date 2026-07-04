@@ -49,7 +49,8 @@
       "Bash(ls /workspace)",
       "Read(//home/anijmeh/**)",
       "Bash(cd /home/anijmeh/projects/french-dubbing/dddd6ce486a0)",
-      "Bash(cat _dubbing_metrics_runs.csv)"
+      "Bash(cat _dubbing_metrics_runs.csv)",
+      "Bash(node --check web/static/app.js)"
     ]
   }
 }

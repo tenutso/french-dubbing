@@ -12,20 +12,21 @@ The pipeline does everything from source separation through translation, voice�
 |---|---|---|
 | Source separation | [Demucs `htdemucs`](https://github.com/facebookresearch/demucs) | Splits vocals from background music so the dub can be re‑mixed cleanly |
 | Transcription | [faster‑whisper `large-v3`](https://github.com/SYSTRAN/faster-whisper) | CTranslate2, float16, word timestamps + VAD, anti‑hallucination tuned |
-| Segment merging | sentence‑scale chunks (2–12 s) | Sub‑second fragments are absorbed into neighbours for natural prosody |
-| Speaker diarization | [pyannote `speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) | On by default; builds a separate voice clone per speaker |
+| Speaker diarization | [pyannote `speaker-diarization-community-1`](https://huggingface.co/pyannote/speaker-diarization-community-1) | On by default; runs **before** merging so chunks never span two speakers; builds a separate voice clone per speaker |
+| Segment merging | sentence‑scale chunks (2–12 s) | Sub‑second fragments are absorbed into neighbours for natural prosody, never across a speaker change |
 | Translation | **mistral-small:22b via Ollama** | Single natural pass + targeted compression; glossary prompt‑injection; native French quality |
 | English‑echo guard | automatic re‑translation | Detects segments the LLM left in English and re‑translates them individually |
-| TTS | **F5‑TTS** (flow‑matching DiT, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~25 s reference; reliable on names and unusual input |
+| TTS | **F5‑TTS** (flow‑matching DiT, 24 kHz native) | Multilingual zero‑shot voice cloning from a ~12 s pause‑condensed reference; per‑voice pace calibration; reliable on names and unusual input |
 | Speaker denoising | noisereduce → FFmpeg `anlmdn` | Layered fallback for a clean voice‑clone reference |
 | Assembly | numpy timeline + Rubber Band time‑stretch + crossfade | **Holds the source timeline** (see timing policy); upsamples 24 kHz → 48 kHz |
 | Subtitles | **Hybrid BBC/Netflix shaper** | ≤2 lines, ≤42 cpl, ≤17 CPS reading speed, logical line breaks |
 | Output | AAC 192 kbps / 48 kHz stereo (+ optional full‑mix with background) + UTF‑8 SRT + optional muxed MP4 | Vimeo‑ready |
 
-### Two features worth calling out
+### Three features worth calling out
 
 - **Timeline‑anchored timing (`timing_policy: anchored`, default).** Each translated run is fit into its original slot — dense runs are sped up a touch (capped at `tts.max_stretch`, ~1.30×, inaudible on speech) and accumulated drift is re‑anchored at every pause — so the dub stays in sync with the video over a full‑length program. Pairs with length‑aware translation (`translation.budget_cps`, iterated over `translation.compression_rounds`) that keeps the French tight enough to fit. A `no_drop` mode never speeds up (timeline extends, so it drifts longer than the source on dense talks); `lock` preserves exact source timing and truncates overflow for lip‑sync‑sensitive work.
 - **Reading‑speed coupling.** Speech runs whose translated text is denser than `tts.reading_cps` (16) are gently *slowed* toward that pace (capped at `tts.max_slowdown`, 1.25×, and never past the slot edge under `anchored`). This de‑rushes the dub and keeps subtitles under the 17 CPS reading‑speed limit.
+- **Per‑voice pace management.** F5‑TTS clones each reference clip's speaking rate, so a pause‑heavy or slow‑spoken reference would make that speaker's entire dub run long. Three layers prevent it: reference clips are **pause‑condensed** (gaps capped at 300 ms), each cloned voice is **calibrated** once and slow voices get a gentle generative speed‑up (≤1.25×), and any segment that still can't fit its window is **adaptively re‑synthesized** faster instead of relying on time‑stretch. Per‑speaker pace is logged after synthesis, with a warning when a voice is too slow to fit a dub timeline.
 
 ### Localisation
 
@@ -78,7 +79,7 @@ python /workspace/scripts/verify_setup.py
 bash /workspace/scripts/05_web.sh
 ```
 
-Open the RunPod‑proxied URL for port 7860, drop in a video, pick locale + volume boost, submit. Live log streams; downloads appear when done.
+Open the RunPod‑proxied URL for port 7860, drop in a video, pick locale, speaker count, and volume boost, submit. Live log streams; downloads appear when done.
 
 **Single video (CLI):**
 
@@ -95,7 +96,10 @@ python /workspace/scripts/02_pipeline.py \
 | `--output-dir` | path | Default `/workspace/outputs` |
 | `--config` | path | Default `/workspace/config.yaml` |
 | `--locale` | `fr` \| `fr-ca` | `fr-ca` loads the Canadian glossary |
-| `--volume-boost` | float, % | Boost output loudness after peak‑normalise |
+| `--speakers` | int 1–20 | Exact speaker count for this video (overrides diarization min/max). `1` = solo presenter: skips diarization entirely |
+| `--volume-boost` | float, % | Boost output loudness (shifts the −16 LUFS loudnorm target) |
+| `--phase` | `1` \| `2` | `1` = transcribe+translate then stop (for review); `2` = TTS+assembly from the saved segments |
+| `--segments-file` | path | Phase 2: load segments from a custom path |
 | `--keep-temp` | flag | Keep intermediate stage JSON for debugging |
 | `--force` | flag | Re‑process even if outputs exist |
 
@@ -118,10 +122,11 @@ One job at a time (VRAM‑safe). Reports to `/workspace/logs/batch_report.json`.
 
 A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in [web/static/](web/static/). Launch with `bash 05_web.sh` (binds `0.0.0.0:7860`).
 
-- Drag‑drop MP4 upload with progress bar.
-- Pre‑fills locale + volume‑boost from `config.yaml`.
+- Drag‑drop MP4 upload with progress bar (or a Vimeo URL, or an on‑pod path for big files).
+- Per‑job options: locale, **speaker count** (blank = auto; `1` = solo presenter), volume boost, and an optional pause‑for‑review stage to edit translations and pick voice references before synthesis.
 - Single‑job FIFO queue; live log via Server‑Sent Events.
 - Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
+- An **Advanced options** panel edits the per‑video subset of `config.yaml` (source language, vocabulary hint, translation model/review pass, output toggles). The tuned timing/quality internals are deliberately not exposed — edit `config.yaml` directly for experiments.
 - Crash‑safe: a job interrupted by a server restart is recovered as `failed`; queued jobs resume.
 - Footer shows live GPU / VRAM / disk / Ollama / HF‑token status.
 
@@ -144,20 +149,24 @@ Everything lives in [config.yaml](config.yaml) (heavily commented). The most use
 ```yaml
 diarization:
   enabled: true
-  min_speakers: 2          # set to 1 only for known single‑speaker recordings
+  min_speakers: 2          # per‑job override: the Speakers field / --speakers flag
   max_speakers: 10
+
+whisper:
+  language: en             # "" = auto‑detect per file (bilingual sources)
+  initial_prompt: ""       # optional domain vocabulary hint ("CAPS, CSP, keynote")
 
 translation:
   model: mistral-small:22b
   review_pass: false       # optional self‑review pass (~2× slower)
   compression_pass: true   # tighten only the over‑budget segments
   compression_rounds: 3    # iterate the compression pass until segments fit
-  budget_cps: 15           # char/sec budget per segment — tighter = better sync
+  budget_cps: 16           # char/sec budget per segment — tighter = better sync
   target_lang: fr          # fr es de it pt nl pl ru ja ko zh ar tr hi vi
   locale: fr-ca            # loads canadian_glossary.yaml
 
 tts:
-  f5tts_model: F5TTS_v1_Multilingual   # F5TTS_v1_Base for English/Chinese only
+  f5tts_model: RASPIAUDIO/F5-French-MixedSpeakers-reduced   # French fine‑tune (HF repo ID or built‑in name)
   f5tts_nfe_step: 32                    # ODE steps: 16 = fast draft, 32 = high quality
   f5tts_cfg_strength: 2.0               # CFG: higher = more faithful to reference voice
   stretcher: rubberband
@@ -176,6 +185,11 @@ subtitles:
   min_duration: 0.833
   max_duration: 7.0
 ```
+
+The timing/quality stack (`budget_cps`, `max_stretch`, compression, the Whisper anti‑hallucination
+thresholds, F5‑TTS internals) is tuned as one coherent system — validated by the per‑run metrics in
+`{output}/_dubbing_metrics_runs.csv` (watch `synthesis_pct_unfit`; under ~5% means a healthy run).
+Change those together and re‑measure, not one at a time.
 
 ---
 
@@ -218,7 +232,9 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mi
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Only `SPEAKER_00` on a multi‑speaker clip | `min_speakers: 1` | Set `diarization.min_speakers: 2`; confirm HF token accepted the [model license](https://huggingface.co/pyannote/speaker-diarization-community-1) |
+| Only `SPEAKER_00` on a multi‑speaker clip | `min_speakers: 1` | Submit with the exact speaker count (Speakers field / `--speakers N`); confirm HF token accepted the [model license](https://huggingface.co/pyannote/speaker-diarization-community-1) |
+| Solo presenter split into two alternating voices | Forced `min_speakers: 2` on a one‑person video | Submit with Speakers = 1 (`--speakers 1`) — skips diarization entirely |
+| One speaker's lines lag / sound stretched | Slow or pause‑heavy voice reference (log shows `cloned voice speaks at N chars/s` warning) | Usually auto‑corrected by pause‑condensing + pace calibration; if it persists, pick a denser reference range for that speaker in the review UI |
 | Ollama `Read timed out` | First‑batch cold load | Already at 600 s + `keep_alive: 30m`; check `ollama ps` and warm with `ollama run mistral-small:22b ""` |
 | `TRANSLATION FAILURE: N/N segments still in English` | Ollama unreachable or wrong model name | `ollama list`; `ollama pull mistral-small:22b` |
 | A few words sound English in the dub | Rare stochastic LLM echo | The English‑echo guard re‑translates these automatically; check the log for "Re‑translating … Recovered" |

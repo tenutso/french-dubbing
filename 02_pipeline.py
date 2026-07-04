@@ -5082,6 +5082,13 @@ def process_video_phase2(
     help="Boost output loudness by this percent (e.g. 20 → +20%). 0 = off.",
 )
 @click.option(
+    "--speakers",
+    type=click.IntRange(1, 20),
+    default=None,
+    help="Exact speaker count for this video (overrides diarization.min/max). "
+         "1 = solo presenter: skips diarization and uses a single voice clone.",
+)
+@click.option(
     "--keep-temp",
     is_flag=True,
     default=False,
@@ -5106,6 +5113,7 @@ def main(
     force: bool,
     locale: Optional[str],
     volume_boost: Optional[float],
+    speakers: Optional[int],
     keep_temp: bool,
     phase: Optional[str],
     segments_file: Optional[str],
@@ -5128,6 +5136,15 @@ def main(
         config.locale = locale.lower()
     if volume_boost is not None:
         config.output_volume_boost_pct = float(volume_boost)
+    if speakers is not None:
+        if speakers == 1:
+            # Solo presenter — diarization adds nothing and a forced
+            # min_speakers > 1 would split one person across two profiles.
+            config.use_diarization = False
+        else:
+            config.use_diarization = True
+            config.diarization_min_speakers = speakers
+            config.diarization_max_speakers = speakers
     if keep_temp:
         config.keep_temp = True
     log = setup_logging(config.logs_folder, Path(video).stem)

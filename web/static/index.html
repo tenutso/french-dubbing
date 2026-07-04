@@ -43,6 +43,11 @@
         <label>Locale
           <select id="locale" name="locale"></select>
         </label>
+        <label>Speakers
+          <input type="number" id="speakers" name="speakers"
+                 min="1" max="20" step="1" placeholder="auto"
+                 title="Exact number of people speaking in this video. 1 = solo presenter (skips diarization). Blank = auto-detect using config defaults.">
+        </label>
         <label>Volume boost (%)
           <input type="number" id="volume_boost" name="volume_boost"
                  min="-50" max="100" step="1" value="0">
@@ -74,7 +79,6 @@
         <code>french-dubbing/</code>. Changes apply to the <em>next</em> queued
         job; running jobs are unaffected.
       </div>
-      <div id="advanced-presets"></div>
       <div id="advanced-fields"></div>
       <div class="actions">
         <button type="button" id="config-save">Save changes</button>

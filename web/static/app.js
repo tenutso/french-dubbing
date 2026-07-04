@@ -126,6 +126,7 @@ $("#submit-form").addEventListener("submit", e => {
   else if (mode === "path") fd.append("local_path", pathInput.value.trim());
   else fd.append("video", fileInput.files[0]);
   fd.append("locale", $("#locale").value);
+  fd.append("speakers", $("#speakers").value);
   fd.append("volume_boost", $("#volume_boost").value);
   if ($("#force").checked) fd.append("force", "on");
   if ($("#review").checked) fd.append("review", "on");
@@ -244,6 +245,7 @@ function renderCard(job) {
   const meta = [];
   const o = job.options || {};
   if (o.locale) meta.push(o.locale);
+  if (o.speakers) meta.push(`${o.speakers} spk`);
   if (o.volume_boost != null) meta.push(`+${o.volume_boost}%`);
   if (o.force) meta.push("force");
   const dur = job.ended_at ? (job.ended_at - job.started_at)
@@ -395,7 +397,6 @@ function appendLog(jobId, line) {
 let configSchema = [];
 let configValues = {};   // server-side current values (baseline for "dirty" + revert)
 let configDirty = {};    // path -> value (pending changes)
-let configPresets = [];
 
 async function loadConfig() {
   try {
@@ -404,58 +405,13 @@ async function loadConfig() {
     const data = await r.json();
     configSchema = data.schema || [];
     configValues = data.values || {};
-    configPresets = data.presets || [];
     configDirty = {};
     $("#config-path").textContent = data.path || "config.yaml";
-    renderPresets();
     renderConfigFields();
     updateAdvancedSummary();
   } catch (e) {
     $("#config-status").textContent = "failed to load config: " + e;
   }
-}
-
-function renderPresets() {
-  const root = $("#advanced-presets");
-  root.innerHTML = "";
-  if (!configPresets.length) return;
-  const label = document.createElement("div");
-  label.className = "cfg-presets-label muted";
-  label.textContent = "Presets — click to stage changes (review below, then Save):";
-  root.appendChild(label);
-  const row = document.createElement("div");
-  row.className = "cfg-presets-row";
-  for (const p of configPresets) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "cfg-preset";
-    btn.innerHTML = `<strong>${p.label}</strong><span class="muted">${p.desc}</span>`;
-    btn.addEventListener("click", () => applyPreset(p));
-    row.appendChild(btn);
-  }
-  root.appendChild(row);
-}
-
-function applyPreset(p) {
-  let staged = 0;
-  for (const [path, val] of Object.entries(p.values || {})) {
-    const baseline = configValues[path];
-    const same = typeof val === "boolean"
-      ? Boolean(baseline) === Boolean(val)
-      : String(baseline ?? "") === String(val ?? "");
-    if (same) {
-      delete configDirty[path];
-    } else {
-      configDirty[path] = val;
-      staged++;
-    }
-  }
-  // Re-render to reflect dirty state on inputs
-  renderConfigFields();
-  updateAdvancedSummary();
-  $("#config-status").textContent = staged
-    ? `preset "${p.label}" staged (${staged} change${staged === 1 ? "" : "s"})`
-    : `preset "${p.label}" matches current config`;
 }
 
 function renderConfigFields() {

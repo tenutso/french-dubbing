@@ -67,50 +67,33 @@ LOCALE_CHOICES = ["fr", "fr-ca"]
 # UI hints: {"min", "max", "step", "choices", "group"}.
 # Only paths declared here are writable via /api/config; everything else in
 # config.yaml is preserved verbatim on save.
+#
+# Deliberately small: only settings that genuinely vary per video/client are
+# exposed. The timing stack (budget_cps / max_stretch / compression / timing
+# policy), the Whisper anti-hallucination thresholds, and the voice-clone
+# internals are tuned as one coherent system — changing one alone breaks the
+# balance, so they live in config.yaml only.
 CONFIG_SCHEMA: dict = {
     # Audio
-    "audio.volume_boost_pct":          ("int",   "Volume boost (%)",        "0 = off. Applied after peak normalization; hard-clipped at ±1.0.", {"min": -50, "max": 100, "step": 1, "group": "Audio"}),
+    "audio.volume_boost_pct":          ("int",   "Volume boost (%)",        "0 = off. Shifts the loudness-normalization target by the equivalent dB (true-peak ceiling still holds).", {"min": -50, "max": 100, "step": 1, "group": "Audio"}),
 
     # Diarization
-    "diarization.enabled":             ("bool",  "Enable diarization",      "Detect speakers and clone a distinct voice per speaker.", {"group": "Diarization"}),
-    "diarization.min_speakers":        ("int",   "Min speakers",            "Set min == max to force an exact count.", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
+    "diarization.enabled":             ("bool",  "Enable diarization",      "Detect speakers and clone a distinct voice per speaker. Disable for solo presenters.", {"group": "Diarization"}),
+    "diarization.min_speakers":        ("int",   "Min speakers",            "Set min == max to force an exact count. The Speakers field on the submit form overrides this per job.", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
     "diarization.max_speakers":        ("int",   "Max speakers",            "", {"min": 1, "max": 20, "step": 1, "group": "Diarization"}),
-    "diarization.profile_duration":    ("int",   "Profile duration (s)",    "Seconds of per-speaker audio for voice cloning. Must stay ≤ 15s — F5-TTS breaks above 22s (pipeline hard-caps at 15s).", {"min": 5, "max": 15, "step": 1, "group": "Diarization"}),
 
     # Source separation
-    "source_separation.enabled":            ("bool",  "Enable source separation", "Separate vocals from music before transcription/cloning.", {"group": "Source separation"}),
-    "source_separation.model":              ("str",   "Demucs model",           "", {"choices": ["htdemucs", "htdemucs_ft", "mdx_extra"], "group": "Source separation"}),
     "source_separation.preserve_background":("bool",  "Preserve background",    "Remix original music/ambience under French vocals into *_french_full.m4a.", {"group": "Source separation"}),
 
     # Whisper
-    "whisper.model":                   ("str",   "Whisper model",           "", {"choices": ["large-v3", "large-v2", "medium", "small", "distil-large-v3"], "group": "Whisper"}),
-    "whisper.compute_type":            ("str",   "Compute type",            "", {"choices": ["float16", "int8_float16", "int8", "float32"], "group": "Whisper"}),
     "whisper.language":                ("str",   "Source language",         "ISO code of the spoken language (en, fr, …). Empty = auto-detect per file — use for bilingual sources.", {"group": "Whisper"}),
     "whisper.initial_prompt":          ("str",   "Vocabulary hint",         "Optional comma-separated proper nouns/acronyms (e.g. \"CAPS, CSP, keynote\"). Avoid full sentences — they get echoed into the transcript over silence.", {"group": "Whisper"}),
-    "whisper.condition_on_previous_text": ("bool", "Condition on prev text", "Off = strongest anti-hallucination posture; Whisper won't feed its own (possibly looped) output back as context.", {"group": "Whisper"}),
-    "whisper.compression_ratio_threshold": ("float", "Compression-ratio max", "Reject segments above this ratio (a classic loop signature). Lower = more aggressive. fw default 2.4.", {"min": 1.5, "max": 4.0, "step": 0.05, "group": "Whisper"}),
-    "whisper.no_speech_threshold":     ("float", "No-speech threshold",     "Drop windows whose no-speech probability exceeds this.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "Whisper"}),
 
     # Translation
     "translation.model":               ("str",   "Translation model",       "Ollama tag (e.g. mistral-small:22b, qwen3:14b).", {"group": "Translation"}),
-    "translation.temperature":         ("float", "Temperature",             "Lower = more literal, higher = more creative.", {"min": 0.0, "max": 1.5, "step": 0.05, "group": "Translation"}),
-    "translation.batch_size":          ("int",   "Batch size",              "Segments per Ollama call. Big batches risk the 4096-token output budget.", {"min": 1, "max": 60, "step": 1, "group": "Translation"}),
-    "translation.review_pass":         ("bool",  "Self-review pass",        "The LLM rereads its output and fixes Anglicisms. Roughly doubles translation time.", {"group": "Translation"}),
-    "translation.compression_pass":    ("bool",  "Compression fallback",    "Targeted second LLM pass that only rewrites segments still over budget after the main translation. Cheap and eliminates most remaining speed-ups.", {"group": "Translation"}),
-    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to the translator. ~15 keeps French tight enough to fit the source timeline; raise for more headroom (reintroduces drift), lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
-    "translation.compression_rounds":  ("int",   "Compression rounds",      "Max iterative passes that re-compress only the segments still over budget. More rounds = tighter timing fit, slightly more LLM calls.", {"min": 1, "max": 6, "step": 1, "group": "Translation"}),
+    "translation.review_pass":         ("bool",  "Self-review pass",        "The LLM rereads its output and fixes Anglicisms. Roughly doubles translation time — use for premium deliverables.", {"group": "Translation"}),
     "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
     "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
-
-    # TTS
-    "tts.timing_policy":               ("str",   "Timing policy",           "anchored holds the source timeline (speed dense runs up, re-anchor drift at pauses) so the dub stays in sync over a full program. no_drop never speeds up and drifts longer than the video. lock truncates overflow.", {"choices": ["anchored", "no_drop", "lock"], "group": "TTS"}),
-    "tts.f5tts_nfe_step":              ("int",   "F5-TTS ODE steps",        "More steps = better quality, slower. 16 = fast draft, 32 = high quality, 64 = max.", {"min": 8, "max": 64, "step": 4, "group": "TTS"}),
-    "tts.f5tts_cfg_strength":          ("float", "CFG strength",             "Classifier-free guidance. Higher = more faithful to reference voice.", {"min": 0.5, "max": 5.0, "step": 0.25, "group": "TTS"}),
-    "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning (single-speaker mode). Must stay ≤ 15s.", {"min": 5, "max": 15, "step": 1, "group": "TTS"}),
-    "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
-    "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
-    "tts.stretcher":                   ("str",   "Time-stretch engine",     "rubberband preserves formants; atempo is the ffmpeg fallback.", {"choices": ["rubberband", "atempo"], "group": "TTS"}),
-    "tts.cps_split_threshold":         ("float", "CPS split threshold",     "Translated segments above this French CPS get split at a sentence boundary before TTS. Shorter halves stretch independently. 0 disables.", {"min": 0.0, "max": 40.0, "step": 0.5, "group": "TTS"}),
 
     # Subtitles
     "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
@@ -118,75 +101,6 @@ CONFIG_SCHEMA: dict = {
     # Output
     "output.mux_video":                ("bool",  "Mux final video",         "Also emit {name}_french.mp4 (original video + dubbed audio + subtitles). Audio is held to the source length so they end together.", {"group": "Output"}),
     "output.burn_subs":                ("bool",  "Burn-in subtitles",       "On = render subtitles into the picture (re-encodes video). Off = soft-embed the SRT track and copy the video stream.", {"group": "Output"}),
-}
-
-
-# Curated presets. Each value must also be a valid value per CONFIG_SCHEMA;
-# the PUT validator catches drift if someone edits a preset wrong.
-CONFIG_PRESETS: dict[str, dict] = {
-    "fast_draft": {
-        "label": "Fast draft",
-        "desc": "Quickest turnaround; lower fidelity. Skip diarization, smaller whisper, no review/compression pass.",
-        "values": {
-            "whisper.model": "distil-large-v3",
-            "whisper.compute_type": "int8_float16",
-            "whisper.condition_on_previous_text": False,
-            "whisper.compression_ratio_threshold": 2.4,  # less aggressive — speed over accuracy
-            "diarization.enabled": False,
-            "source_separation.enabled": True,
-            "source_separation.model": "mdx_extra",
-            "translation.review_pass": False,
-            "translation.compression_pass": False,        # skip the extra Qwen call
-            "translation.batch_size": 30,
-            "translation.budget_cps": 19,                 # accept slightly longer FR
-            "tts.use_deepfilter": False,
-            "tts.stretcher": "atempo",
-            "tts.cps_split_threshold": 24.0,              # less aggressive splitting
-        },
-    },
-    "high_quality": {
-        "label": "High quality",
-        "desc": "Best fidelity end-to-end. Strong anti-hallucination, review + compression passes, rubberband stretcher.",
-        "values": {
-            "whisper.model": "large-v3",
-            "whisper.compute_type": "float16",
-            "whisper.condition_on_previous_text": False,
-            "whisper.compression_ratio_threshold": 2.0,   # aggressive loop rejection
-            "whisper.no_speech_threshold": 0.6,
-            "diarization.enabled": True,
-            "source_separation.enabled": True,
-            "source_separation.model": "htdemucs",
-            "source_separation.preserve_background": True,
-            "translation.review_pass": True,
-            "translation.compression_pass": True,         # squeeze out remaining overflows
-            "translation.compression_rounds": 3,          # iterate until segments fit
-            "translation.batch_size": 15,
-            "translation.temperature": 0.25,
-            "translation.budget_cps": 15,                 # tight FR → fits the source timeline
-            "tts.use_deepfilter": True,
-            "tts.timing_policy": "anchored",              # hold sync over long programs
-            "tts.stretcher": "rubberband",
-            "tts.max_stretch": 1.3,
-            "tts.cps_split_threshold": 20.0,              # tighter split threshold
-        },
-    },
-    "voice_clone_focus": {
-        "label": "Voice-cloning focus",
-        "desc": "Optimise speaker fidelity: long reference clip, denoise, tight stretch limits, aggressive compression.",
-        "values": {
-            "diarization.enabled": True,
-            "diarization.profile_duration": 15,
-            "translation.compression_pass": True,         # short utterances clone better
-            "translation.budget_cps": 16,
-            "tts.speaker_profile_duration": 15,
-            "tts.use_deepfilter": True,
-            "tts.f5tts_nfe_step": 32,
-            "tts.f5tts_cfg_strength": 2.5,                # stronger reference adherence
-            "tts.max_stretch": 1.2,
-            "tts.stretcher": "rubberband",
-            "tts.cps_split_threshold": 19.0,
-        },
-    },
 }
 
 
@@ -392,6 +306,8 @@ async def _run_job(job: Job) -> None:
             cmd += ["--locale", opts["locale"]]
         if opts.get("volume_boost") not in (None, ""):
             cmd += ["--volume-boost", str(opts["volume_boost"])]
+        if opts.get("speakers"):
+            cmd += ["--speakers", str(opts["speakers"])]
         if _is_phase1:
             cmd += ["--phase", "1"]
         elif _is_phase2:
@@ -660,14 +576,10 @@ async def get_config() -> JSONResponse:
         {"path": p, "type": t, "label": label, "help": help_, **hints}
         for p, (t, label, help_, hints) in CONFIG_SCHEMA.items()
     ]
-    presets_out = [
-        {"id": pid, "label": p["label"], "desc": p["desc"], "values": p["values"]}
-        for pid, p in CONFIG_PRESETS.items()
-    ]
     return JSONResponse({
         "values": values,
         "schema": schema_out,
-        "presets": presets_out,
+        "presets": [],   # presets removed — defaults are the tuned configuration
         "path": str(CONFIG_PATH),
         "job_running": state.current_job_id is not None,
     })
@@ -866,6 +778,7 @@ async def submit(
     local_path: str = Form(""),
     locale: str = Form(""),
     volume_boost: str = Form(""),
+    speakers: str = Form(""),
     force: str = Form(""),
     review: str = Form(""),
 ) -> JSONResponse:
@@ -878,6 +791,14 @@ async def submit(
             vb = float(volume_boost)
         except ValueError:
             raise HTTPException(400, "volume_boost must be a number")
+    spk: Optional[int] = None
+    if speakers.strip():
+        try:
+            spk = int(speakers)
+        except ValueError:
+            raise HTTPException(400, "speakers must be a whole number")
+        if not 1 <= spk <= 20:
+            raise HTTPException(400, "speakers must be between 1 and 20")
 
     # Exactly one source: a browser upload, a Vimeo URL, or a path to a file
     # already on the pod. The on-pod path bypasses the browser/proxy upload
@@ -898,6 +819,7 @@ async def submit(
     options = {
         "locale": locale or None,
         "volume_boost": vb,
+        "speakers": spk,
         "force": force.lower() in ("1", "true", "on", "yes"),
         "review": review.lower() in ("1", "true", "on", "yes"),
     }

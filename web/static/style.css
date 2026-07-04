@@ -287,29 +287,6 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
   font-family: var(--mono);
   font-size: 11px;
 }
-.cfg-presets-label { margin: 4px 0 6px; }
-.cfg-presets-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.cfg-preset {
-  background: var(--panel-2);
-  border: 1px solid var(--border);
-  color: var(--text);
-  text-align: left;
-  padding: 8px 12px;
-  border-radius: 4px;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  cursor: pointer;
-  font: inherit;
-}
-.cfg-preset:hover { border-color: var(--accent); }
-.cfg-preset strong { font-size: 13px; }
-.cfg-preset .muted { font-size: 11px; line-height: 1.35; }
 .cfg-group { margin-top: 14px; }
 .cfg-group h3 {
   font-size: 12px;

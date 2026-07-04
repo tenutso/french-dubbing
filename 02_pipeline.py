@@ -26,7 +26,6 @@ import shutil
 import subprocess
 import sys
 import types
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -101,6 +100,13 @@ class PipelineConfig:
     whisper_model: str = "large-v3"
     whisper_device: str = "cuda"
     whisper_compute_type: str = "float16"
+    # Source language ("en", "fr", …). Empty = auto-detect per file — use for
+    # bilingual sources so French passages aren't forced through English decoding.
+    whisper_language: str = "en"
+    # Optional domain-vocabulary prompt (proper nouns, acronyms). Empty = none.
+    # Full sentences here get echoed into the transcript over silence/music —
+    # keep it to a comma-separated term list if used at all.
+    whisper_initial_prompt: str = ""
     # Anti-hallucination tuning (faster-whisper / CT2)
     whisper_condition_on_previous_text: bool = False
     whisper_compression_ratio_threshold: float = 2.2
@@ -146,7 +152,6 @@ class PipelineConfig:
     # In "anchored" mode tts_max_stretch is the per-group *speed-up* cap used to
     # keep the dub inside the source timeline (1.30 ≈ inaudible on speech).
     tts_max_stretch: float = 1.3
-    tts_min_stretch: float = 0.8
     # Timing policy when a group's dub can't fit its time window:
     #   "anchored" → hold the source timeline: speed dense groups up (≤ max_stretch)
     #                and re-anchor drift at each pause, so audio length ≈ source.
@@ -290,6 +295,8 @@ def load_config(path: str) -> PipelineConfig:
         whisper_model=w.get("model", "large-v3"),
         whisper_device=w.get("device", "cuda"),
         whisper_compute_type=w.get("compute_type", "float16"),
+        whisper_language=str(w.get("language", "en") or ""),
+        whisper_initial_prompt=str(w.get("initial_prompt", "") or ""),
         whisper_condition_on_previous_text=bool(w.get("condition_on_previous_text", False)),
         whisper_compression_ratio_threshold=float(w.get("compression_ratio_threshold", 2.2)),
         whisper_no_speech_threshold=float(w.get("no_speech_threshold", 0.6)),
@@ -319,7 +326,6 @@ def load_config(path: str) -> PipelineConfig:
         f5tts_cfg_strength=float(tts.get("f5tts_cfg_strength", 2.0)),
         f5tts_speed=float(tts.get("f5tts_speed", 1.0)),
         tts_max_stretch=tts.get("max_stretch", 1.3),
-        tts_min_stretch=tts.get("min_stretch", 0.8),
         tts_group_gap=tts.get("group_gap", 0.4),
         tts_stretcher=tts.get("stretcher", "rubberband"),
         timing_policy=tts.get("timing_policy", "anchored"),
@@ -621,6 +627,10 @@ def extract_audio(
 
 
 def get_duration(video_path: str, log: logging.Logger) -> float:
+    """Source duration in seconds, or 0.0 on failure.
+
+    Callers must treat 0.0 as fatal: the anchored timing policy fits the whole
+    dub to this value, so a guessed duration silently corrupts the output."""
     try:
         r = subprocess.run(
             [
@@ -633,8 +643,8 @@ def get_duration(video_path: str, log: logging.Logger) -> float:
         )
         return float(r.stdout.strip())
     except Exception as e:
-        log.warning(f"Could not read duration ({e}), defaulting to 3600 s")
-        return 3600.0
+        log.error(f"Could not read source duration ({e})")
+        return 0.0
 
 
 # ============================================================================
@@ -652,6 +662,8 @@ def transcribe_audio(
     compression_ratio_threshold: float = 2.2,
     no_speech_threshold: float = 0.6,
     log_prob_threshold: float = -1.0,
+    language: str = "en",
+    initial_prompt: str = "",
 ) -> Optional[List[dict]]:
     log.info(f"Loading faster-whisper {model_name} [{compute_type}] …")
     try:
@@ -670,9 +682,12 @@ def transcribe_audio(
         #     compressible (a classic loop signature: "X. X. X.").
         #   no_speech_threshold=0.6           → drop silent windows VAD missed.
         #   log_prob_threshold=-1.0           → keep default, but explicit.
+        # language="" → auto-detect (bilingual sources); initial_prompt is a
+        # hallucination seed on silence/music, so it defaults to empty and
+        # should only ever carry domain vocabulary, never full sentences.
         segments_gen, info = model.transcribe(
             wav_path,
-            language="en",
+            language=language or None,
             beam_size=5,
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 300},
@@ -681,7 +696,7 @@ def transcribe_audio(
             compression_ratio_threshold=compression_ratio_threshold,
             no_speech_threshold=no_speech_threshold,
             log_prob_threshold=log_prob_threshold,
-            initial_prompt="Hello. Welcome to this video. Today we will discuss several important topics.",
+            initial_prompt=initial_prompt or None,
         )
         segments = [
             {
@@ -906,14 +921,20 @@ def merge_segments(
     Strategy:
       - Keep merging across pauses ≤ max_gap until either max_duration is hit
         or we cross min_duration AND hit a sentence-ending punctuation.
+      - Never merge across a speaker change (segments carry a "speaker" key
+        when diarization ran) — a chunk spanning two speakers would be dubbed
+        entirely in one cloned voice.
       - Never emit a chunk shorter than min_duration: force-merge tiny chunks
-        with their previous neighbour as a final sweep.
+        with their previous neighbour as a final sweep (same-speaker only).
 
     This eliminates the sub-second fragments that broke SRT timing in v3 and
     gives the TTS enough context per call for natural prosody.
     """
     if not segments:
         return segments
+
+    def _same_speaker(a: dict, b: dict) -> bool:
+        return a.get("speaker") == b.get("speaker")
 
     merged: List[dict] = []
     current = dict(segments[0])
@@ -924,11 +945,12 @@ def merge_segments(
         current_dur  = current["end"] - current["start"]
         ends_sent    = bool(re.search(r"[.!?]\s*$", current["text"].rstrip()))
 
-        # Merge if gap small enough, combined stays under cap, AND
+        # Merge if gap small enough, combined stays under cap, same speaker, AND
         # either we haven't reached min_duration or the last clause didn't end.
         should_merge = (
             gap <= max_gap
             and combined_dur <= max_duration
+            and _same_speaker(current, seg)
             and (current_dur < min_duration or not ends_sent)
         )
         if should_merge:
@@ -948,7 +970,8 @@ def merge_segments(
         for chunk in merged[1:]:
             dur = chunk["end"] - chunk["start"]
             prev_dur = cleaned[-1]["end"] - cleaned[-1]["start"]
-            if dur < min_duration and (prev_dur + dur) <= max_duration * 1.25:
+            if (dur < min_duration and (prev_dur + dur) <= max_duration * 1.25
+                    and _same_speaker(cleaned[-1], chunk)):
                 cleaned[-1]["end"]  = chunk["end"]
                 cleaned[-1]["text"] = cleaned[-1]["text"].rstrip() + " " + chunk["text"].lstrip()
                 if chunk.get("words"):
@@ -1525,6 +1548,8 @@ should stay reasonably close to N — do not compress far below it.
 
 Output ONLY the numbered rewrites, one per line, preserving the original numbering. No explanations or notes.
 
+{glossary_section}
+
 {language} segments:
 {segments}"""
 
@@ -1537,6 +1562,7 @@ def compress_overflowing_translations(
     target_lang: str = "fr",
     margin: float = 1.05,
     rounds: int = 3,
+    glossary_section: str = "",
 ) -> List[dict]:
     """Iterative Qwen pass that only touches segments still over budget.
 
@@ -1620,7 +1646,9 @@ def compress_overflowing_translations(
                 f"{i + 1}. [≤{b} chars] {out[idx].get('text_fr','')}"
                 for i, (idx, b) in enumerate(chunk)
             )
-            prompt = think_prefix + _COMPRESS_PROMPT.format(language=language, segments=numbered)
+            prompt = think_prefix + _COMPRESS_PROMPT.format(
+                language=language, segments=numbered, glossary_section=glossary_section,
+            )
             response = _ollama_call(prompt, model, temperature, log)
             if not response:
                 continue
@@ -1879,6 +1907,14 @@ def _scan_and_fix_hallucinations(
     return segments
 
 
+# Explicit context window for every Ollama call. Ollama's default (2048-4096
+# depending on version) silently truncates the FRONT of longer prompts — i.e.
+# the instruction block and glossary — which looks exactly like "the model
+# ignored the brief". 8192 covers the translate prompt + glossary + a
+# 20-segment batch + the 4096-token output budget with room to spare.
+_OLLAMA_NUM_CTX = 8192
+
+
 def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logger) -> Optional[str]:
     # keep_alive=30m pins the model in VRAM between batches.
     try:
@@ -1889,7 +1925,11 @@ def _ollama_call(prompt: str, model: str, temperature: float, log: logging.Logge
                 "prompt": prompt,
                 "stream": False,
                 "keep_alive": "30m",
-                "options": {"temperature": temperature, "num_predict": 4096},
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": 4096,
+                    "num_ctx": _OLLAMA_NUM_CTX,
+                },
             },
             timeout=(15, 600),
         )
@@ -2091,17 +2131,12 @@ def translate_segments(
                     translations[i] = single[0]
         return translations
 
-    # Parallel processing of batches
+    # Sequential batches: Ollama serializes requests to a single loaded model
+    # anyway (OLLAMA_NUM_PARALLEL=1 default), so a thread pool adds queueing
+    # and read-timeout risk without throughput.
     all_translations = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        results = list(tqdm(
-            executor.map(_process_batch, batches),
-            total=len(batches),
-            desc=f"Translating ({target_lang})",
-            leave=False
-        ))
-        for batch_translations in results:
-            all_translations.extend(batch_translations)
+    for batch in tqdm(batches, desc=f"Translating ({target_lang})", leave=False):
+        all_translations.extend(_process_batch(batch))
 
     for i, text in enumerate(all_translations):
         text = text or out[i]["text"]
@@ -2394,6 +2429,31 @@ def resolve_speaker_references(
 
 def _seg_text(seg: dict) -> str:
     return (seg.get("text_fr") or seg.get("text") or "").strip()
+
+
+# Inclusive-writing doublets ("conférencier·ère", "professionnel·les") are a
+# written-only convention — there is no way to pronounce the median dot, and
+# F5-TTS garbles or hallucinates around it. The subtitles keep the inclusive
+# form; only the text sent to the TTS is collapsed to the base (masculine)
+# form, re-pluralised when the suffix carried the plural "s".
+# Covers U+00B7 (median dot), U+2027 (hyphenation point), U+2022 (bullet).
+_INCLUSIVE_DOT_RE = re.compile(
+    r"([A-Za-zÀ-ÿ]+)[··‧•]((?:[A-Za-zÀ-ÿ]+[··‧•]?)+)"
+)
+# Written-only symbols the TTS should never see (guillemets read as noise).
+_TTS_STRIP_CHARS = str.maketrans({"«": "", "»": "", "“": "", "”": ""})
+
+
+def _tts_spoken_form(text: str) -> str:
+    """Rewrite written-only conventions into something the TTS can pronounce."""
+    def _collapse(m: "re.Match") -> str:
+        base, suffix = m.group(1), m.group(2)
+        plural = suffix.rstrip("··‧•").endswith("s") and not base.endswith(("s", "x"))
+        return base + ("s" if plural else "")
+
+    text = _INCLUSIVE_DOT_RE.sub(_collapse, text)
+    text = text.translate(_TTS_STRIP_CHARS)
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 
 # F5-TTS does not have XTTS's hard token cap, but very long single-call inputs
@@ -2690,7 +2750,7 @@ def synthesize_all_segments(
     synthesized: List[Tuple[np.ndarray, float, float]] = []
     with tqdm(total=len(segments), desc="Synthesizing (F5-TTS)") as pbar:
         for seg in segments:
-            text = _seg_text(seg)
+            text = _tts_spoken_form(_seg_text(seg))
             if not text:
                 pbar.update(1)
                 continue
@@ -2729,6 +2789,24 @@ def synthesize_all_segments(
 _CROSSFADE_MS = 120.0
 _FADE_OUT_MS  = 100.0
 _FADE_IN_MS   = 30.0
+
+# Loudness target for delivered audio (EBU R128 single-pass loudnorm).
+# -16 LUFS integrated / -1.5 dBTP is the common online-video delivery target;
+# consistent run-to-run, unlike peak normalization which depends on the single
+# loudest sample. volume_boost_pct shifts the integrated target instead of
+# post-gain so the true-peak ceiling still holds (no clipping).
+_LOUDNORM_I   = -16.0
+_LOUDNORM_TP  = -1.5
+_LOUDNORM_LRA = 11.0
+
+
+def _loudnorm_af(volume_boost_pct: float = 0.0) -> str:
+    import math
+    target_i = _LOUDNORM_I
+    if volume_boost_pct:
+        target_i += 20.0 * math.log10(1.0 + max(volume_boost_pct, -99.0) / 100.0)
+    target_i = min(max(target_i, -30.0), -8.0)
+    return f"loudnorm=I={target_i:.1f}:TP={_LOUDNORM_TP}:LRA={_LOUDNORM_LRA}"
 
 
 def _trim_silence(audio: np.ndarray, top_db: int = 30) -> np.ndarray:
@@ -2850,7 +2928,6 @@ def assemble_and_encode(
     src_rate: int,
     out_rate: int,
     max_stretch: float,
-    min_stretch: float,
     temp_dir: str,
     log: logging.Logger,
     volume_boost_pct: float = 0.0,
@@ -3101,21 +3178,21 @@ def assemble_and_encode(
     if len(nz):
         assembled = assembled[: min(len(assembled), int(nz[-1] + 0.2 * src_rate))]
 
+    # Keep the interim WAV peak-safe (it also feeds the background remix);
+    # delivery loudness is handled by loudnorm at encode time.
     peak = np.max(np.abs(assembled))
     if peak > 0:
         assembled *= 0.95 / peak
-    if volume_boost_pct:
-        gain = 1.0 + volume_boost_pct / 100.0
-        assembled = np.clip(assembled * gain, -1.0, 1.0)
-        log.info(f"  Applied {volume_boost_pct:+.0f}% volume boost (gain {gain:.2f}×)")
 
     sf.write(wav_path, assembled, src_rate)
     log.info(f"✓ WAV assembled: {os.path.getsize(wav_path) / 1e6:.1f} MB")
 
+    loudnorm = _loudnorm_af(volume_boost_pct)
     try:
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", wav_path,
+                "-af", loudnorm,
                 "-ar", str(out_rate), "-ac", "2",
                 "-c:a", "aac", "-b:a", "192k",
                 aac_path,
@@ -3124,7 +3201,7 @@ def assemble_and_encode(
         )
         log.info(
             f"✓ AAC encoded: {os.path.getsize(aac_path) / 1e6:.1f} MB "
-            f"@ 192 kbps {out_rate} Hz stereo"
+            f"@ 192 kbps {out_rate} Hz stereo ({loudnorm})"
         )
         return True
     except Exception as e:
@@ -3152,11 +3229,15 @@ def remix_with_background(
     #   threshold: level above which compression starts (0.1)
     #   ratio: how much to reduce bg (20:1)
     #   attack/release: timing of ducking (15ms / 400ms)
+    # amix normalize=0: without it amix scales each input by 1/n, dropping the
+    # French voice ~6 dB below the voice-only track. The final loudnorm both
+    # sets delivery loudness and true-peak-limits the un-normalized sum.
     filt = (
         f"[0:a]highpass=f=80,compand,volume={voice_gain:.3f},asplit=2[v_f][v_s];"
         f"[1:a]volume={bg_gain_db}dB[bg_pre];"
         "[bg_pre][v_s]sidechaincompress=threshold=0.08:ratio=12:attack=15:release=400[bg_ducked];"
-        "[v_f][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0[out]"
+        "[v_f][bg_ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[mix];"
+        f"[mix]{_loudnorm_af(volume_boost_pct)}[out]"
     )
     try:
         subprocess.run(
@@ -3194,6 +3275,8 @@ def mux_final_video(
     is rendered into the picture (video is re-encoded); otherwise it is
     soft-embedded as a selectable ``mov_text`` track and the video is copied.
     """
+    # The dubbed audio is already AAC (m4a) — stream-copy it instead of paying
+    # a second lossy encode generation.
     if burn_subs:
         # Escape the SRT path for the subtitles filter (\, :, ' are special).
         esc = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
@@ -3202,7 +3285,7 @@ def mux_final_video(
             "-vf", f"subtitles='{esc}'",
             "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k", "-shortest", output_path,
+            "-c:a", "copy", "-shortest", output_path,
         ]
     else:
         # No -shortest here: a soft subtitle track whose last cue ends before the
@@ -3212,7 +3295,7 @@ def mux_final_video(
         cmd = [
             "ffmpeg", "-y", "-i", video_path, "-i", audio_path, "-i", srt_path,
             "-map", "0:v:0", "-map", "1:a:0", "-map", "2:0",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-c:v", "copy", "-c:a", "copy",
             "-c:s", "mov_text", "-metadata:s:s:0", "language=fra",
             output_path,
         ]
@@ -3961,6 +4044,9 @@ def process_video(
         )
 
     total_duration = get_duration(video_path, log)
+    if total_duration <= 0:
+        log.error("Source duration unreadable — aborting (anchored timing needs it)")
+        return False
 
     # ── 1. Source separation ────────────────────────────────────────────────
     vocals_wav:    Optional[str] = None
@@ -3992,6 +4078,8 @@ def process_video(
         compression_ratio_threshold=config.whisper_compression_ratio_threshold,
         no_speech_threshold=config.whisper_no_speech_threshold,
         log_prob_threshold=config.whisper_log_prob_threshold,
+        language=config.whisper_language,
+        initial_prompt=config.whisper_initial_prompt,
     )
     if not segments:
         return False
@@ -4010,21 +4098,9 @@ def process_video(
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "02b_loop_collapsed", log)
 
-    segments = merge_segments(
-        segments,
-        max_gap=config.segment_merge_gap,
-        max_duration=config.segment_merge_max_duration,
-        min_duration=config.segment_merge_min_duration,
-        log=log,
-    )
-
-    if config.keep_temp:
-        _dump_segments(segments, temp_dir, "03_merged", log)
-
-    # Source baseline (English only) — the timeline the French must fit.
-    metrics.snapshot("merged_source", segments)
-
-    # Optional diarization.
+    # Diarize BEFORE merging so speaker changes become merge boundaries —
+    # a merged chunk must never span two speakers, or the whole chunk gets
+    # dubbed in one cloned voice.
     diarization_turns: Optional[List[Tuple[float, float, str]]] = None
     if config.use_diarization:
         log.info("\n[2b/6] SPEAKER DIARIZATION (pyannote.audio)")
@@ -4045,11 +4121,25 @@ def process_video(
             for spk, n in sorted(speaker_counts.items()):
                 log.info(f"  {spk}: {n} segment(s)")
             if config.keep_temp:
-                _dump_segments(segments, temp_dir, "04_diarized", log)
+                _dump_segments(segments, temp_dir, "02c_diarized", log)
         else:
             log.warning("  Diarization failed — all segments assigned to SPEAKER_00")
             for seg in segments:
                 seg["speaker"] = "SPEAKER_00"
+
+    segments = merge_segments(
+        segments,
+        max_gap=config.segment_merge_gap,
+        max_duration=config.segment_merge_max_duration,
+        min_duration=config.segment_merge_min_duration,
+        log=log,
+    )
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "03_merged", log)
+
+    # Source baseline (English only) — the timeline the French must fit.
+    metrics.snapshot("merged_source", segments)
 
     # ── 3. Translate ────────────────────────────────────────────────────────
     log.info(f"\n[3/6] TRANSLATING ({config.translation_model} via Ollama)")
@@ -4098,6 +4188,17 @@ def process_video(
             _dump_segments(segments, temp_dir, "06_reviewed", log)
         metrics.snapshot("reviewed", segments)
 
+    # Glossary BEFORE compression: substitutions can lengthen text
+    # (week-end → fin de semaine), so the budget check must measure the
+    # final Québécois forms; the compression prompt carries the glossary
+    # so rewrites don't undo them.
+    if glossary.entries:
+        log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
+        segments = apply_glossary(segments, glossary.entries, log)
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06_glossary", log)
+        metrics.snapshot("glossary", segments)
+
     # Compression fallback: targeted second pass on segments still over budget.
     if config.translation_compression_pass:
         log.info("\n[3d/6] COMPRESSING OVER-BUDGET SEGMENTS")
@@ -4109,17 +4210,11 @@ def process_video(
             budget_cps=config.translation_budget_cps,
             target_lang=config.target_lang,
             rounds=config.translation_compression_rounds,
+            glossary_section=glossary_section,
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06b_compressed", log)
         metrics.snapshot("compressed", segments)
-
-    if glossary.entries:
-        log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
-        segments = apply_glossary(segments, glossary.entries, log)
-        if config.keep_temp:
-            _dump_segments(segments, temp_dir, "07_glossary", log)
-        metrics.snapshot("glossary", segments)
 
     # CPS guard: split segments whose final French text would force the
     # assembler past max_stretch. Splits at sentence boundary; halves
@@ -4190,7 +4285,6 @@ def process_video(
         src_rate=actual_sr,
         out_rate=config.output_sample_rate,
         max_stretch=config.tts_max_stretch,
-        min_stretch=config.tts_min_stretch,
         temp_dir=temp_dir,
         log=log,
         volume_boost_pct=config.output_volume_boost_pct,
@@ -4353,6 +4447,8 @@ def process_video_phase1(
         compression_ratio_threshold=config.whisper_compression_ratio_threshold,
         no_speech_threshold=config.whisper_no_speech_threshold,
         log_prob_threshold=config.whisper_log_prob_threshold,
+        language=config.whisper_language,
+        initial_prompt=config.whisper_initial_prompt,
     )
     if not segments:
         return False
@@ -4371,19 +4467,8 @@ def process_video_phase1(
     if config.keep_temp:
         _dump_segments(segments, temp_dir, "02b_loop_collapsed", log)
 
-    segments = merge_segments(
-        segments,
-        max_gap=config.segment_merge_gap,
-        max_duration=config.segment_merge_max_duration,
-        min_duration=config.segment_merge_min_duration,
-        log=log,
-    )
-
-    if config.keep_temp:
-        _dump_segments(segments, temp_dir, "03_merged", log)
-
-    metrics.snapshot("merged_source", segments)
-
+    # Diarize BEFORE merging — speaker changes are merge boundaries (see
+    # process_video for rationale).
     diarization_turns: Optional[List[Tuple[float, float, str]]] = None
     if config.use_diarization:
         log.info("\n[2b/6] SPEAKER DIARIZATION (pyannote.audio)")
@@ -4404,11 +4489,24 @@ def process_video_phase1(
             for spk, n in sorted(speaker_counts.items()):
                 log.info(f"  {spk}: {n} segment(s)")
             if config.keep_temp:
-                _dump_segments(segments, temp_dir, "04_diarized", log)
+                _dump_segments(segments, temp_dir, "02c_diarized", log)
         else:
             log.warning("  Diarization failed — all segments assigned to SPEAKER_00")
             for seg in segments:
                 seg["speaker"] = "SPEAKER_00"
+
+    segments = merge_segments(
+        segments,
+        max_gap=config.segment_merge_gap,
+        max_duration=config.segment_merge_max_duration,
+        min_duration=config.segment_merge_min_duration,
+        log=log,
+    )
+
+    if config.keep_temp:
+        _dump_segments(segments, temp_dir, "03_merged", log)
+
+    metrics.snapshot("merged_source", segments)
 
     # ── 3. Translate ────────────────────────────────────────────────────────
     log.info(f"\n[3/6] TRANSLATING ({config.translation_model} via Ollama)")
@@ -4457,6 +4555,14 @@ def process_video_phase1(
             _dump_segments(segments, temp_dir, "06_reviewed", log)
         metrics.snapshot("reviewed", segments)
 
+    # Glossary BEFORE compression (see process_video for rationale).
+    if glossary.entries:
+        log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
+        segments = apply_glossary(segments, glossary.entries, log)
+        if config.keep_temp:
+            _dump_segments(segments, temp_dir, "06_glossary", log)
+        metrics.snapshot("glossary", segments)
+
     if config.translation_compression_pass:
         log.info("\n[3d/6] COMPRESSING OVER-BUDGET SEGMENTS")
         segments = compress_overflowing_translations(
@@ -4467,17 +4573,11 @@ def process_video_phase1(
             budget_cps=config.translation_budget_cps,
             target_lang=config.target_lang,
             rounds=config.translation_compression_rounds,
+            glossary_section=glossary_section,
         )
         if config.keep_temp:
             _dump_segments(segments, temp_dir, "06b_compressed", log)
         metrics.snapshot("compressed", segments)
-
-    if glossary.entries:
-        log.info("\n[3c/6] APPLYING GLOSSARY (deterministic substitution)")
-        segments = apply_glossary(segments, glossary.entries, log)
-        if config.keep_temp:
-            _dump_segments(segments, temp_dir, "07_glossary", log)
-        metrics.snapshot("glossary", segments)
 
     if config.cps_split_threshold > 0:
         segments = split_overflowing_segments(
@@ -4569,6 +4669,9 @@ def process_video_phase2(
     log.info(f"  Loaded {len(segments)} segments from {Path(segments_file).name}")
 
     total_duration = get_duration(video_path, log)
+    if total_duration <= 0:
+        log.error("Source duration unreadable — aborting (anchored timing needs it)")
+        return False
 
     # Recover vocals.wav written by Phase 1.
     vocals_wav:    Optional[str] = None
@@ -4653,7 +4756,6 @@ def process_video_phase2(
         src_rate=actual_sr,
         out_rate=config.output_sample_rate,
         max_stretch=config.tts_max_stretch,
-        min_stretch=config.tts_min_stretch,
         temp_dir=temp_dir,
         log=log,
         volume_boost_pct=config.output_volume_boost_pct,

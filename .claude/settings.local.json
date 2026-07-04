@@ -29,7 +29,17 @@
       "Bash(python3 -c \"import sys,json; [print\\(f['name']\\) for f in json.load\\(sys.stdin\\)]\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/configs/F5TTS_v1_Base.yaml\")",
       "Bash(curl -s \"https://raw.githubusercontent.com/SWivid/F5-TTS/main/src/f5_tts/configs/F5TTS_Base.yaml\")",
-      "Bash(curl -s \"https://huggingface.co/RASPIAUDIO/F5-French-MixedSpeakers-reduced/raw/main/README.md\")"
+      "Bash(curl -s \"https://huggingface.co/RASPIAUDIO/F5-French-MixedSpeakers-reduced/raw/main/README.md\")",
+      "Bash(python3 -m py_compile 02_pipeline.py)",
+      "Bash(python3 -m py_compile web/app.py 02_pipeline.py)",
+      "Bash(python3 -c \"import yaml; yaml.safe_load\\(open\\('config.yaml'\\)\\); print\\('YAML_OK'\\)\")",
+      "Bash(git -C /home/anijmeh/projects/french-dubbing rm -q runpod_handler.py runpod_client.py requirements-runpod.txt SERVERLESS.md RUNPOD_DEPLOYMENT.md)",
+      "Bash(python3 *)",
+      "Bash(bash -n 04_setup.sh 05_web.sh bootstrap.sh)",
+      "Bash(./venv/bin/pip -q install fastapi httpx pyyaml python-multipart)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }

@@ -12,22 +12,25 @@ MP4
  ├─▶ 2. Transcription            faster-whisper large-v3 (word timestamps, VAD)
  │        └─ dedup / loop-collapse anti-hallucination cleanup
  │
- ├─▶ 3. Segment merging          sentence-scale chunks (2–12 s)
+ ├─▶ 3. Diarization (optional)   pyannote community-1 → who spoke when
+ │        └─ runs BEFORE merging so speaker changes are merge boundaries
  │
- ├─▶ 4. Diarization (optional)   pyannote community-1 → who spoke when
+ ├─▶ 4. Segment merging          sentence-scale chunks (2–12 s), never across speakers
  │
- ├─▶ 5. Translation              Qwen3:14b via Ollama
+ ├─▶ 5. Translation              Ollama LLM (default mistral-small:22b)
  │        ├─ glossary prompt-injection (fr-ca)
  │        ├─ English-echo guard (re-translate leftovers)
- │        ├─ compression pass (over-budget segments only)
- │        └─ always-substitute glossary (deterministic)
+ │        ├─ always-substitute glossary (deterministic)
+ │        └─ compression pass (over-budget segments only, glossary-aware)
  │
- ├─▶ 6. Voice references         per-speaker 25 s clips, noisereduce-denoised
+ ├─▶ 6. Voice references         per-speaker ~12 s clips, noisereduce-denoised
  │
- ├─▶ 7. TTS                      Coqui XTTS-v2 zero-shot cloning (24 kHz)
+ ├─▶ 7. TTS                      F5-TTS flow-matching zero-shot cloning (24 kHz)
+ │        └─ spoken-form normalization (inclusive doublets → pronounceable French)
  │
  └─▶ 8. Assembly + subtitles     timeline placement (anchored), Rubber Band stretch,
-          background re-mix, hybrid BBC/Netflix SRT, optional video mux
+          background re-mix, hybrid BBC/Netflix SRT, optional video mux,
+          EBU R128 loudness-normalized output
             →  _french.m4a / _full.m4a / .srt / _french.mp4
 ```
 
@@ -43,7 +46,9 @@ original music/ambience (`source_separation.preserve_background: true`).
 ## 2. Transcription — faster‑whisper `large-v3`
 
 CTranslate2 backend, float16, **word‑level timestamps** and VAD. Word timestamps are reused
-later to anchor subtitle cue boundaries to the original speech.
+later to anchor subtitle cue boundaries to the original speech. `whisper.language` pins the
+source language (empty = auto‑detect, for bilingual sources); `whisper.initial_prompt` is an
+optional vocabulary hint — keep it to a term list, full sentences get echoed over silence.
 
 Whisper can hallucinate looped phrases on silence or music. Four guards are tuned in
 `config.yaml → whisper`:
@@ -56,25 +61,31 @@ Whisper can hallucinate looped phrases on silence or music. Four guards are tune
 Two post passes (`dedupe_whisper_segments`, `collapse_intrasegment_loops`) strip residual
 overlap and within‑segment repetition.
 
-## 3. Segment merging
+## 3. Speaker diarization — pyannote `speaker-diarization-community-1` (optional)
+
+When `diarization.enabled: true`, pyannote labels who is speaking when. It runs **before
+segment merging** so that each raw Whisper fragment is tagged with the speaker holding the
+most overlap, and a speaker change becomes a hard merge boundary — a merged chunk can never
+span two speakers (which would dub both sides of an exchange in one cloned voice). A separate
+voice‑clone reference is assembled per speaker, so every voice in a panel is dubbed
+distinctly. Requires an `HF_TOKEN` that has accepted the gated model license. Set
+`min_speakers` for reliable multi‑speaker detection.
+
+## 4. Segment merging
 
 Sub‑second Whisper fragments produce robotic TTS prosody and unreadable subtitles, so
 fragments are merged into **sentence‑scale chunks**: keep merging across pauses ≤
 `segment_merge_gap` until a chunk crosses `segment_merge_min_duration` and hits sentence
-punctuation, never exceeding `segment_merge_max_duration` (2–12 s by default).
+punctuation, never exceeding `segment_merge_max_duration` (2–12 s by default) and never
+crossing a speaker change.
 
-## 4. Speaker diarization — pyannote `speaker-diarization-community-1` (optional)
-
-When `diarization.enabled: true`, pyannote labels who is speaking when. Each transcript
-segment is tagged with the speaker holding the most overlap, and a separate voice‑clone
-reference is assembled per speaker — so every voice in a panel is dubbed distinctly. Requires
-an `HF_TOKEN` that has accepted the gated model license. Set `min_speakers` for reliable
-multi‑speaker detection.
-
-## 5. Translation — Qwen3:14b via Ollama
+## 5. Translation — Ollama LLM (default `mistral-small:22b`)
 
 A single natural pass over the merged segments, called over Ollama's HTTP API in batches
-(`/no_think` is sent automatically for `qwen3.*` tags). Quality layers:
+(`/no_think` is sent automatically for `qwen3.*` tags; any Ollama tag works via
+`translation.model`). Every call pins an explicit `num_ctx` (8192) — Ollama's small default
+context silently truncates the *front* of long prompts, i.e. exactly the instruction block
+and glossary. Quality layers, in order:
 
 - **Glossary prompt‑injection** (fr‑ca): mandatory vocabulary, acronyms to keep in English,
   and inclusive‑language rules are injected into the prompt from [`canadian_glossary.yaml`](canadian_glossary.yaml).
@@ -82,29 +93,36 @@ A single natural pass over the merged segments, called over Ollama's HTTP API in
   segment still in English; the old behaviour silently dubbed that English. Suspect segments
   (English‑looking output from an English source) are re‑translated individually with a strict
   prompt. Bilingual source clips (already‑French segments) are left untouched.
+- **Always‑substitute glossary** (`apply_glossary`): deterministic rewrite of must‑win
+  Québécois forms (`always:` section), gender‑ and elision‑aware
+  (e.g. *le week‑end → la fin de semaine*, *la newsletter → l'infolettre*). Runs **before**
+  compression so the length budget measures the final (often longer) Québécois wording.
 - **Compression pass**: only the segments still over `budget_cps` are re‑prompted to tighten
   phrasing, iterated up to `compression_rounds` times (re‑compressing against the latest text
   until they fit) — cheap, and it keeps the French short enough to stay in sync downstream.
-- **Always‑substitute glossary** (`apply_glossary`): deterministic, post‑translation rewrite of
-  must‑win Québécois forms (`always:` section), gender‑ and elision‑aware
-  (e.g. *le week‑end → la fin de semaine*, *la newsletter → l'infolettre*).
-
-Why Qwen3:14b? It scored higher than Gemma3:27b on FR‑CA translation (chrF 63.7 vs 62.6) at
-roughly half the VRAM, leaving headroom for Whisper + XTTS to stay resident. Swap models via
-`translation.model` — any Ollama tag works.
+  The compression prompt carries the glossary so rewrites don't undo enforced terms.
 
 ## 6. Voice references
 
-A ~25 s reference clip is extracted per speaker (skipping the first ~20 s of intro/music) and
-denoised through noisereduce → FFmpeg `anlmdn` (whichever is available). XTTS
-clones timbre from this clip, so a clean reference is what preserves the original voice.
+A ~12 s reference clip is extracted per speaker (skipping the first ~20 s of intro/music) and
+denoised through noisereduce → FFmpeg `anlmdn` (whichever is available). F5‑TTS clones timbre
+from this clip, so a clean reference is what preserves the original voice. Clips are hard‑
+capped at 15 s: F5‑TTS's duration formula breaks above 22 s reference length.
 
-## 7. TTS — Coqui XTTS‑v2 (Idiap fork)
+## 7. TTS — F5‑TTS (flow‑matching zero‑shot voice cloning)
 
-Multilingual zero‑shot voice cloning with native French, 24 kHz output. Text is split on
-sentence/clause boundaries to respect XTTS's per‑call length limit; multi‑speaker jobs select
-the matching per‑speaker reference for each segment. Sampling is controlled by
-`tts.xtts_temperature` / `repetition_penalty` / `top_k` / `top_p`.
+Multilingual flow‑matching TTS with native French, 24 kHz output
+(`tts.f5tts_model` — a built‑in model name or a HuggingFace repo ID such as the
+`RASPIAUDIO/F5-French-MixedSpeakers-reduced` French fine‑tune). Text is split on
+sentence/clause boundaries (≤250 chars per call); multi‑speaker jobs select the matching
+per‑speaker reference for each segment. Quality knobs: `f5tts_nfe_step` (ODE steps),
+`f5tts_cfg_strength`, `f5tts_speed`. Runaway/near‑silent outputs are detected and retried.
+
+Before synthesis, written‑only conventions are normalized to a **spoken form**
+(`_tts_spoken_form`): inclusive median‑dot doublets like *conférencier·ère* — required in the
+subtitles by the CAPS style guide — are unpronounceable, so the TTS receives the collapsed
+base form (re‑pluralised when the suffix carried the plural). Guillemets are stripped. The
+subtitles keep the full inclusive written forms.
 
 ## 8. Assembly, timing, and subtitles
 
@@ -140,21 +158,27 @@ via the preserved English word anchors, then polished so every cue meets the lin
 gap rules. Lines wrap at logical points (never mid‑word, never stranding an article).
 `standard: kapwing` restores the legacy single‑line karaoke behaviour.
 
-**Output:** peak‑normalised AAC 192 kbps / 48 kHz stereo — `_french.m4a` (dub only) and, when
-the background was preserved, `_french_full.m4a` (dub side‑chain‑ducked over the original bed) —
-plus the UTF‑8 `.srt`. Subtitle timings follow the actual audio placement (`placements`), so they
-stay in sync even after speed‑up/slowdown. When `output.mux_video` is set, `mux_final_video` also
-produces `_french.mp4` — the original video stream (copied) with the dubbed audio and subtitles
-(soft `mov_text` track by default, or burned in with `output.burn_subs`) — for one‑file sync
-verification; because the dub is held to the source length, the streams end together.
+**Output:** loudness‑normalised AAC 192 kbps / 48 kHz stereo (EBU R128 `loudnorm`,
+−16 LUFS / −1.5 dBTP — consistent delivery level run‑to‑run; `audio.volume_boost_pct` shifts
+the target instead of applying raw gain) — `_french.m4a` (dub only) and, when the background
+was preserved, `_french_full.m4a` (dub side‑chain‑ducked over the original bed, mixed with
+`amix normalize=0` so the voice keeps its level) — plus the UTF‑8 `.srt`. Subtitle timings
+follow the actual audio placement (`placements`), so they stay in sync even after
+speed‑up/slowdown. When `output.mux_video` is set, `mux_final_video` also produces
+`_french.mp4` — the original video stream (copied) with the dubbed audio (stream‑copied, no
+second lossy encode) and subtitles (soft `mov_text` track by default, or burned in with
+`output.burn_subs`) — for one‑file sync verification; because the dub is held to the source
+length, the streams end together.
 
 ---
 
 ## VRAM budget (RTX 4090, 24 GB)
 
-Models load and free in sequence (`max_workers: 1`). Peak co‑residency is Whisper large‑v3
-(~3 GB) + XTTS‑v2 (~2 GB) + Qwen3:14b in Ollama (~9 GB), comfortably within 24 GB. Larger
-translation models (e.g. `gemma3:27b`, ~17 GB) also fit but leave less headroom.
+Models load and free in sequence (`max_workers: 1`), and the translation LLM is explicitly
+unloaded from Ollama before F5‑TTS loads. Peak residency: Whisper large‑v3 (~3 GB) during
+transcription, `mistral-small:22b` in Ollama (~13 GB) during translation, F5‑TTS (~2 GB)
+during synthesis — each phase fits comfortably within 24 GB. Smaller translation models
+(e.g. `qwen3:14b`, ~9 GB) leave more headroom.
 
 ## Where to look in the code
 
@@ -162,9 +186,9 @@ translation models (e.g. `gemma3:27b`, ~17 GB) also fit but leave less headroom.
 |---|---|
 | Transcription + anti‑hallucination | `transcribe_audio`, `dedupe_whisper_segments`, `collapse_intrasegment_loops` |
 | Segment merging / CPS split | `merge_segments`, `split_overflowing_segments` |
-| Translation + guards | `translate_segments_qwen`, `_retranslate_leftover_english`, `compress_overflowing_translations`, `apply_glossary` |
+| Translation + guards | `translate_segments`, `_retranslate_leftover_english`, `compress_overflowing_translations`, `apply_glossary` |
 | Diarization / profiles | `diarize_audio`, `assign_speakers`, `build_speaker_profiles` |
-| TTS | `synthesize_all_segments` |
+| TTS + spoken-form normalization | `synthesize_all_segments`, `_tts_spoken_form` |
 | Timeline / anchored / drift re‑anchoring | `assemble_and_encode` |
 | Video mux | `mux_final_video` |
 | Subtitles | `create_srt`, `_split_into_chunks`, `_wrap_two_lines`, `_enforce_subtitle_timing` |

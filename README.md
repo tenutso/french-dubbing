@@ -129,7 +129,11 @@ A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in
 DUBBING_WEB_PORT=8080 bash /workspace/scripts/05_web.sh   # custom port
 ```
 
-**No auth** — the RunPod proxy URL is unguessable, but don't post it publicly. Put it behind an authenticated reverse proxy if you need protection.
+**Auth** — set `DUBBING_UI_TOKEN` in the environment before launching. Every request must then carry the token (the UI shows a sign‑in page once and stores an HttpOnly cookie; scripts can pass `Authorization: Bearer <token>` or `?token=`). If unset, the UI is **unauthenticated** — fine on localhost, not behind a public proxy URL.
+
+```bash
+DUBBING_UI_TOKEN=$(openssl rand -hex 24) bash /workspace/scripts/05_web.sh
+```
 
 ---
 
@@ -203,7 +207,7 @@ For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the Fre
 
 ## Running outside RunPod
 
-Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + Qwen3:14b co‑resident) and CUDA 12.x:
+Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mistral‑small:22b co‑resident) and CUDA 12.x:
 
 - Use the [`Dockerfile`](Dockerfile) (PyTorch 2.8 / CUDA 12.8 base), or
 - Run `04_setup.sh` directly on Ubuntu 24.04 with PyTorch 2.8 installed.
@@ -218,10 +222,10 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + Qw
 | Ollama `Read timed out` | First‑batch cold load | Already at 600 s + `keep_alive: 30m`; check `ollama ps` and warm with `ollama run mistral-small:22b ""` |
 | `TRANSLATION FAILURE: N/N segments still in English` | Ollama unreachable or wrong model name | `ollama list`; `ollama pull mistral-small:22b` |
 | A few words sound English in the dub | Rare stochastic LLM echo | The English‑echo guard re‑translates these automatically; check the log for "Re‑translating … Recovered" |
-| Output too quiet | 0.95 peak‑normalise | `--volume-boost 20` |
+| Output too quiet | Loudness target (−16 LUFS) | `--volume-boost 20` (shifts the loudnorm target ~+1.6 dB) |
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
 | A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
-| `qwen3:14b` re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
+| Ollama model re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.
 
@@ -251,7 +255,7 @@ french-dubbing/
 ## License & attribution
 
 - Pipeline code, web UI, glue: **MIT**
-- faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · noisereduce: MIT · Qwen3 (via Ollama): Apache 2.0 · FFmpeg: LGPL/GPL
+- faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · noisereduce: MIT · translation LLM: per‑model licence (check your Ollama tag — e.g. `mistral-small:22b` is Mistral Research License, `mistral-small:24b` and `qwen3:14b` are Apache 2.0) · FFmpeg: LGPL/GPL
 - **F5‑TTS**: MIT licence (model weights and code). All pipeline components are now commercial‑friendly.
 
 No proprietary APIs are required to run the pipeline end‑to‑end.

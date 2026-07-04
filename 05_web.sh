@@ -11,6 +11,10 @@ HOST="${DUBBING_WEB_HOST:-0.0.0.0}"
 
 echo "Starting dubbing web UI on ${HOST}:${PORT}"
 echo "Workspace: ${DUBBING_WORKSPACE:-/workspace}"
+if [ -z "${DUBBING_UI_TOKEN:-}" ]; then
+    echo "WARNING: DUBBING_UI_TOKEN not set — the UI is UNAUTHENTICATED." >&2
+    echo "         Set it before exposing this port: DUBBING_UI_TOKEN=\$(openssl rand -hex 24)" >&2
+fi
 exec python -m uvicorn web.app:app \
     --host "$HOST" --port "$PORT" \
     --log-level info \

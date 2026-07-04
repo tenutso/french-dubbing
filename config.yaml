@@ -17,8 +17,10 @@ pipeline:
 audio:
   # 48000 Hz — avoids resampling loss on Vimeo and modern video platforms.
   output_sample_rate: 48000
-  # Boost the final output by this percent (0 = off, 20 = +20%). Applied after
-  # peak normalization; hard-clipped at ±1.0. Override at runtime: --volume-boost 20
+  # Final outputs are loudness-normalized (EBU R128 loudnorm, -16 LUFS / -1.5 dBTP)
+  # so delivery level is consistent run-to-run. This boost shifts the loudness
+  # target by the equivalent dB (20 = ~+1.6 dB) instead of applying raw gain,
+  # so the true-peak ceiling still holds. Override at runtime: --volume-boost 20
   volume_boost_pct: 0
 
 # ============================================================
@@ -78,6 +80,13 @@ whisper:
   # float16       → best quality on RTX 4090
   # int8_float16  → lower VRAM, marginal accuracy loss
   compute_type: float16
+  # Source language. Empty ("") = auto-detect per file — use for bilingual
+  # sources so already-French passages aren't forced through English decoding.
+  language: en
+  # Optional domain-vocabulary hint (comma-separated proper nouns/acronyms,
+  # e.g. "CAPS, CSP, keynote"). Leave empty: full sentences here get echoed
+  # into the transcript over silence/music (a hallucination seed).
+  initial_prompt: ""
   # Anti-hallucination tuning. condition_on_previous_text=false prevents
   # Whisper from feeding (potentially looped) prior output as context for
   # the next window — the single biggest switch against runaway repetition.
@@ -91,10 +100,10 @@ whisper:
   log_prob_threshold: -1.0
 
 # ============================================================
-# Translation — Minstral via Ollama
-# Single backend, single natural pass + targeted compression. Overflow is
-# handled downstream by the assembler's timing policy (no_drop) rather than by
-# shrinking translations — see tts.timing_policy / reading_cps below.
+# Translation — LLM via Ollama (default: mistral-small:22b)
+# Single backend, single natural pass + targeted compression. Residual
+# overflow is absorbed downstream by the assembler's anchored timing policy —
+# see tts.timing_policy / reading_cps below.
 # ============================================================
 translation:
   # Translation model via Ollama. /no_think is sent automatically for qwen3.* tags.
@@ -185,9 +194,9 @@ tts:
 
   # Per-group speed-up cap. In timing_policy=anchored this is how much a dense
   # run may be sped up to stay inside the source timeline (1.30 ≈ inaudible on
-  # speech). Keep it gentle for naturalness.
+  # speech). Keep it gentle for naturalness. (Slow-down is governed by
+  # reading_cps / max_slowdown below.)
   max_stretch: 1.3
-  min_stretch: 0.7
 
   # Timing policy when a dub run is longer than its time window:
   #   anchored → hold the source timeline: speed dense runs up (≤ max_stretch)

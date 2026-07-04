@@ -110,7 +110,7 @@ WHISPER_CACHE="$MODELS_FOLDER/whisper"
 
 # Models
 WHISPER_MODEL=$(cfg     whisper.model      large-v3)
-OLLAMA_MODEL=$(cfg      translation.model  qwen3:14b)
+OLLAMA_MODEL=$(cfg      translation.model  mistral-small:22b)
 F5TTS_MODEL=$(cfg       tts.f5tts_model    F5TTS_v1_Multilingual)
 DIARIZATION_MODEL=$(cfg diarization.model  pyannote/speaker-diarization-community-1)
 
@@ -385,7 +385,7 @@ else
     log_warn "Ollama not installed — skipping service start"
 fi
 
-# ── Step 12: Pull Qwen3:14b ─────────────────────────────────────────────
+# ── Step 12: Pull the translation model ─────────────────────────────────
 
 pull_with_retry() {
     local model="$1"

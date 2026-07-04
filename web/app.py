@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -24,9 +25,8 @@ from urllib.parse import urlparse
 
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
-    FileResponse, HTMLResponse, JSONResponse, StreamingResponse,
+    FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 
@@ -85,17 +85,19 @@ CONFIG_SCHEMA: dict = {
     # Whisper
     "whisper.model":                   ("str",   "Whisper model",           "", {"choices": ["large-v3", "large-v2", "medium", "small", "distil-large-v3"], "group": "Whisper"}),
     "whisper.compute_type":            ("str",   "Compute type",            "", {"choices": ["float16", "int8_float16", "int8", "float32"], "group": "Whisper"}),
+    "whisper.language":                ("str",   "Source language",         "ISO code of the spoken language (en, fr, …). Empty = auto-detect per file — use for bilingual sources.", {"group": "Whisper"}),
+    "whisper.initial_prompt":          ("str",   "Vocabulary hint",         "Optional comma-separated proper nouns/acronyms (e.g. \"CAPS, CSP, keynote\"). Avoid full sentences — they get echoed into the transcript over silence.", {"group": "Whisper"}),
     "whisper.condition_on_previous_text": ("bool", "Condition on prev text", "Off = strongest anti-hallucination posture; Whisper won't feed its own (possibly looped) output back as context.", {"group": "Whisper"}),
     "whisper.compression_ratio_threshold": ("float", "Compression-ratio max", "Reject segments above this ratio (a classic loop signature). Lower = more aggressive. fw default 2.4.", {"min": 1.5, "max": 4.0, "step": 0.05, "group": "Whisper"}),
     "whisper.no_speech_threshold":     ("float", "No-speech threshold",     "Drop windows whose no-speech probability exceeds this.", {"min": 0.0, "max": 1.0, "step": 0.05, "group": "Whisper"}),
 
     # Translation
-    "translation.model":               ("str",   "Translation model",       "Ollama tag (e.g. qwen3:14b, qwen3:32b).", {"group": "Translation"}),
+    "translation.model":               ("str",   "Translation model",       "Ollama tag (e.g. mistral-small:22b, qwen3:14b).", {"group": "Translation"}),
     "translation.temperature":         ("float", "Temperature",             "Lower = more literal, higher = more creative.", {"min": 0.0, "max": 1.5, "step": 0.05, "group": "Translation"}),
-    "translation.batch_size":          ("int",   "Batch size",              "Segments per Ollama call. Big batches risk 4096-token budget.", {"min": 1, "max": 60, "step": 1, "group": "Translation"}),
-    "translation.review_pass":         ("bool",  "Self-review pass",        "Qwen rereads and fixes Anglicisms. Roughly doubles translation time.", {"group": "Translation"}),
-    "translation.compression_pass":    ("bool",  "Compression fallback",    "Targeted second Qwen pass that only rewrites segments still over budget after the main translation. Cheap and eliminates most remaining speed-ups.", {"group": "Translation"}),
-    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to Qwen. ~15 keeps French tight enough to fit the source timeline; raise for more headroom (reintroduces drift), lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
+    "translation.batch_size":          ("int",   "Batch size",              "Segments per Ollama call. Big batches risk the 4096-token output budget.", {"min": 1, "max": 60, "step": 1, "group": "Translation"}),
+    "translation.review_pass":         ("bool",  "Self-review pass",        "The LLM rereads its output and fixes Anglicisms. Roughly doubles translation time.", {"group": "Translation"}),
+    "translation.compression_pass":    ("bool",  "Compression fallback",    "Targeted second LLM pass that only rewrites segments still over budget after the main translation. Cheap and eliminates most remaining speed-ups.", {"group": "Translation"}),
+    "translation.budget_cps":          ("int",   "Char budget per second",  "Per-segment character budget passed to the translator. ~15 keeps French tight enough to fit the source timeline; raise for more headroom (reintroduces drift), lower to force tighter phrasing.", {"min": 10, "max": 25, "step": 1, "group": "Translation"}),
     "translation.compression_rounds":  ("int",   "Compression rounds",      "Max iterative passes that re-compress only the segments still over budget. More rounds = tighter timing fit, slightly more LLM calls.", {"min": 1, "max": 6, "step": 1, "group": "Translation"}),
     "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
     "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
@@ -107,7 +109,6 @@ CONFIG_SCHEMA: dict = {
     "tts.speaker_profile_duration":    ("int",   "Speaker clip duration (s)", "Length of reference clip for voice cloning (single-speaker mode). Must stay ≤ 15s.", {"min": 5, "max": 15, "step": 1, "group": "TTS"}),
     "tts.use_deepfilter":              ("bool",  "Denoise reference",       "Denoise the speaker reference clip before cloning.", {"group": "TTS"}),
     "tts.max_stretch":                 ("float", "Max stretch ratio",       "anchored: per-group speed-up cap used to hold the source timeline (~1.30 is inaudible). lock: above this the tail is truncated instead of sped up further.", {"min": 1.0, "max": 2.0, "step": 0.05, "group": "TTS"}),
-    "tts.min_stretch":                 ("float", "Min stretch ratio",       "Floor for slowing down audio to fill long windows.", {"min": 0.3, "max": 1.0, "step": 0.05, "group": "TTS"}),
     "tts.stretcher":                   ("str",   "Time-stretch engine",     "rubberband preserves formants; atempo is the ffmpeg fallback.", {"choices": ["rubberband", "atempo"], "group": "TTS"}),
     "tts.cps_split_threshold":         ("float", "CPS split threshold",     "Translated segments above this French CPS get split at a sentence boundary before TTS. Shorter halves stretch independently. 0 disables.", {"min": 0.0, "max": 40.0, "step": 0.5, "group": "TTS"}),
 
@@ -182,7 +183,6 @@ CONFIG_PRESETS: dict[str, dict] = {
             "tts.f5tts_nfe_step": 32,
             "tts.f5tts_cfg_strength": 2.5,                # stronger reference adherence
             "tts.max_stretch": 1.2,
-            "tts.min_stretch": 0.8,
             "tts.stretcher": "rubberband",
             "tts.cps_split_threshold": 19.0,
         },
@@ -264,123 +264,203 @@ class State:
 
 state = State()
 app = FastAPI(title="Dubbing Web UI")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+# Shared-token auth: set DUBBING_UI_TOKEN in the environment and every request
+# must carry it (login form → HttpOnly SameSite cookie, or Bearer header, or
+# ?token= for scripted access). SameSite=strict also kills cross-origin
+# drive-by requests, which is why no CORS middleware is registered — the UI is
+# same-origin only. Unset token = auth disabled (local development).
+AUTH_TOKEN = os.environ.get("DUBBING_UI_TOKEN", "")
+AUTH_COOKIE = "dubbing_token"
+
+_LOGIN_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Dubbing UI — sign in</title>
+<style>
+ body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
+      align-items:center;min-height:100vh;margin:0;background:#111;color:#eee}
+ form{background:#1c1c1e;padding:2rem;border-radius:12px;display:flex;
+      flex-direction:column;gap:.75rem;min-width:280px}
+ input,button{padding:.6rem .8rem;border-radius:8px;border:1px solid #444;
+      font-size:1rem;background:#111;color:#eee}
+ button{background:#2563eb;border:none;cursor:pointer}
+ .err{color:#f87171;margin:0;font-size:.9rem}
+</style></head><body>
+<form method="post" action="/auth">
+  <strong>Dubbing Web UI</strong>
+  <!--msg-->
+  <input type="password" name="token" placeholder="Access token" autofocus>
+  <button type="submit">Sign in</button>
+</form></body></html>"""
+
+
+def _token_ok(supplied: str) -> bool:
+    return bool(supplied) and secrets.compare_digest(supplied, AUTH_TOKEN)
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    if not AUTH_TOKEN:
+        return await call_next(request)
+    if request.url.path == "/auth" and request.method == "POST":
+        return await call_next(request)
+    bearer = request.headers.get("authorization") or ""
+    if bearer.startswith("Bearer "):
+        bearer = bearer[len("Bearer "):].strip()
+    supplied = (
+        request.cookies.get(AUTH_COOKIE)
+        or request.headers.get("x-auth-token")
+        or bearer
+        or request.query_params.get("token")
+        or ""
+    )
+    if _token_ok(supplied):
+        return await call_next(request)
+    if request.method == "GET" and "text/html" in (request.headers.get("accept") or ""):
+        return HTMLResponse(_LOGIN_HTML, status_code=401)
+    return JSONResponse({"detail": "unauthorized"}, status_code=401)
+
+
+@app.post("/auth")
+async def auth_login(token: str = Form("")) -> HTMLResponse:
+    if not AUTH_TOKEN:
+        return RedirectResponse("/", status_code=303)
+    if not _token_ok(token):
+        return HTMLResponse(
+            _LOGIN_HTML.replace("<!--msg-->", '<p class="err">Invalid token</p>'),
+            status_code=401,
+        )
+    resp = RedirectResponse("/", status_code=303)
+    resp.set_cookie(
+        AUTH_COOKIE, token,
+        httponly=True, samesite="strict", max_age=30 * 24 * 3600,
+    )
+    return resp
 
 
 # ── Queue worker ──────────────────────────────────────────────────────────────
 async def _run_job(job: Job) -> None:
-    """Execute one pipeline subprocess; stream its stdout into the job's log buffer."""
+    """Execute one pipeline subprocess; stream its stdout into the job's log buffer.
+
+    Every exit path — success, failure, cancel (including cancel during a Vimeo
+    download), worker exception — goes through the ``finally`` block, which
+    publishes the terminal status, closes SSE streams, and clears the
+    current-job state. Without that, a cancel during download left
+    ``current_job_id`` set (blocking config edits) and SSE streams open forever.
+    """
     job.status = STATUS_RUNNING
     job.started_at = time.time()
     state.current_job_id = job.id
     state.save()
     state.publish(job.id, f">>> Starting: {job.video_filename}")
 
-    # Snapshot the exact config that will produce this dub. Lets you diff
-    # settings across runs and re-run the same job with identical params.
     try:
-        snap = Path(job.output_dir) / "config.snapshot.yaml"
-        if CONFIG_PATH.exists():
-            snap.write_bytes(CONFIG_PATH.read_bytes())
-            state.publish(job.id, f"... snapshot: {snap}")
-    except Exception as e:
-        state.publish(job.id, f"!!! snapshot failed: {e}")
+        # Snapshot the exact config that will produce this dub. Lets you diff
+        # settings across runs and re-run the same job with identical params.
+        try:
+            snap = Path(job.output_dir) / "config.snapshot.yaml"
+            if CONFIG_PATH.exists():
+                snap.write_bytes(CONFIG_PATH.read_bytes())
+                state.publish(job.id, f"... snapshot: {snap}")
+        except Exception as e:
+            state.publish(job.id, f"!!! snapshot failed: {e}")
 
-    # Pending Vimeo job — fetch the video before running the pipeline.
-    if not job.video_path and job.source_url:
-        if not await _download_vimeo(job):
-            return  # _download_vimeo marked the job failed and saved state
+        # Pending Vimeo job — fetch the video before running the pipeline.
+        if not job.video_path and job.source_url:
+            if not await _download_vimeo(job):
+                return  # job already marked failed/cancelled
+            if job.status == STATUS_CANCELLED:
+                return  # cancelled between download and launch
 
-    opts = job.options or {}
-    _is_phase1 = opts.get("review") and not opts.get("_p2")
-    _is_phase2 = bool(opts.get("_p2"))
+        opts = job.options or {}
+        _is_phase1 = opts.get("review") and not opts.get("_p2")
+        _is_phase2 = bool(opts.get("_p2"))
 
-    cmd = [
-        sys.executable, str(PIPELINE_PY),
-        "--video",      job.video_path,
-        "--output-dir", job.output_dir,
-        "--config",     str(CONFIG_PATH),
-    ]
-    # Phase 2 is always a deliberate "synthesize now" action from the UI, so it must
-    # run even when prior outputs exist (re-generation after re-opening review). On
-    # the first approve no outputs exist yet, so --force is a harmless no-op there.
-    if opts.get("force") or _is_phase2:
-        cmd.append("--force")
-    if opts.get("locale"):
-        cmd += ["--locale", opts["locale"]]
-    if opts.get("volume_boost") not in (None, ""):
-        cmd += ["--volume-boost", str(opts["volume_boost"])]
-    if _is_phase1:
-        cmd += ["--phase", "1"]
-    elif _is_phase2:
-        cmd += ["--phase", "2"]
+        cmd = [
+            sys.executable, str(PIPELINE_PY),
+            "--video",      job.video_path,
+            "--output-dir", job.output_dir,
+            "--config",     str(CONFIG_PATH),
+        ]
+        # Phase 2 is always a deliberate "synthesize now" action from the UI, so it must
+        # run even when prior outputs exist (re-generation after re-opening review). On
+        # the first approve no outputs exist yet, so --force is a harmless no-op there.
+        if opts.get("force") or _is_phase2:
+            cmd.append("--force")
+        if opts.get("locale"):
+            cmd += ["--locale", opts["locale"]]
+        if opts.get("volume_boost") not in (None, ""):
+            cmd += ["--volume-boost", str(opts["volume_boost"])]
+        if _is_phase1:
+            cmd += ["--phase", "1"]
+        elif _is_phase2:
+            cmd += ["--phase", "2"]
 
-    state.publish(job.id, "$ " + " ".join(cmd))
+        state.publish(job.id, "$ " + " ".join(cmd))
 
-    try:
-        # start_new_session so we can kill the whole process group on cancel
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except Exception as e:
-        job.status = STATUS_FAILED
-        job.error = f"failed to launch pipeline: {e}"
-        job.ended_at = time.time()
-        state.publish(job.id, f"!!! launch failed: {e}")
+        try:
+            # start_new_session so we can kill the whole process group on cancel
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as e:
+            job.status = STATUS_FAILED
+            job.error = f"failed to launch pipeline: {e}"
+            state.publish(job.id, f"!!! launch failed: {e}")
+            return
+
+        state.current_proc = proc
+
+        try:
+            assert proc.stdout is not None
+            while True:
+                line_bytes = await proc.stdout.readline()
+                if not line_bytes:
+                    break
+                line = line_bytes.decode("utf-8", errors="replace").rstrip()
+                if not line:
+                    continue
+                m = PHASE_RE.search(line)
+                if m:
+                    job.phase = f"[{m.group(1)}/6] {m.group(2)}".strip()
+                state.publish(job.id, line)
+        except Exception as e:
+            state.publish(job.id, f"!!! log-stream error: {e}")
+
+        rc = await proc.wait()
+        job.returncode = rc
+
+        # Determine final status
+        if job.status == STATUS_CANCELLED:
+            pass  # cancel already set status
+        elif rc == 0:
+            _collect_outputs(job)
+            if _is_phase1:
+                job.status = STATUS_AWAITING_REVIEW
+            else:
+                job.status = STATUS_COMPLETED
+        else:
+            job.status = STATUS_FAILED
+            job.error = job.error or f"pipeline exited with code {rc}"
+
+    finally:
+        if not job.ended_at:
+            job.ended_at = time.time()
+        rc_note = f" (rc={job.returncode})" if job.returncode is not None else ""
+        state.publish(job.id, f"<<< {job.status.upper()}{rc_note}")
+        # Signal SSE subscribers to close cleanly
+        for q in state.subscribers.get(job.id, []):
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+        state.current_proc = None
         state.current_job_id = None
         state.save()
-        return
-
-    state.current_proc = proc
-
-    try:
-        assert proc.stdout is not None
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace").rstrip()
-            if not line:
-                continue
-            m = PHASE_RE.search(line)
-            if m:
-                job.phase = f"[{m.group(1)}/6] {m.group(2)}".strip()
-            state.publish(job.id, line)
-    except Exception as e:
-        state.publish(job.id, f"!!! log-stream error: {e}")
-
-    rc = await proc.wait()
-    job.returncode = rc
-    job.ended_at = time.time()
-
-    # Determine final status
-    if job.status == STATUS_CANCELLED:
-        pass  # cancel already set status
-    elif rc == 0:
-        _collect_outputs(job)
-        if _is_phase1:
-            job.status = STATUS_AWAITING_REVIEW
-        else:
-            job.status = STATUS_COMPLETED
-    else:
-        job.status = STATUS_FAILED
-        job.error = job.error or f"pipeline exited with code {rc}"
-
-    state.publish(job.id, f"<<< {job.status.upper()} (rc={rc})")
-    # Signal SSE subscribers to close cleanly
-    for q in state.subscribers.get(job.id, []):
-        try:
-            q.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
-
-    state.current_proc = None
-    state.current_job_id = None
-    state.save()
 
 
 async def _download_vimeo(job: Job) -> bool:
@@ -445,21 +525,13 @@ async def _download_vimeo(job: Job) -> bool:
 
 
 def _fail_job(job: Job, msg: str) -> bool:
-    """Mark a job failed with a message; returns False for convenient early-return."""
+    """Mark a job failed with a message; returns False for convenient early-return.
+
+    Terminal-status publishing, SSE close, and current-job state cleanup all
+    happen in _run_job's ``finally`` block — every failure path funnels there."""
     job.status = STATUS_FAILED
     job.error = msg
-    job.ended_at = time.time()
     state.publish(job.id, f"!!! {msg}")
-    state.publish(job.id, f"<<< {job.status.upper()}")
-    # Signal SSE subscribers to close cleanly (mirrors _run_job's terminal handling)
-    for q in state.subscribers.get(job.id, []):
-        try:
-            q.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
-    state.current_job_id = None
-    state.current_proc = None
-    state.save()
     return False
 
 
@@ -527,6 +599,11 @@ async def _startup() -> None:
         if j.status == STATUS_QUEUED:
             await state.queue.put(j.id)
     state.worker_task = asyncio.create_task(_queue_worker())
+    if not AUTH_TOKEN:
+        log.warning(
+            "DUBBING_UI_TOKEN is not set — the web UI is UNAUTHENTICATED. "
+            "Anyone who can reach this port can submit jobs and edit config."
+        )
     log.info("dubbing web UI started")
 
 
@@ -651,10 +728,6 @@ async def update_config(payload: dict, force: bool = False) -> JSONResponse:
     dmax = _get_dotted(merged, "diarization.max_speakers")
     if isinstance(dmin, int) and isinstance(dmax, int) and dmin > dmax:
         raise HTTPException(400, "diarization.min_speakers must be ≤ max_speakers")
-    smin = _get_dotted(merged, "tts.min_stretch")
-    smax = _get_dotted(merged, "tts.max_stretch")
-    if isinstance(smin, (int, float)) and isinstance(smax, (int, float)) and smin > smax:
-        raise HTTPException(400, "tts.min_stretch must be ≤ tts.max_stretch")
 
     # Write — comment-preserving line rewrite for known leaves
     try:
@@ -879,17 +952,20 @@ async def submit(
         stem = safe_stem(video.filename) or "video"
         dest = UPLOAD_DIR / f"{job_id}__{stem}.mp4"
         written = 0
-        with dest.open("wb") as out:
-            while True:
-                chunk = await video.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > MAX_UPLOAD_BYTES:
-                    out.close()
-                    dest.unlink(missing_ok=True)
-                    raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // 1024**3} GB cap")
-                out.write(chunk)
+        try:
+            with dest.open("wb") as out:
+                while True:
+                    chunk = await video.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, f"file exceeds {MAX_UPLOAD_BYTES // 1024**3} GB cap")
+                    out.write(chunk)
+        except BaseException:
+            # Aborted/oversize upload — don't leave a partial file on disk.
+            dest.unlink(missing_ok=True)
+            raise
         log_path = LOG_DIR / f"{dest.stem}.log"
         job = Job(
             id=job_id,

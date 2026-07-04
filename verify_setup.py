@@ -237,16 +237,26 @@ def main():
         ok2, _ = run(f"command -v {tool}")
         c.check(f"tool: {tool}", ok2)
 
-    # ── Ollama (primary translator — Qwen3) ───────────────────────────────────
-    print(f"\n{BLUE}Ollama — Qwen3 translation{RESET}")
+    # ── Ollama (primary translator) ───────────────────────────────────────────
+    # Check for the model configured in config.yaml, not a hardcoded tag.
+    ollama_model = "mistral-small:22b"
+    try:
+        import yaml as _yaml
+        with open("/workspace/config.yaml") as _f:
+            _cfg = _yaml.safe_load(_f) or {}
+        ollama_model = (_cfg.get("translation", {}) or {}).get("model", ollama_model)
+    except Exception:
+        pass
+    print(f"\n{BLUE}Ollama — translation ({ollama_model}){RESET}")
     ok2, _ = run("command -v ollama")
     if c.check("Ollama installed", ok2):
         ok3, out = run("curl -s http://localhost:11434/api/tags", timeout=5)
         if c.check("Ollama service running", ok3 and "models" in out.lower()):
             ok4, out = run("ollama list 2>/dev/null")
-            has_qwen = ok4 and "qwen3" in out
-            c.check("qwen3 model present", has_qwen,
-                    "run: ollama pull qwen3:14b" if not has_qwen else "")
+            model_base = ollama_model.split(":")[0]
+            has_model = ok4 and model_base in out
+            c.check(f"{ollama_model} model present", has_model,
+                    f"run: ollama pull {ollama_model}" if not has_model else "")
         else:
             c.warn("Ollama not running",
                    "start: nohup ollama serve > /workspace/logs/ollama.log 2>&1 &")

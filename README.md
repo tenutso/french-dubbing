@@ -142,6 +142,45 @@ DUBBING_UI_TOKEN=$(openssl rand -hex 24) bash /workspace/scripts/05_web.sh
 
 ---
 
+## On‑demand operation (budget)
+
+For occasional workloads, don't keep the pod running — pay for GPU seconds only while a job
+is processing (a typical video costs $0.15–0.35 on a community‑cloud 4090; the only fixed
+cost is volume storage, a few $/month):
+
+1. **Put `/workspace` on a RunPod network volume** so pods can be stopped (or even terminated
+   and re‑created) without losing models, jobs, or outputs. Cold start with warm volume ≈ 30 s
+   via [bootstrap.sh](bootstrap.sh).
+2. **Enable idle auto‑stop** — set in the pod template:
+
+   ```bash
+   DUBBING_IDLE_STOP_MIN=10        # stop the pod after 10 min with no jobs
+   ```
+
+   The web app stops its own pod (via `runpodctl`, falling back to the RunPod REST API if
+   `RUNPOD_API_KEY` is set) once there has been no running/queued job and no mutating request
+   for that long. GET polling (the UI footer) does **not** keep the pod alive; submitting,
+   editing translations, or saving voice references does. Jobs paused at the review stage
+   persist on the volume and survive a stop. `/api/health` reports `idle_for_s` so you can
+   see the countdown.
+3. **Start on demand with [trigger.sh](trigger.sh)** from any machine (needs `curl` + `python3`):
+
+   ```bash
+   export RUNPOD_API_KEY=... RUNPOD_POD_ID=... DUBBING_UI_TOKEN=...
+   ./trigger.sh --vimeo https://vimeo.com/12345 --locale fr-ca --speakers 3 --wait --download ./out
+   ```
+
+   It starts the pod, waits for the API, submits the job (Vimeo URL, on‑pod path, or file
+   upload), and optionally polls to completion and downloads the outputs. The pod then
+   idle‑stops on its own. Any backend can do the same three HTTP calls directly:
+   `POST rest.runpod.io/v1/pods/{id}/start` → poll `GET /api/health` → `POST /api/jobs`.
+
+One caveat: a *stopped* pod is not guaranteed to get its GPU back at start time. If
+`trigger.sh` reports the pod can't start, create a fresh pod on the same network volume
+(same template) — nothing is lost.
+
+---
+
 ## Configuration
 
 Everything lives in [config.yaml](config.yaml) (heavily commented). The most useful knobs:
@@ -255,6 +294,7 @@ french-dubbing/
 ├── 03_batch_runner.py        # batch a folder of MP4s
 ├── 04_setup.sh               # one‑shot installer (RunPod / Ubuntu 24.04)
 ├── 05_web.sh                 # uvicorn launcher (web UI)
+├── trigger.sh                # on-demand client: start pod → submit job → download
 ├── bootstrap.sh              # RunPod container‑start entrypoint
 ├── verify_setup.py           # GO/NO‑GO post‑install check
 ├── config.yaml               # all knobs (commented)

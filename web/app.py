@@ -162,6 +162,13 @@ class State:
         self.current_proc: Optional[asyncio.subprocess.Process] = None
         self.current_job_id: Optional[str] = None
         self.worker_task: Optional[asyncio.Task] = None
+        self.idle_task: Optional[asyncio.Task] = None
+        # Last meaningful activity (job start/finish, any mutating request).
+        # GET polling doesn't count — the UI footer polls health forever.
+        self.last_activity: float = time.time()
+
+    def touch(self) -> None:
+        self.last_activity = time.time()
 
     def save(self) -> None:
         save_jobs(self.jobs)
@@ -215,6 +222,11 @@ def _token_ok(supplied: str) -> bool:
 
 @app.middleware("http")
 async def _require_token(request: Request, call_next):
+    # Any mutating request counts as activity for the idle auto-stop —
+    # submitting, editing segments/config, saving voice refs. GETs don't:
+    # the frontend polls jobs/health forever, which would hold the pod open.
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        state.touch()
     if not AUTH_TOKEN:
         return await call_next(request)
     if request.url.path == "/auth" and request.method == "POST":
@@ -253,6 +265,80 @@ async def auth_login(token: str = Form("")) -> HTMLResponse:
     return resp
 
 
+# ── Idle auto-stop (on-demand / budget operation) ─────────────────────────────
+# Set DUBBING_IDLE_STOP_MIN (e.g. 10) in the pod template and the server stops
+# its own RunPod pod after that many minutes with no running/queued job and no
+# mutating request. Everything that matters (models, jobs.json, outputs,
+# phase-1 segments awaiting review) lives on the /workspace volume, so a
+# stopped pod resumes exactly where it left off. Unset/0 = disabled.
+IDLE_STOP_MIN = float(os.environ.get("DUBBING_IDLE_STOP_MIN", "0") or 0)
+RUNPOD_POD_ID = os.environ.get("RUNPOD_POD_ID", "")
+RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
+
+
+def _idle_seconds() -> float:
+    """Seconds since the last job/mutating-request activity; 0 while busy."""
+    busy = state.current_job_id is not None or any(
+        j.status == STATUS_QUEUED for j in state.jobs.values()
+    )
+    if busy:
+        state.touch()
+        return 0.0
+    return time.time() - state.last_activity
+
+
+def _stop_self() -> bool:
+    """Stop this RunPod pod via runpodctl, falling back to the REST API."""
+    if not RUNPOD_POD_ID:
+        log.warning("idle-stop: RUNPOD_POD_ID not set — cannot stop pod")
+        return False
+    try:
+        r = subprocess.run(
+            ["runpodctl", "stop", "pod", RUNPOD_POD_ID],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            return True
+        log.warning("idle-stop: runpodctl failed: %s", (r.stderr or r.stdout).strip()[:200])
+    except FileNotFoundError:
+        log.debug("idle-stop: runpodctl not installed — trying REST API")
+    except Exception as e:
+        log.warning("idle-stop: runpodctl error: %s", e)
+    if RUNPOD_API_KEY:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                f"https://rest.runpod.io/v1/pods/{RUNPOD_POD_ID}/stop",
+                method="POST",
+                headers={"Authorization": f"Bearer {RUNPOD_API_KEY}"},
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return 200 <= resp.status < 300
+        except Exception as e:
+            log.warning("idle-stop: REST stop failed: %s", e)
+    return False
+
+
+async def _idle_watchdog() -> None:
+    """Stop the pod after IDLE_STOP_MIN minutes of no jobs / no writes."""
+    limit_s = IDLE_STOP_MIN * 60
+    while True:
+        await asyncio.sleep(60)
+        idle = _idle_seconds()
+        if idle < limit_s:
+            continue
+        log.info(
+            "idle-stop: no activity for %.0f min (limit %.0f) — stopping pod %s",
+            idle / 60, IDLE_STOP_MIN, RUNPOD_POD_ID or "(unknown)",
+        )
+        state.save()
+        if _stop_self():
+            return  # the pod is going down; nothing left to watch
+        # Stop failed — back off a full cycle before retrying, and reset the
+        # clock so we don't hammer the API every minute.
+        state.touch()
+
+
 # ── Queue worker ──────────────────────────────────────────────────────────────
 async def _run_job(job: Job) -> None:
     """Execute one pipeline subprocess; stream its stdout into the job's log buffer.
@@ -266,6 +352,7 @@ async def _run_job(job: Job) -> None:
     job.status = STATUS_RUNNING
     job.started_at = time.time()
     state.current_job_id = job.id
+    state.touch()
     state.save()
     state.publish(job.id, f">>> Starting: {job.video_filename}")
 
@@ -376,6 +463,7 @@ async def _run_job(job: Job) -> None:
                 pass
         state.current_proc = None
         state.current_job_id = None
+        state.touch()   # the idle clock starts when the job ends, not when it started
         state.save()
 
 
@@ -519,6 +607,12 @@ async def _startup() -> None:
         log.warning(
             "DUBBING_UI_TOKEN is not set — the web UI is UNAUTHENTICATED. "
             "Anyone who can reach this port can submit jobs and edit config."
+        )
+    if IDLE_STOP_MIN > 0:
+        state.idle_task = asyncio.create_task(_idle_watchdog())
+        log.info(
+            "idle auto-stop enabled: pod stops after %.0f min without jobs "
+            "(pod %s)", IDLE_STOP_MIN, RUNPOD_POD_ID or "unknown — set RUNPOD_POD_ID",
         )
     log.info("dubbing web UI started")
 
@@ -1476,6 +1570,9 @@ async def health() -> JSONResponse:
         "config_present": CONFIG_PATH.exists(),
         "hf_token_present": bool(os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")),
     }
+    if IDLE_STOP_MIN > 0:
+        info["idle_stop_min"] = IDLE_STOP_MIN
+        info["idle_for_s"] = round(_idle_seconds())
     # Disk free
     try:
         usage = shutil.disk_usage(str(WORKSPACE))

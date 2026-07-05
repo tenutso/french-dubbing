@@ -15,6 +15,9 @@ if [ -z "${DUBBING_UI_TOKEN:-}" ]; then
     echo "WARNING: DUBBING_UI_TOKEN not set — the UI is UNAUTHENTICATED." >&2
     echo "         Set it before exposing this port: DUBBING_UI_TOKEN=\$(openssl rand -hex 24)" >&2
 fi
+if [ -n "${DUBBING_IDLE_STOP_MIN:-}" ] && [ "${DUBBING_IDLE_STOP_MIN:-0}" != "0" ]; then
+    echo "Idle auto-stop: pod stops after ${DUBBING_IDLE_STOP_MIN} min without jobs"
+fi
 exec python -m uvicorn web.app:app \
     --host "$HOST" --port "$PORT" \
     --log-level info \

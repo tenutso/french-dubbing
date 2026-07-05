@@ -1659,9 +1659,36 @@ def _find_upload_link(obj) -> Optional[str]:
     return None
 
 
+_SRT_TS_RE = re.compile(r"(\d{2,}):(\d{2}):(\d{2}),(\d{3})")
+
+
+def _srt_to_vtt(srt_text: str) -> str:
+    """Convert SRT to WebVTT — Vimeo's native caption format.
+
+    Vimeo's SRT parser rejects files its VTT parser accepts ("Unable to parse
+    captions"), so uploads always go up as VTT: strip index lines, add the
+    header, and swap the millisecond comma for a period."""
+    out = ["WEBVTT", ""]
+    for block in re.split(r"\r?\n\s*\r?\n", srt_text.lstrip("﻿").strip()):
+        lines = [ln.rstrip("\r") for ln in block.splitlines() if ln.strip()]
+        # Skip anything before the timestamp line (index number, stray BOM).
+        ts_i = next((i for i, ln in enumerate(lines[:2]) if "-->" in ln), None)
+        if ts_i is None:
+            continue
+        lines = lines[ts_i:]
+        lines[0] = _SRT_TS_RE.sub(lambda m: f"{m.group(1)}:{m.group(2)}:{m.group(3)}.{m.group(4)}", lines[0])
+        out.extend(lines)
+        out.append("")
+    return "\n".join(out)
+
+
 def _vimeo_push_subtitles(token: str, video_id: str, srt_path: str,
                           language: str, name: str = "Français") -> dict:
-    """Create a text track, upload the SRT, activate it."""
+    """Create a text track, upload the captions (as WebVTT), activate it."""
+    with open(srt_path, encoding="utf-8-sig") as f:
+        vtt = _srt_to_vtt(f.read())
+    if vtt.count("-->") == 0:
+        return {"ok": False, "step": "convert captions", "detail": "no cues found in SRT"}
     r = _rq.post(
         f"{VIMEO_API}/videos/{video_id}/texttracks",
         headers=_vimeo_headers(token),
@@ -1675,10 +1702,10 @@ def _vimeo_push_subtitles(token: str, video_id: str, srt_path: str,
     if not link:
         return {"ok": False, "step": "create texttrack",
                 "detail": f"no upload link in response: {json.dumps(tt)[:300]}"}
-    with open(srt_path, "rb") as f:
-        put = _rq.put(link, data=f.read(), timeout=120)
+    put = _rq.put(link, data=vtt.encode("utf-8"),
+                  headers={"Content-Type": "text/vtt"}, timeout=120)
     if put.status_code not in (200, 201, 204):
-        return {"ok": False, "step": "upload srt", "detail": _vimeo_err(put)}
+        return {"ok": False, "step": "upload captions", "detail": _vimeo_err(put)}
     uri = tt.get("uri")
     if uri:
         act = _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
@@ -1688,31 +1715,109 @@ def _vimeo_push_subtitles(token: str, video_id: str, srt_path: str,
     return {"ok": True, "uri": uri or ""}
 
 
+_VIMEO_SPEC_CACHE = WORKSPACE / "web" / "vimeo_openapi.json"
+
+
+def _vimeo_openapi(token: str) -> dict:
+    """Fetch (and cache for a day) Vimeo's live OpenAPI spec for this token.
+
+    The docs site is JS-rendered, and plan-gated endpoints 404 rather than
+    403 — so the only reliable source for the audio-tracks contract is the
+    spec Vimeo serves for the authenticated account."""
+    try:
+        if (_VIMEO_SPEC_CACHE.exists()
+                and time.time() - _VIMEO_SPEC_CACHE.stat().st_mtime < 86400):
+            return json.loads(_VIMEO_SPEC_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    try:
+        r = _rq.get(f"{VIMEO_API}/?openapi=1", headers=_vimeo_headers(token), timeout=60)
+        if r.status_code != 200:
+            log.warning("vimeo: openapi fetch failed: %s", _vimeo_err(r))
+            return {}
+        spec = r.json()
+    except Exception as e:
+        log.warning("vimeo: openapi fetch failed: %s", e)
+        return {}
+    try:
+        _VIMEO_SPEC_CACHE.write_text(json.dumps(spec), encoding="utf-8")
+    except Exception:
+        pass
+    return spec
+
+
+def _op_body_props(post: dict, spec: dict) -> List[str]:
+    """Body property names of an operation (OpenAPI 3 and Swagger 2 shapes)."""
+    props: List[str] = []
+    rb = post.get("requestBody") or {}
+    if "$ref" in rb:   # resolve one level of components ref
+        ref = rb["$ref"].lstrip("#/").split("/")
+        node = spec
+        for part in ref:
+            node = (node or {}).get(part, {})
+        rb = node or {}
+    for mt in (rb.get("content") or {}).values():
+        props += list(((mt.get("schema") or {}).get("properties") or {}).keys())
+    for p in post.get("parameters") or []:
+        if p.get("in") in ("body", "formData"):
+            schema_props = ((p.get("schema") or {}).get("properties") or {})
+            props += list(schema_props.keys()) or [p.get("name", "")]
+    return sorted({p for p in props if p})
+
+
+def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, List[str]]]:
+    """Locate the create-audio-track operation: (path_template, body_props)."""
+    paths = spec.get("paths") or {}
+    # Exact operationId first (matches the docs anchor), then any audio POST
+    # under a video path.
+    for match_exact in (True, False):
+        for path, ops in paths.items():
+            post = (ops or {}).get("post")
+            if not post:
+                continue
+            opid = (post.get("operationId") or "").lower()
+            if match_exact and opid != "create_audio_track":
+                continue
+            if not match_exact and not ("audio" in path.lower() and "video" in path.lower()):
+                continue
+            return path, _op_body_props(post, spec)
+    return None
+
+
 def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
                       language: str, name: str = "Français") -> dict:
     """Create a dubbed audio track and upload the full-mix M4A.
 
-    The audio-tracks API is newer and plan-gated (multi-audio is not on every
-    tier), so this tries the documented endpoint with a couple of payload
-    shapes and reports Vimeo's exact error when the plan or shape is rejected."""
-    attempts: list = []
-    created = None
-    for path, payload in (
-        (f"/videos/{video_id}/audio_tracks", {"type": "dubbed", "language": language, "name": name}),
-        (f"/videos/{video_id}/audio_tracks", {"language": language, "name": name}),
-        (f"/videos/{video_id}/audiotracks",  {"type": "dubbed", "language": language, "name": name}),
-    ):
-        r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
-                     json=payload, timeout=30)
-        if r.status_code in (200, 201):
-            created = r.json()
-            break
-        attempts.append(f"POST {path} {sorted(payload)} → {_vimeo_err(r)}")
-        if r.status_code == 403:
+    The endpoint path and body fields are discovered from Vimeo's live
+    OpenAPI spec (cached daily). Multi-audio is plan-gated: if the spec for
+    this account has no audio-track create operation, say so explicitly."""
+    spec = _vimeo_openapi(token)
+    found = _vimeo_audio_create_op(spec) if spec else None
+    if not found:
+        if spec:
             return {"ok": False, "step": "create audio track",
-                    "detail": _vimeo_err(r) + " — multi-audio may not be available on this Vimeo plan"}
-    if created is None:
-        return {"ok": False, "step": "create audio track", "detail": " | ".join(attempts)}
+                    "detail": "no audio-track endpoint in the API spec for this "
+                              "account — multi-audio may not be available on this "
+                              "Vimeo plan (or token scopes)"}
+        return {"ok": False, "step": "create audio track",
+                "detail": "could not fetch the Vimeo API spec to locate the "
+                          "audio-track endpoint — retry, or check token scopes"}
+
+    path_tpl, props = found
+    path = re.sub(r"\{[^}]*video[^}]*\}", video_id, path_tpl)
+    # Send only fields the operation actually accepts.
+    candidates = {"language": language, "type": "dubbed", "name": name, "active": True}
+    payload = {k: v for k, v in candidates.items() if not props or k in props}
+    log.info("vimeo: audio-track endpoint %s (props: %s) payload %s",
+             path_tpl, props or "unknown", sorted(payload))
+
+    r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
+                 json=payload, timeout=30)
+    if r.status_code not in (200, 201):
+        hint = " — multi-audio may not be available on this Vimeo plan" if r.status_code in (403, 404) else ""
+        return {"ok": False, "step": "create audio track",
+                "detail": f"POST {path_tpl} {sorted(payload)} → {_vimeo_err(r)}{hint}"}
+    created = r.json()
 
     link = _find_upload_link(created)
     if not link:
@@ -1727,7 +1832,7 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
         # Best-effort activation — some shapes auto-activate on upload.
         _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
                   json={"active": True}, timeout=30)
-    return {"ok": True, "uri": uri or ""}
+    return {"ok": True, "uri": uri or "", "endpoint": path_tpl}
 
 
 def _external_base(request: Request) -> str:

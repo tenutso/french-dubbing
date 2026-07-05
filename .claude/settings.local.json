@@ -53,7 +53,10 @@
       "Bash(node --check web/static/app.js)",
       "Bash(chmod +x trigger.sh)",
       "Bash(bash -n trigger.sh)",
-      "Bash(bash -n 05_web.sh trigger.sh)"
+      "Bash(bash -n 05_web.sh trigger.sh)",
+      "WebFetch(domain:developer.vimeo.com)",
+      "WebFetch(domain:github.com)",
+      "WebSearch"
     ]
   }
 }

@@ -68,6 +68,20 @@
     </form>
   </section>
 
+  <section class="card" id="vimeo-card">
+    <h2>Vimeo</h2>
+    <div id="vimeo-status" class="muted">checking connection…</div>
+    <div id="vimeo-controls" class="vimeo-controls">
+      <button type="button" id="vimeo-connect" hidden>Connect to Vimeo</button>
+      <input type="password" id="vimeo-token-input"
+             placeholder="…or paste a personal access token (scopes: public private edit upload)">
+      <button type="button" id="vimeo-token-save">Save token</button>
+      <button type="button" id="vimeo-disconnect" hidden>Disconnect</button>
+    </div>
+    <p class="muted small">Once connected, completed jobs get a “Push to Vimeo” button that
+      uploads the French subtitles and the dubbed audio track onto the source video.</p>
+  </section>
+
   <section class="card" id="advanced-section">
     <details id="advanced-details">
       <summary>

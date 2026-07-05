@@ -454,3 +454,18 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
 .vr-turns { flex-basis: 100%; font-size: 0.82rem; opacity: 0.85; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .vr-turn { font-size: 0.78rem; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border, #2a2a2a); background: transparent; color: inherit; cursor: pointer; }
 .vr-turn:hover { background: var(--border, #2a2a2a); }
+
+/* Vimeo integration */
+#vimeo-card h2 { margin-top: 0; }
+#vimeo-card .small { margin: 8px 0 0; }
+.vimeo-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.vimeo-controls input { flex: 1 1 320px; min-width: 200px; }
+.vimeo-panel {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border, #2a2a2a);
+}
+.vimeo-panel .vp-video { flex: 1 1 260px; min-width: 180px; }
+.vimeo-panel .vp-lang { width: 72px; }
+.vimeo-panel label.check { display: inline-flex; align-items: center; gap: 4px; }
+.vimeo-panel .vp-result { flex-basis: 100%; white-space: pre-wrap; }
+.vimeo-panel .vp-result.err { color: #f87171; }

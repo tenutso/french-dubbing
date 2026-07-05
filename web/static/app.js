@@ -233,6 +233,104 @@ function renderList(selector, list, emptyMsg) {
   }
 }
 
+// ── Vimeo connection ─────────────────────────────────────────────────────────
+let vimeoConnected = false;
+
+async function loadVimeoStatus() {
+  try {
+    const r = await fetch("/api/vimeo/status");
+    if (!r.ok) return;
+    const s = await r.json();
+    vimeoConnected = s.connected;
+    $("#vimeo-status").textContent = s.connected
+      ? `Connected as ${s.user || "Vimeo user"} (${s.via})`
+      : "Not connected";
+    $("#vimeo-connect").hidden = s.connected || !s.oauth_available;
+    $("#vimeo-disconnect").hidden = !s.connected;
+    $("#vimeo-token-input").hidden = s.connected;
+    $("#vimeo-token-save").hidden = s.connected;
+  } catch (e) { /* leave as-is */ }
+}
+
+function initVimeoControls() {
+  $("#vimeo-connect").addEventListener("click", () => {
+    window.location.href = "/api/vimeo/connect";
+  });
+  $("#vimeo-token-save").addEventListener("click", async () => {
+    const token = $("#vimeo-token-input").value.trim();
+    if (!token) return;
+    const r = await fetch("/api/vimeo/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (r.ok) {
+      $("#vimeo-token-input").value = "";
+      await loadVimeoStatus();
+      refreshJobs();
+    } else {
+      const err = await r.json().catch(() => ({}));
+      $("#vimeo-status").textContent = err.detail || `token rejected (HTTP ${r.status})`;
+    }
+  });
+  $("#vimeo-disconnect").addEventListener("click", async () => {
+    if (!confirm("Disconnect from Vimeo?")) return;
+    await fetch("/api/vimeo/token", { method: "DELETE" });
+    await loadVimeoStatus();
+    refreshJobs();
+  });
+}
+
+// Inline "Push to Vimeo" panel on a completed job card.
+function buildVimeoPanel(job, root) {
+  const panel = document.createElement("div");
+  panel.className = "vimeo-panel";
+  panel.hidden = true;
+  const locale = (job.options || {}).locale || "";
+  panel.innerHTML = `
+    <input class="vp-video" placeholder="vimeo.com URL or video id">
+    <input class="vp-lang" title="Track language code">
+    <label class="check"><input type="checkbox" class="vp-subs" checked> Subtitles (.srt)</label>
+    <label class="check"><input type="checkbox" class="vp-audio" checked> Audio track (full mix)</label>
+    <button type="button" class="vp-go">Push</button>
+    <div class="vp-result muted"></div>`;
+  // Values assigned via DOM (not interpolated into HTML) so a hostile
+  // source_url can't inject markup.
+  panel.querySelector(".vp-video").value = job.source_url || "";
+  panel.querySelector(".vp-lang").value = locale === "fr-ca" ? "fr-CA" : "fr";
+  const result = panel.querySelector(".vp-result");
+  panel.querySelector(".vp-go").addEventListener("click", async (e) => {
+    const btn = e.target;
+    btn.disabled = true;
+    result.textContent = "pushing…";
+    try {
+      const r = await fetch(`/api/jobs/${job.id}/vimeo-push`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video: panel.querySelector(".vp-video").value.trim(),
+          language: panel.querySelector(".vp-lang").value.trim(),
+          subtitles: panel.querySelector(".vp-subs").checked,
+          audio: panel.querySelector(".vp-audio").checked,
+        }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        result.textContent = d.detail || `push failed (HTTP ${r.status})`;
+      } else {
+        const parts = Object.entries(d.results || {}).map(([k, v]) =>
+          v.ok ? `${k}: ✓` : `${k}: ✗ ${v.step} — ${v.detail}`);
+        result.textContent = parts.join("   ") || "nothing selected";
+        result.classList.toggle("err", !d.ok);
+      }
+    } catch (err) {
+      result.textContent = "network error: " + err;
+    }
+    btn.disabled = false;
+  });
+  return panel;
+}
+
 function renderCard(job) {
   const tpl = $("#job-card-tpl").content.cloneNode(true);
   const root = tpl.querySelector(".job");
@@ -327,6 +425,19 @@ function renderCard(job) {
       document.getElementById("review-section").scrollIntoView({ behavior: "smooth" })
     );
     $(".job-actions", root).insertBefore(btn, $(".show-log", root));
+  }
+
+  // "Push to Vimeo" for completed jobs (needs a Vimeo connection).
+  if (job.status === "completed" && vimeoConnected &&
+      job.outputs && (job.outputs.srt || job.outputs.full || job.outputs.audio)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.textContent = "Push to Vimeo";
+    btn.title = "Upload the French subtitles and dubbed audio track onto the source Vimeo video";
+    const panel = buildVimeoPanel(job, root);
+    btn.addEventListener("click", () => { panel.hidden = !panel.hidden; });
+    $(".job-actions", root).insertBefore(btn, $(".show-log", root));
+    root.appendChild(panel);
   }
 
   // "Re-open review" for finished jobs — step back to the review stage and
@@ -937,6 +1048,8 @@ async function init() {
   await loadConfig();
   await loadGlossary();
   await refreshHealth();
+  initVimeoControls();
+  await loadVimeoStatus();
   await refreshJobs();
   $("#config-save").addEventListener("click", () => saveConfig(false));
   $("#config-revert").addEventListener("click", revertConfig);

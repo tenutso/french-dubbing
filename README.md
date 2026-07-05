@@ -127,6 +127,7 @@ A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in
 - Single‑job FIFO queue; live log via Server‑Sent Events.
 - Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
 - An **Advanced options** panel edits the per‑video subset of `config.yaml` (source language, vocabulary hint, translation model/review pass, output toggles). The tuned timing/quality internals are deliberately not exposed — edit `config.yaml` directly for experiments.
+- **Push to Vimeo**: connect once (personal access token or OAuth), then deliver subtitles + dubbed audio track onto the source video from the job card — see [Push to Vimeo](#push-to-vimeo).
 - Crash‑safe: a job interrupted by a server restart is recovered as `failed`; queued jobs resume.
 - Footer shows live GPU / VRAM / disk / Ollama / HF‑token status.
 
@@ -241,7 +242,31 @@ For each `webinar.mp4`, in `/workspace/outputs/`:
 - `webinar_french_full.m4a` — full mix: French vocals + original background bed (when Demucs separation succeeded and `source_separation.preserve_background: true`)
 - `webinar_french.mp4` — original video + dubbed audio + subtitles, muxed for one‑file review (when `output.mux_video: true`). The dub is held to the source length, so audio, subs, and picture stay in sync end‑to‑end.
 
-For Vimeo: upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
+For Vimeo, use the built‑in push (below) — or manually upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
+
+---
+
+## Push to Vimeo
+
+The web UI can deliver a finished dub straight onto the source Vimeo video: the SRT as an
+**active French text track** and the full‑mix M4A as a **dubbed audio track**
+(multi‑audio requires a Vimeo plan that supports it; the UI surfaces Vimeo's exact error if not).
+
+**Connect once** (token persists on the volume across pod stops):
+
+- *Simplest*: paste a [personal access token](https://developer.vimeo.com/apps) with scopes
+  `public private edit upload` into the Vimeo card.
+- *Or OAuth*: create a Vimeo API app, set `VIMEO_CLIENT_ID` / `VIMEO_CLIENT_SECRET` in the pod
+  env, register `{pod-url}/api/vimeo/callback` as the redirect URL, and use **Connect to Vimeo**.
+
+**Push**: completed jobs show a *Push to Vimeo* button — target video pre‑filled from the job's
+Vimeo URL (editable for uploaded files), language defaults to `fr-CA` for `fr-ca` jobs, with
+per‑item results shown inline.
+
+**Automation** (n8n etc.): the same action is one API call —
+`POST /api/jobs/{id}/vimeo-push` with `{"video": "...", "language": "fr-CA", "subtitles": true, "audio": true}`
+(Bearer‑auth with `DUBBING_UI_TOKEN`), so a workflow can go submit → wait → push without
+downloading any files itself.
 
 ---
 

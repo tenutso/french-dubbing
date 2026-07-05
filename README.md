@@ -151,7 +151,10 @@ cost is volume storage, a few $/month):
 
 1. **Put `/workspace` on a RunPod network volume** so pods can be stopped (or even terminated
    and re‑created) without losing models, jobs, or outputs. Cold start with warm volume ≈ 30 s
-   via [bootstrap.sh](bootstrap.sh).
+   via [bootstrap.sh](bootstrap.sh). Secrets (`DUBBING_UI_TOKEN`, `VIMEO_ACCESS_TOKEN`,
+   `RUNPOD_API_KEY`, `HF_TOKEN`) can live in `/workspace/.env` on the volume — both the
+   pipeline and the web app load it at startup, so fresh pods boot fully configured without
+   template edits.
 2. **Enable idle auto‑stop** — set in the pod template:
 
    ```bash
@@ -254,10 +257,13 @@ The web UI can deliver a finished dub straight onto the source Vimeo video: the 
 
 **Connect once** (token persists on the volume across pod stops):
 
-- *Simplest*: paste a [personal access token](https://developer.vimeo.com/apps) with scopes
-  `public private edit upload` into the Vimeo card.
-- *Or OAuth*: create a Vimeo API app, set `VIMEO_CLIENT_ID` / `VIMEO_CLIENT_SECRET` in the pod
-  env, register `{pod-url}/api/vimeo/callback` as the redirect URL, and use **Connect to Vimeo**.
+- *Hands‑off*: set `VIMEO_ACCESS_TOKEN` (a [personal access token](https://developer.vimeo.com/apps)
+  with scopes `public private edit upload`) in the pod template env or in `/workspace/.env` —
+  the app verifies and connects automatically at every boot. A token pasted in the UI takes
+  precedence over the env seed.
+- *UI*: paste the same personal access token into the Vimeo card.
+- *Or OAuth*: create a Vimeo API app, set `VIMEO_CLIENT_ID` / `VIMEO_CLIENT_SECRET`, register
+  `{pod-url}/api/vimeo/callback` as the redirect URL, and use **Connect to Vimeo**.
 
 **Push**: completed jobs show a *Push to Vimeo* button — target video pre‑filled from the job's
 Vimeo URL (editable for uploaded files), language defaults to `fr-CA` for `fr-ca` jobs, with

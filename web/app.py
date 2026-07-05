@@ -37,6 +37,28 @@ from .jobs import (
     load_jobs, new_job_id, safe_stem, save_jobs, sorted_jobs,
 )
 
+
+def _load_dotenv() -> None:
+    """Load .env (repo checkout, then /workspace/.env) before reading config.
+
+    Putting secrets — DUBBING_UI_TOKEN, VIMEO_ACCESS_TOKEN, RUNPOD_API_KEY,
+    VIMEO_CLIENT_ID/SECRET — in /workspace/.env keeps them on the volume, so
+    freshly created pods boot fully configured without template edits.
+    Values already set in the environment win (override=False)."""
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    for candidate in (
+        Path(__file__).resolve().parent.parent / ".env",
+        Path("/workspace/.env"),
+    ):
+        if candidate.exists():
+            load_dotenv(candidate, override=False)
+
+
+_load_dotenv()
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 WEB_ROOT     = Path(__file__).resolve().parent
 STATIC_DIR   = WEB_ROOT / "static"
@@ -615,6 +637,8 @@ async def _startup() -> None:
             "idle auto-stop enabled: pod stops after %.0f min without jobs "
             "(pod %s)", IDLE_STOP_MIN, RUNPOD_POD_ID or "unknown — set RUNPOD_POD_ID",
         )
+    # Off the event loop — it's a network call to Vimeo.
+    await asyncio.to_thread(_vimeo_seed_from_env)
     log.info("dubbing web UI started")
 
 
@@ -1581,6 +1605,12 @@ VIMEO_TOKEN_FILE = WORKSPACE / "web" / "vimeo_token.json"
 VIMEO_CLIENT_ID = os.environ.get("VIMEO_CLIENT_ID", "")
 VIMEO_CLIENT_SECRET = os.environ.get("VIMEO_CLIENT_SECRET", "")
 VIMEO_REDIRECT_URL = os.environ.get("VIMEO_REDIRECT_URL", "")  # optional override
+# Personal access token supplied via the environment (pod template or
+# /workspace/.env) — the app connects with it automatically at startup, so a
+# fresh pod boots ready to push without touching the UI. A token pasted in
+# the UI takes precedence; the env seed only (re)applies when the stored
+# connection is absent or itself env-sourced.
+VIMEO_ACCESS_TOKEN_ENV = os.environ.get("VIMEO_ACCESS_TOKEN", "")
 VIMEO_OAUTH_SCOPES = "public private edit upload"
 
 _vimeo_oauth_states: Dict[str, float] = {}   # state -> expiry ts
@@ -1631,6 +1661,30 @@ def _vimeo_me(token: str) -> Optional[dict]:
         return r.json() if r.status_code == 200 else None
     except Exception:
         return None
+
+
+def _vimeo_seed_from_env() -> None:
+    """Connect with VIMEO_ACCESS_TOKEN at startup (see its comment above)."""
+    if not VIMEO_ACCESS_TOKEN_ENV:
+        return
+    stored = _vimeo_load_token()
+    if stored.get("access_token"):
+        if stored.get("via") != "environment":
+            return  # user connected explicitly — don't override
+        if stored.get("access_token") == VIMEO_ACCESS_TOKEN_ENV:
+            return  # same env token already stored
+    me = _vimeo_me(VIMEO_ACCESS_TOKEN_ENV)
+    if not me:
+        log.warning("VIMEO_ACCESS_TOKEN set but Vimeo rejected it "
+                    "(check scopes: public private edit upload)")
+        return
+    _vimeo_save_token({
+        "access_token": VIMEO_ACCESS_TOKEN_ENV,
+        "user": me.get("name", ""),
+        "via": "environment",
+        "connected_at": time.time(),
+    })
+    log.info("Vimeo connected from environment as %s", me.get("name", "?"))
 
 
 def _find_upload_link(obj) -> Optional[str]:

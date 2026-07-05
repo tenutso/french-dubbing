@@ -1800,9 +1800,9 @@ def _vimeo_openapi(token: str) -> dict:
     return spec
 
 
-def _op_body_props(post: dict, spec: dict) -> List[str]:
-    """Body property names of an operation (OpenAPI 3 and Swagger 2 shapes)."""
-    props: List[str] = []
+def _op_body_props(post: dict, spec: dict) -> Dict[str, dict]:
+    """Body properties of an operation: {name: schema} (OpenAPI 3 + Swagger 2)."""
+    props: Dict[str, dict] = {}
     rb = post.get("requestBody") or {}
     if "$ref" in rb:   # resolve one level of components ref
         ref = rb["$ref"].lstrip("#/").split("/")
@@ -1811,15 +1811,20 @@ def _op_body_props(post: dict, spec: dict) -> List[str]:
             node = (node or {}).get(part, {})
         rb = node or {}
     for mt in (rb.get("content") or {}).values():
-        props += list(((mt.get("schema") or {}).get("properties") or {}).keys())
+        for name, schema in (((mt.get("schema") or {}).get("properties")) or {}).items():
+            props[name] = schema or {}
     for p in post.get("parameters") or []:
         if p.get("in") in ("body", "formData"):
             schema_props = ((p.get("schema") or {}).get("properties") or {})
-            props += list(schema_props.keys()) or [p.get("name", "")]
-    return sorted({p for p in props if p})
+            if schema_props:
+                for name, schema in schema_props.items():
+                    props[name] = schema or {}
+            elif p.get("name"):
+                props[p["name"]] = {}
+    return props
 
 
-def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, List[str]]]:
+def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, Dict[str, dict]]]:
     """Locate the create-audio-track operation: (path_template, body_props)."""
     paths = spec.get("paths") or {}
     # Exact operationId first (matches the docs anchor), then any audio POST
@@ -1836,6 +1841,20 @@ def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, List[str]]]:
                 continue
             return path, _op_body_props(post, spec)
     return None
+
+
+def _vimeo_current_version(token: str, video_id: str) -> Optional[str]:
+    """Id of the video's active (current) version — audio tracks attach to it."""
+    r = _rq.get(f"{VIMEO_API}/videos/{video_id}/versions",
+                headers=_vimeo_headers(token), timeout=30)
+    if r.status_code != 200:
+        return None
+    data = (r.json() or {}).get("data") or []
+    chosen = next((d for d in data if d.get("active")), data[0] if data else None)
+    if not chosen:
+        return None
+    m = re.search(r"/versions/(\d+)", chosen.get("uri", ""))
+    return m.group(1) if m else None
 
 
 def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
@@ -1858,19 +1877,38 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
                           "audio-track endpoint — retry, or check token scopes"}
 
     path_tpl, props = found
-    path = re.sub(r"\{[^}]*video[^}]*\}", video_id, path_tpl)
+    path = path_tpl.replace("{video_id}", video_id)
+    # Audio tracks attach to a video *version* — resolve the active one.
+    if "{version_id}" in path:
+        version_id = _vimeo_current_version(token, video_id)
+        if not version_id:
+            return {"ok": False, "step": "resolve video version",
+                    "detail": f"could not read the active version of video {video_id} "
+                              f"(needed for {path_tpl})"}
+        path = path.replace("{version_id}", version_id)
+    if "{" in path:
+        return {"ok": False, "step": "create audio track",
+                "detail": f"unresolved placeholder in endpoint {path_tpl}"}
+
+    # "type" values come from the spec's enum ("dubbed" preferred).
+    type_enum = (props.get("type") or {}).get("enum") or []
+    track_type = "dubbed"
+    if type_enum and "dubbed" not in type_enum:
+        track_type = next((e for e in type_enum if e not in ("main", "original")),
+                          type_enum[0])
     # Send only fields the operation actually accepts.
-    candidates = {"language": language, "type": "dubbed", "name": name, "active": True}
+    candidates = {"type": track_type, "active": True, "language": language, "name": name}
     payload = {k: v for k, v in candidates.items() if not props or k in props}
     log.info("vimeo: audio-track endpoint %s (props: %s) payload %s",
-             path_tpl, props or "unknown", sorted(payload))
+             path_tpl, {k: (v.get("enum") or v.get("type", "?")) for k, v in props.items()} or "unknown",
+             payload)
 
     r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
                  json=payload, timeout=30)
     if r.status_code not in (200, 201):
         hint = " — multi-audio may not be available on this Vimeo plan" if r.status_code in (403, 404) else ""
         return {"ok": False, "step": "create audio track",
-                "detail": f"POST {path_tpl} {sorted(payload)} → {_vimeo_err(r)}{hint}"}
+                "detail": f"POST {path} {sorted(payload)} → {_vimeo_err(r)}{hint}"}
     created = r.json()
 
     link = _find_upload_link(created)
@@ -1883,9 +1921,15 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
         return {"ok": False, "step": "upload audio", "detail": _vimeo_err(put)}
     uri = created.get("uri")
     if uri:
-        # Best-effort activation — some shapes auto-activate on upload.
+        # Language isn't part of the create body on this API — set it (and
+        # activate) after upload, best-effort.
+        patch_body = {"active": True}
+        if "language" not in payload:
+            patch_body["language"] = language
+        if "name" not in payload:
+            patch_body["name"] = name
         _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
-                  json={"active": True}, timeout=30)
+                  json=patch_body, timeout=30)
     return {"ok": True, "uri": uri or "", "endpoint": path_tpl}
 
 

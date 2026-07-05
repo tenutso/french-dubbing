@@ -1843,6 +1843,26 @@ def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, Dict[str, dict]]]:
     return None
 
 
+def _tus_upload(link: str, file_path: str) -> Optional[str]:
+    """Single-shot tus upload (Vimeo's resumable protocol). None on success.
+
+    Vimeo's modern upload endpoints return a tus upload_link; the bytes go up
+    as a PATCH with offset headers — a plain PUT is rejected."""
+    size = os.path.getsize(file_path)
+    with open(file_path, "rb") as f:
+        r = _rq.patch(link, data=f, headers={
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": "0",
+            "Content-Type": "application/offset+octet-stream",
+        }, timeout=600)
+    if r.status_code not in (200, 204):
+        return _vimeo_err(r)
+    offset = getattr(r, "headers", {}).get("Upload-Offset")
+    if offset is not None and int(offset) != size:
+        return f"tus upload incomplete: offset {offset} of {size} bytes"
+    return None
+
+
 def _vimeo_current_version(token: str, video_id: str) -> Optional[str]:
     """Id of the video's active (current) version — audio tracks attach to it."""
     r = _rq.get(f"{VIMEO_API}/videos/{video_id}/versions",
@@ -1896,40 +1916,60 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
     if type_enum and "dubbed" not in type_enum:
         track_type = next((e for e in type_enum if e not in ("main", "original")),
                           type_enum[0])
-    # Send only fields the operation actually accepts.
-    candidates = {"type": track_type, "active": True, "language": language, "name": name}
-    payload = {k: v for k, v in candidates.items() if not props or k in props}
-    log.info("vimeo: audio-track endpoint %s (props: %s) payload %s",
-             path_tpl, {k: (v.get("enum") or v.get("type", "?")) for k, v in props.items()} or "unknown",
-             payload)
+    # Contract learned from the live API (400 invalid_parameters): the create
+    # body REQUIRES language_code and an upload object (tus, like video
+    # uploads) — the account spec under-reports its own properties.
+    payload: dict = {
+        "type": track_type,
+        "active": True,
+        "language_code": language,
+        "upload": {"approach": "tus", "size": os.path.getsize(m4a_path)},
+    }
+    log.info("vimeo: audio-track endpoint %s (spec props: %s) payload %s",
+             path_tpl,
+             {k: (v.get("enum") or v.get("type", "?")) for k, v in props.items()} or "unknown",
+             {k: v for k, v in payload.items() if k != "upload"} | {"upload": payload["upload"]})
 
     r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
                  json=payload, timeout=30)
+    if r.status_code == 400:
+        # Adaptive retry: drop only *optional* fields the API flags as invalid
+        # (never the required language_code/upload).
+        try:
+            flagged = [p.get("field") for p in (r.json().get("invalid_parameters") or [])]
+        except Exception:
+            flagged = []
+        droppable = [f for f in flagged if f in ("type", "active", "name")]
+        if droppable and set(flagged) == set(droppable):
+            payload = {k: v for k, v in payload.items() if k not in droppable}
+            log.info("vimeo: retrying audio-track create without %s", droppable)
+            r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
+                         json=payload, timeout=30)
     if r.status_code not in (200, 201):
         hint = " — multi-audio may not be available on this Vimeo plan" if r.status_code in (403, 404) else ""
         return {"ok": False, "step": "create audio track",
                 "detail": f"POST {path} {sorted(payload)} → {_vimeo_err(r)}{hint}"}
     created = r.json()
 
-    link = _find_upload_link(created)
+    up = created.get("upload") or {}
+    link = up.get("upload_link") or _find_upload_link(created)
     if not link:
         return {"ok": False, "step": "create audio track",
                 "detail": f"created but no upload link in response: {json.dumps(created)[:300]}"}
-    with open(m4a_path, "rb") as f:
-        put = _rq.put(link, data=f, headers={"Content-Type": "audio/mp4"}, timeout=600)
-    if put.status_code not in (200, 201, 204):
-        return {"ok": False, "step": "upload audio", "detail": _vimeo_err(put)}
+    if (up.get("approach") or "tus") == "tus":
+        err = _tus_upload(link, m4a_path)
+        if err:
+            return {"ok": False, "step": "upload audio (tus)", "detail": err}
+    else:
+        with open(m4a_path, "rb") as f:
+            put = _rq.put(link, data=f, headers={"Content-Type": "audio/mp4"}, timeout=600)
+        if put.status_code not in (200, 201, 204):
+            return {"ok": False, "step": "upload audio", "detail": _vimeo_err(put)}
     uri = created.get("uri")
     if uri:
-        # Language isn't part of the create body on this API — set it (and
-        # activate) after upload, best-effort.
-        patch_body = {"active": True}
-        if "language" not in payload:
-            patch_body["language"] = language
-        if "name" not in payload:
-            patch_body["name"] = name
+        # Best-effort: ensure the track is active and human-labeled.
         _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
-                  json=patch_body, timeout=30)
+                  json={"active": True, "name": name}, timeout=30)
     return {"ok": True, "uri": uri or "", "endpoint": path_tpl}
 
 

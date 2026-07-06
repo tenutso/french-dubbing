@@ -269,6 +269,12 @@ The web UI can deliver a finished dub straight onto the source Vimeo video: the 
 Vimeo URL (editable for uploaded files), language defaults to `fr-CA` for `fr-ca` jobs, with
 per‑item results shown inline.
 
+**Auto‑push**: tick *Auto‑push to Vimeo* at submit time (Vimeo‑URL sources; `--auto-push` in
+`trigger.sh`) and the push runs as the final step of the job itself — safe to walk away from a
+long job on an idle‑stopping pod, since the pod can't power down between the dub finishing and
+the outputs reaching Vimeo. Results land in the job log and on the job card; a push failure
+never fails the job (re‑push manually from the card).
+
 **Automation** (n8n etc.): the same action is one API call —
 `POST /api/jobs/{id}/vimeo-push` with `{"video": "...", "language": "fr-CA", "subtitles": true, "audio": true}`
 (Bearer‑auth with `DUBBING_UI_TOKEN`), so a workflow can go submit → wait → push without

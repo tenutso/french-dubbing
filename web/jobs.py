@@ -10,7 +10,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-JOBS_FILE = "/workspace/web/jobs.json"
+JOBS_FILE = os.path.join(
+    os.environ.get("DUBBING_WORKSPACE", "/workspace"), "web", "jobs.json"
+)
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -38,6 +40,8 @@ class Job:
     phase: str = ""
     returncode: Optional[int] = None
     source_url: str = ""
+    # Result of the (auto or manual) push to Vimeo: {ok, video_id, results}.
+    vimeo: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

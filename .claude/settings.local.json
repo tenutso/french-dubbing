@@ -56,7 +56,8 @@
       "Bash(bash -n 05_web.sh trigger.sh)",
       "WebFetch(domain:developer.vimeo.com)",
       "WebFetch(domain:github.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(DUBBING_WORKSPACE=/tmp/claude-1000/-home-anijmeh-projects-french-dubbing/79b9f484-07e0-4cbd-98c2-5fa42b5aef96/scratchpad/ws /tmp/claude-1000/-home-anijmeh-projects-french-dubbing/79b9f484-07e0-4cbd-98c2-5fa42b5aef96/scratchpad/venv/bin/python /tmp/claude-1000/-home-anijmeh-projects-french-dubbing/79b9f484-07e0-4cbd-98c2-5fa42b5aef96/scratchpad/test_autopush.py)"
     ]
   }
 }

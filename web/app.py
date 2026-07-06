@@ -473,6 +473,12 @@ async def _run_job(job: Job) -> None:
             job.status = STATUS_FAILED
             job.error = job.error or f"pipeline exited with code {rc}"
 
+        # Auto-push to Vimeo — runs inside the job (before the finally block
+        # ends it), so the idle auto-stop can't power the pod down between a
+        # long job finishing unattended and its outputs reaching Vimeo.
+        if job.status == STATUS_COMPLETED and opts.get("vimeo_push"):
+            await _auto_vimeo_push(job)
+
     finally:
         if not job.ended_at:
             job.ended_at = time.time()
@@ -900,6 +906,7 @@ async def submit(
     speakers: str = Form(""),
     force: str = Form(""),
     review: str = Form(""),
+    vimeo_push: str = Form(""),
 ) -> JSONResponse:
     # Validate options against allow-lists (empty = use config default)
     if locale and locale not in LOCALE_CHOICES:
@@ -934,6 +941,14 @@ async def submit(
     if not active:
         raise HTTPException(400, "no source provided: upload a file, give a Vimeo URL, or an on-pod path")
 
+    want_autopush = vimeo_push.lower() in ("1", "true", "on", "yes")
+    if want_autopush:
+        if not vimeo_url:
+            raise HTTPException(400, "auto-push to Vimeo needs a Vimeo URL source "
+                                     "(the push target is the source video)")
+        if not _vimeo_load_token().get("access_token"):
+            raise HTTPException(400, "auto-push requested but not connected to Vimeo")
+
     job_id = new_job_id()
     options = {
         "locale": locale or None,
@@ -941,6 +956,7 @@ async def submit(
         "speakers": spk,
         "force": force.lower() in ("1", "true", "on", "yes"),
         "review": review.lower() in ("1", "true", "on", "yes"),
+        "vimeo_push": want_autopush,
     }
     output_dir = OUTPUT_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1995,6 +2011,56 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
     return {"ok": True, "uri": uri or "", "endpoint": path_tpl}
 
 
+def _job_language(job: Job) -> str:
+    """Vimeo track language for a job: its locale option, else the config default."""
+    loc = (job.options or {}).get("locale") or ""
+    if not loc:
+        try:
+            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+            loc = (cfg.get("translation") or {}).get("locale", "")
+        except Exception:
+            loc = ""
+    return "fr-CA" if loc == "fr-ca" else "fr"
+
+
+async def _auto_vimeo_push(job: Job) -> None:
+    """Push a just-completed job's outputs to its source Vimeo video.
+
+    Runs in the worker as part of the job, streaming results into the job log.
+    A push failure never fails the job itself — the dub succeeded; the result
+    is stored on the job (job.vimeo) so the card shows what happened."""
+    token = _vimeo_load_token().get("access_token", "")
+    video_id = _vimeo_video_id(job.source_url or "")
+    if not token or not video_id:
+        reason = "not connected to Vimeo" if not token else "job has no Vimeo source URL"
+        job.vimeo = {"auto": True, "ok": False, "detail": reason}
+        state.publish(job.id, f"!!! auto-push to Vimeo skipped: {reason}")
+        return
+
+    language = _job_language(job)
+    srt = job.outputs.get("srt")
+    m4a = job.outputs.get("full") or job.outputs.get("audio")
+    state.publish(job.id, f">>> auto-pushing to Vimeo video {video_id} ({language}) …")
+    results: dict = {}
+    if srt and os.path.exists(srt):
+        results["subtitles"] = await asyncio.to_thread(
+            _vimeo_push_subtitles, token, video_id, srt, language)
+    if m4a and os.path.exists(m4a):
+        results["audio"] = await asyncio.to_thread(
+            _vimeo_push_audio, token, video_id, m4a, language)
+
+    ok = bool(results) and all(v.get("ok") for v in results.values())
+    job.vimeo = {"auto": True, "ok": ok, "video_id": video_id,
+                 "language": language, "results": results}
+    for kind, res in results.items():
+        state.publish(job.id, "    vimeo %s: %s" % (
+            kind, "✓" if res.get("ok")
+            else f"✗ {res.get('step', '')} — {res.get('detail', '')}"))
+    state.publish(job.id, "<<< auto-push %s" % (
+        "complete" if ok else "FAILED (the dub itself succeeded — push manually from the job card)"))
+    log.info("vimeo auto-push job=%s video=%s ok=%s", job.id, video_id, ok)
+
+
 def _external_base(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto", "https")
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
@@ -2123,6 +2189,9 @@ async def vimeo_push(job_id: str, request: Request) -> JSONResponse:
             results["audio"] = {"ok": False, "step": "locate file", "detail": "no audio output on this job"}
 
     ok = all(v.get("ok") for v in results.values()) if results else False
+    job.vimeo = {"auto": False, "ok": ok, "video_id": video_id,
+                 "language": language, "results": results}
+    state.save()
     log.info("vimeo push job=%s video=%s → %s", job_id, video_id,
              {k: v.get("ok") for k, v in results.items()})
     return JSONResponse({"ok": ok, "video_id": video_id, "language": language, "results": results})

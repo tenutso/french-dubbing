@@ -13,6 +13,9 @@ let lastJobsHash = "";
 let reviewJobId = null;
 let reviewSegments = [];
 
+// Vimeo connection state (used by the submit form before the status loads)
+let vimeoConnected = false;
+
 // ── Options ──────────────────────────────────────────────────────────────────
 async function loadOptions() {
   const r = await fetch("/api/options");
@@ -101,6 +104,12 @@ function updateSourceMode() {
   fileInput.required = mode === "file";
   vimeoInput.required = mode === "vimeo";
   pathInput.required = mode === "path";
+  // Auto-push needs a Vimeo source (the push target) and a Vimeo connection.
+  const pushBox = $("#vimeo_push");
+  const usable = mode === "vimeo" && vimeoConnected;
+  pushBox.disabled = !usable;
+  if (!usable) pushBox.checked = false;
+  $("#vimeo-push-label").classList.toggle("muted", !usable);
 }
 document.querySelectorAll('input[name="source"]').forEach(r =>
   r.addEventListener("change", updateSourceMode)
@@ -130,6 +139,7 @@ $("#submit-form").addEventListener("submit", e => {
   fd.append("volume_boost", $("#volume_boost").value);
   if ($("#force").checked) fd.append("force", "on");
   if ($("#review").checked) fd.append("review", "on");
+  if ($("#vimeo_push").checked) fd.append("vimeo_push", "on");
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
@@ -234,8 +244,6 @@ function renderList(selector, list, emptyMsg) {
 }
 
 // ── Vimeo connection ─────────────────────────────────────────────────────────
-let vimeoConnected = false;
-
 async function loadVimeoStatus() {
   try {
     const r = await fetch("/api/vimeo/status");
@@ -249,6 +257,7 @@ async function loadVimeoStatus() {
     $("#vimeo-disconnect").hidden = !s.connected;
     $("#vimeo-token-input").hidden = s.connected;
     $("#vimeo-token-save").hidden = s.connected;
+    updateSourceMode();   // (re)enable the auto-push checkbox
   } catch (e) { /* leave as-is */ }
 }
 
@@ -346,6 +355,7 @@ function renderCard(job) {
   if (o.speakers) meta.push(`${o.speakers} spk`);
   if (o.volume_boost != null) meta.push(`+${o.volume_boost}%`);
   if (o.force) meta.push("force");
+  if (o.vimeo_push) meta.push("auto-push");
   const dur = job.ended_at ? (job.ended_at - job.started_at)
             : job.started_at ? (Date.now() / 1000 - job.started_at) : 0;
   if (dur > 0) meta.push(`${Math.round(dur)}s`);
@@ -388,6 +398,21 @@ function renderCard(job) {
     e.className = "err";
     e.textContent = job.error;
     dl.appendChild(e);
+  }
+
+  // Vimeo push outcome (auto or manual), persisted on the job.
+  if (job.vimeo && job.vimeo.results) {
+    const v = document.createElement("div");
+    v.className = job.vimeo.ok ? "muted" : "err";
+    const parts = Object.entries(job.vimeo.results).map(([k, r]) =>
+      r.ok ? `${k} ✓` : `${k} ✗ ${r.step || ""} — ${r.detail || ""}`);
+    v.textContent = `Vimeo (${job.vimeo.auto ? "auto" : "manual"} → ${job.vimeo.video_id}): ${parts.join("   ")}`;
+    dl.appendChild(v);
+  } else if (job.vimeo && job.vimeo.detail) {
+    const v = document.createElement("div");
+    v.className = "err";
+    v.textContent = `Vimeo auto-push skipped: ${job.vimeo.detail}`;
+    dl.appendChild(v);
   }
 
   // Log panel: reuse any buffered text we already streamed

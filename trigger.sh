@@ -21,6 +21,9 @@
 #   --locale fr|fr-ca     locale for this job
 #   --speakers N          exact speaker count (1 = solo presenter)
 #   --volume-boost N      loudness boost percent
+#   --auto-push           push subtitles + dubbed audio onto the source Vimeo
+#                         video when the job completes (Vimeo-URL sources only;
+#                         needs the pod's Vimeo connection) — fire-and-forget
 #   --review              pause for translation review (default off — a job
 #                         waiting for review lets the pod idle-stop; state
 #                         persists and resumes on next start)
@@ -34,7 +37,7 @@ set -euo pipefail
 BASE="${DUBBING_URL:-https://${RUNPOD_POD_ID}-7860.proxy.runpod.net}"
 AUTH=(-H "Authorization: Bearer ${DUBBING_UI_TOKEN}")
 
-SOURCE_KIND="" SOURCE_VAL="" LOCALE="" SPEAKERS="" VBOOST="" REVIEW="" WAIT=0 DOWNLOAD_DIR=""
+SOURCE_KIND="" SOURCE_VAL="" LOCALE="" SPEAKERS="" VBOOST="" REVIEW="" AUTOPUSH="" WAIT=0 DOWNLOAD_DIR=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --vimeo)        SOURCE_KIND=vimeo_url;  SOURCE_VAL="$2"; shift 2 ;;
@@ -43,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --locale)       LOCALE="$2";   shift 2 ;;
     --speakers)     SPEAKERS="$2"; shift 2 ;;
     --volume-boost) VBOOST="$2";   shift 2 ;;
+    --auto-push)    AUTOPUSH=on;   shift ;;
     --review)       REVIEW=on;     shift ;;
     --wait)         WAIT=1;        shift ;;
     --download)     WAIT=1; DOWNLOAD_DIR="$2"; shift 2 ;;
@@ -91,6 +95,7 @@ fi
 [[ -n "$LOCALE"   ]] && form+=(-F "locale=${LOCALE}")
 [[ -n "$SPEAKERS" ]] && form+=(-F "speakers=${SPEAKERS}")
 [[ -n "$VBOOST"   ]] && form+=(-F "volume_boost=${VBOOST}")
+[[ -n "$AUTOPUSH" ]] && form+=(-F "vimeo_push=on")
 [[ -n "$REVIEW"   ]] && form+=(-F "review=on")
 
 resp=$(curl -sS "${AUTH[@]}" "${form[@]}" "${BASE}/api/jobs")

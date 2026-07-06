@@ -1843,6 +1843,32 @@ def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, Dict[str, dict]]]:
     return None
 
 
+def _pick_track_type(enum: List[str]) -> Optional[str]:
+    """Choose the audio-track type meaning 'dubbed into another language'.
+
+    The enum comes from the account's API spec and its naming varies. Never
+    pick commentary/description (players present those differently) and never
+    pick main/original (could displace the source audio) — when nothing
+    dubbing-ish exists, return None and omit the field so the API applies its
+    own default (or rejects it, which the adaptive retry absorbs)."""
+    if not enum:
+        return "dubbed"
+    by_lower = {e.lower(): e for e in enum}
+    for cand in ("dubbed", "dub", "dubbing", "translation", "translated",
+                 "alternative", "alternate", "secondary"):
+        if cand in by_lower:
+            return by_lower[cand]
+    for e in enum:   # anything containing "dub" ("dubbed_audio", …)
+        if "dub" in e.lower():
+            return e
+    avoid = ("main", "original", "primary", "commentary",
+             "audio_description", "description", "descriptive")
+    for e in enum:
+        if e.lower() not in avoid:
+            return e
+    return None
+
+
 def _tus_upload(link: str, file_path: str) -> Optional[str]:
     """Single-shot tus upload (Vimeo's resumable protocol). None on success.
 
@@ -1910,21 +1936,17 @@ def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
         return {"ok": False, "step": "create audio track",
                 "detail": f"unresolved placeholder in endpoint {path_tpl}"}
 
-    # "type" values come from the spec's enum ("dubbed" preferred).
-    type_enum = (props.get("type") or {}).get("enum") or []
-    track_type = "dubbed"
-    if type_enum and "dubbed" not in type_enum:
-        track_type = next((e for e in type_enum if e not in ("main", "original")),
-                          type_enum[0])
+    track_type = _pick_track_type((props.get("type") or {}).get("enum") or [])
     # Contract learned from the live API (400 invalid_parameters): the create
     # body REQUIRES language_code and an upload object (tus, like video
     # uploads) — the account spec under-reports its own properties.
     payload: dict = {
-        "type": track_type,
         "active": True,
         "language_code": language,
         "upload": {"approach": "tus", "size": os.path.getsize(m4a_path)},
     }
+    if track_type:
+        payload["type"] = track_type
     log.info("vimeo: audio-track endpoint %s (spec props: %s) payload %s",
              path_tpl,
              {k: (v.get("enum") or v.get("type", "?")) for k, v in props.items()} or "unknown",

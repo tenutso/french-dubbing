@@ -22,11 +22,12 @@ The pipeline does everything from source separation through translation, voice�
 | Subtitles | **Hybrid BBC/Netflix shaper** | ≤2 lines, ≤42 cpl, ≤17 CPS reading speed, logical line breaks |
 | Output | AAC 192 kbps / 48 kHz stereo (+ optional full‑mix with background) + UTF‑8 SRT + optional muxed MP4 | Vimeo‑ready |
 
-### Three features worth calling out
+### Features worth calling out
 
 - **Timeline‑anchored timing (`timing_policy: anchored`, default).** Each translated run is fit into its original slot — dense runs are sped up a touch (capped at `tts.max_stretch`, ~1.30×, inaudible on speech) and accumulated drift is re‑anchored at every pause — so the dub stays in sync with the video over a full‑length program. Pairs with length‑aware translation (`translation.budget_cps`, iterated over `translation.compression_rounds`) that keeps the French tight enough to fit. A `no_drop` mode never speeds up (timeline extends, so it drifts longer than the source on dense talks); `lock` preserves exact source timing and truncates overflow for lip‑sync‑sensitive work.
 - **Reading‑speed coupling.** Speech runs whose translated text is denser than `tts.reading_cps` (16) are gently *slowed* toward that pace (capped at `tts.max_slowdown`, 1.25×, and never past the slot edge under `anchored`). This de‑rushes the dub and keeps subtitles under the 17 CPS reading‑speed limit.
 - **Per‑voice pace management.** F5‑TTS clones each reference clip's speaking rate, so a pause‑heavy or slow‑spoken reference would make that speaker's entire dub run long. Three layers prevent it: reference clips are **pause‑condensed** (gaps capped at 300 ms), each cloned voice is **calibrated** once and slow voices get a gentle generative speed‑up (≤1.25×), and any segment that still can't fit its window is **adaptively re‑synthesized** faster instead of relying on time‑stretch. Per‑speaker pace is logged after synthesis, with a warning when a voice is too slow to fit a dub timeline.
+- **Name pronunciation + ASR verification.** A **pronunciation lexicon** (`pronunciations:` in the glossary, editable in the web UI) phonetically respells names/brands for the TTS only — subtitles keep real spellings — and unmapped ALL‑CAPS acronyms are spelled out with French letter names. Then every synthesized segment is **transcribed back** (whisper‑small, CPU) and scored against its intended text; low‑similarity takes are re‑synthesized best‑of‑N (`tts.verify_tts`), catching garbled names, vocabulary bleed, and swallowed words that duration/volume checks miss.
 
 ### Localisation
 

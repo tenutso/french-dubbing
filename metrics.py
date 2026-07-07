@@ -276,6 +276,8 @@ class MetricsCollector:
         segments: Sequence[dict],
         synthesized: Sequence[Tuple],
         src_rate: int,
+        asr_scores: Optional[Dict[int, float]] = None,
+        verify_threshold: float = 0.0,
     ) -> None:
         """Compare natural TTS length vs target window → did the translation fit?
 
@@ -317,6 +319,7 @@ class MetricsCollector:
                     "required_stretch": round(required, 3),
                     "max_stretch": round(self.max_stretch, 3),
                     "fits": int(required <= self.max_stretch) if required else 1,
+                    "asr_score": (asr_scores or {}).get(key, ""),
                     "text_fr": fr,
                 })
 
@@ -326,7 +329,7 @@ class MetricsCollector:
             path = os.path.join(self.metrics_dir, "synthesis_fit.csv")
             fields = [
                 "id", "speaker", "start_s", "duration_s", "fr_chars", "tts_natural_s",
-                "required_stretch", "max_stretch", "fits", "text_fr",
+                "required_stretch", "max_stretch", "fits", "asr_score", "text_fr",
             ]
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=fields)
@@ -335,6 +338,9 @@ class MetricsCollector:
 
             n_unfit = sum(1 for r in rows if not r["fits"])
             stretches = [r["required_stretch"] for r in rows if r["required_stretch"]]
+            flagged = ""
+            if asr_scores and verify_threshold > 0:
+                flagged = sum(1 for v in asr_scores.values() if v < verify_threshold)
             self._synthesis_summary = {
                 "phase": "synthesis_fit",
                 "n_segments": len(rows),
@@ -342,6 +348,7 @@ class MetricsCollector:
                 "pct_unfit": round(_pct(n_unfit, len(rows)), 1),
                 "mean_required_stretch": round(statistics.mean(stretches), 3) if stretches else 0.0,
                 "max_required_stretch": round(max(stretches), 3) if stretches else 0.0,
+                "verify_flagged": flagged,
             }
             self.log.info(
                 f"  [metrics] synthesis_fit: {n_unfit}/{len(rows)} segment(s) "
@@ -406,9 +413,11 @@ class MetricsCollector:
         if self._synthesis_summary:
             row["synthesis_pct_unfit"] = self._synthesis_summary["pct_unfit"]
             row["synthesis_mean_required_stretch"] = self._synthesis_summary["mean_required_stretch"]
+            row["tts_verify_flagged"] = self._synthesis_summary.get("verify_flagged", "")
         else:
             row["synthesis_pct_unfit"] = ""
             row["synthesis_mean_required_stretch"] = ""
+            row["tts_verify_flagged"] = ""
 
         runs_path = os.path.join(self.output_dir, "_dubbing_metrics_runs.csv")
         fields = list(row.keys())

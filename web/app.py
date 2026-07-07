@@ -118,6 +118,9 @@ CONFIG_SCHEMA: dict = {
     "translation.target_lang":         ("str",   "Target language",         "", {"choices": ["fr", "es", "de", "it", "pt", "nl", "pl", "ru", "ja", "ko", "zh", "ar", "tr", "hi", "vi"], "group": "Translation"}),
     "translation.locale":              ("str",   "Locale variant",          "fr-ca triggers the Canadian glossary.", {"choices": LOCALE_CHOICES, "group": "Translation"}),
 
+    # TTS
+    "tts.verify_tts":                  ("bool",  "ASR verification",        "Transcribe each synthesized segment and re-generate low-similarity takes (best-of-N). Catches garbled names, vocabulary bleed, and swallowed words; ~1 min per video.", {"group": "TTS"}),
+
     # Subtitles
     "subtitles.sync_offset_ms":        ("int",   "Subtitle offset (ms)",    "Positive = later, negative = earlier.", {"min": -10000, "max": 10000, "step": 50, "group": "Subtitles"}),
 
@@ -1158,15 +1161,19 @@ def _download(job: Job, kind: str) -> FileResponse:
 
 GLOSSARY_PATH = Path("/workspace/canadian_glossary.yaml")
 GLOSSARY_MIRRORS = [Path("/workspace/french-dubbing/canadian_glossary.yaml")]
-GLOSSARY_TERM_MODES = ["suggest", "always"]
-# The flat glossary file stores two editable top-level maps:
-#   glossary: {english: fr_ca}    → mode "suggest" (injected into the prompt)
-#   always:   {find_form: fr_ca}  → mode "always"  (deterministic post-rewrite)
+GLOSSARY_TERM_MODES = ["suggest", "always", "pronounce"]
+# The flat glossary file stores three editable top-level maps:
+#   glossary:       {english: fr_ca}    → mode "suggest" (injected into the prompt)
+#   always:         {find_form: fr_ca}  → mode "always"  (deterministic post-rewrite)
+#   pronunciations: {written: spoken}   → mode "pronounce" (TTS-only phonetic respelling)
 # The editor surfaces each entry as a row {en, fr_ca, mode}. This mirrors how
-# 02_pipeline.py:load_glossary reads the file, so edits round-trip correctly.
-# The acronyms: section and all header/section comments are preserved on save.
+# 02_pipeline.py load_glossary/load_pronunciations read the file, so edits
+# round-trip correctly. The acronyms: section and all header/section comments
+# are preserved on save.
 GLOSSARY_FIELDS = ("en", "fr_ca", "mode")
-_GLOSSARY_SECTION_BY_MODE = {"suggest": "glossary", "always": "always"}
+_GLOSSARY_SECTION_BY_MODE = {
+    "suggest": "glossary", "always": "always", "pronounce": "pronunciations",
+}
 
 
 @app.get("/api/glossary")
@@ -1176,7 +1183,7 @@ async def get_glossary() -> JSONResponse:
     except Exception as e:
         raise HTTPException(500, f"failed to read glossary: {e}")
     terms: list[dict] = []
-    for mode, section in (("suggest", "glossary"), ("always", "always")):
+    for mode, section in _GLOSSARY_SECTION_BY_MODE.items():
         for k, v in (data.get(section) or {}).items():
             terms.append({"en": str(k), "fr_ca": "" if v is None else str(v), "mode": mode})
     return JSONResponse({
@@ -1188,18 +1195,18 @@ async def get_glossary() -> JSONResponse:
 
 @app.post("/api/glossary")
 async def update_glossary(payload: dict) -> JSONResponse:
-    """Rewrite the editable `glossary:` and `always:` maps in canadian_glossary.yaml.
+    """Rewrite the editable maps in canadian_glossary.yaml.
 
     Body: {"terms": [{"en", "fr_ca", "mode"}, ...]}. Rows are grouped by mode
-    into the two flat maps the pipeline reads (mode "suggest" → glossary:,
-    mode "always" → always:). The acronyms: section, header comments, and any
-    other top-level content are preserved.
+    into the flat maps the pipeline reads (mode "suggest" → glossary:,
+    "always" → always:, "pronounce" → pronunciations:). The acronyms: section,
+    header comments, and any other top-level content are preserved.
     """
     terms = payload.get("terms")
     if not isinstance(terms, list):
         raise HTTPException(400, "terms must be a list")
 
-    by_mode: dict[str, dict[str, str]] = {"suggest": {}, "always": {}}
+    by_mode: dict[str, dict[str, str]] = {m: {} for m in GLOSSARY_TERM_MODES}
     for i, raw in enumerate(terms):
         if not isinstance(raw, dict):
             raise HTTPException(400, f"terms[{i}] must be an object")
@@ -1213,7 +1220,7 @@ async def update_glossary(payload: dict) -> JSONResponse:
         by_mode[mode][en] = fr_ca
 
     try:
-        _rewrite_glossary_sections(GLOSSARY_PATH, by_mode["suggest"], by_mode["always"])
+        _rewrite_glossary_sections(GLOSSARY_PATH, by_mode)
     except Exception as e:
         raise HTTPException(500, f"failed to update glossary: {e}")
 
@@ -1221,12 +1228,12 @@ async def update_glossary(payload: dict) -> JSONResponse:
     for mp in GLOSSARY_MIRRORS:
         try:
             if mp.exists() and mp.resolve() != GLOSSARY_PATH.resolve():
-                _rewrite_glossary_sections(mp, by_mode["suggest"], by_mode["always"])
+                _rewrite_glossary_sections(mp, by_mode)
                 mirrored.append(str(mp))
         except Exception as e:
             log.warning("glossary mirror failed for %s: %s", mp, e)
 
-    count = len(by_mode["suggest"]) + len(by_mode["always"])
+    count = sum(len(m) for m in by_mode.values())
     return JSONResponse({"ok": True, "count": count, "mirrored": mirrored})
 
 
@@ -1245,10 +1252,10 @@ def _yaml_q(v) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _rewrite_glossary_sections(path: Path, suggest_map: dict, always_map: dict) -> None:
-    """Regenerate the `glossary:` and `always:` flat maps in place.
+def _rewrite_glossary_sections(path: Path, by_mode: dict) -> None:
+    """Regenerate the editable flat maps (glossary/always/pronunciations) in place.
 
-    Only those two top-level sections are rewritten from the editor data; the
+    Only those top-level sections are rewritten from the editor data; the
     file header, the acronyms: section, and the comment blocks that precede each
     section are preserved. Inline grouping comments *inside* a rewritten section
     are not retained (the section body is regenerated from the submitted rows).
@@ -1290,8 +1297,8 @@ def _rewrite_glossary_sections(path: Path, suggest_map: dict, always_map: dict) 
             break                            # column-0 content → next section/comment
         return lines[:start] + render(section, mapping) + lines[last_body + 1:]
 
-    lines = splice(lines, "glossary", suggest_map)
-    lines = splice(lines, "always", always_map)
+    for mode, section in _GLOSSARY_SECTION_BY_MODE.items():
+        lines = splice(lines, section, by_mode.get(mode) or {})
 
     path.write_text("\n".join(lines) + newline_eof, encoding="utf-8")
 

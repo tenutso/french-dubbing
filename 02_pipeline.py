@@ -177,6 +177,15 @@ class PipelineConfig:
     f5tts_nfe_step: int = 32
     f5tts_cfg_strength: float = 2.0
     f5tts_speed: float = 1.0
+    # Spell out unmapped 2-4 letter ALL-CAPS acronyms with French letter names
+    # for the TTS ("CSP" → "cé esse pé"). Pronunciation-lexicon entries win.
+    tts_spell_acronyms: bool = True
+    # ASR round-trip verification: transcribe each synthesized segment and
+    # re-synthesize low-similarity takes (best-of-N). Catches vocabulary bleed,
+    # swallowed/duplicated words, and garbled output that duration/RMS miss.
+    verify_tts: bool = True
+    verify_threshold: float = 0.78
+    verify_retries: int = 2
 
     # Audio
     output_volume_boost_pct: float = 0.0
@@ -325,6 +334,10 @@ def load_config(path: str) -> PipelineConfig:
         f5tts_nfe_step=int(tts.get("f5tts_nfe_step", 32)),
         f5tts_cfg_strength=float(tts.get("f5tts_cfg_strength", 2.0)),
         f5tts_speed=float(tts.get("f5tts_speed", 1.0)),
+        tts_spell_acronyms=bool(tts.get("spell_acronyms", True)),
+        verify_tts=bool(tts.get("verify_tts", True)),
+        verify_threshold=float(tts.get("verify_threshold", 0.78)),
+        verify_retries=int(tts.get("verify_retries", 2)),
         tts_max_stretch=tts.get("max_stretch", 1.3),
         tts_group_gap=tts.get("group_gap", 0.4),
         tts_stretcher=tts.get("stretcher", "rubberband"),
@@ -460,6 +473,32 @@ def load_glossary(path: str, log: logging.Logger) -> "Glossary":
     except Exception as e:
         log.warning(f"Glossary load failed ({e}) — continuing without glossary")
         return empty
+
+
+def load_pronunciations(path: str, log: logging.Logger) -> Dict[str, str]:
+    """Load the TTS pronunciation lexicon: {written form: phonetic respelling}.
+
+    Lives in the glossary file's `pronunciations:` map but is loaded
+    independently of locale — a mispronounced name is wrong in any target
+    language, and phase 2 (which never loads the translation glossary) needs
+    it at synthesis time. Applied to TTS text only; subtitles keep real
+    spellings."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        pron = {
+            str(k): str(v)
+            for k, v in (data.get("pronunciations") or {}).items()
+            if v and str(k) != str(v)
+        }
+        if pron:
+            log.info(f"✓ Pronunciation lexicon: {len(pron)} term(s)")
+        return pron
+    except Exception as e:
+        log.warning(f"Pronunciation lexicon load failed ({e}) — continuing without")
+        return {}
 
 
 def _build_glossary_section(glossary: "Glossary", locale: str) -> str:
@@ -2569,8 +2608,38 @@ _INCLUSIVE_DOT_RE = re.compile(
 _TTS_STRIP_CHARS = str.maketrans({"«": "", "»": "", "“": "", "”": ""})
 
 
-def _tts_spoken_form(text: str) -> str:
-    """Rewrite written-only conventions into something the TTS can pronounce."""
+# French letter names for spelled-out acronyms ("CSP" → "cé esse pé").
+_FR_LETTER_NAMES = {
+    "A": "a", "B": "bé", "C": "cé", "D": "dé", "E": "eu", "F": "effe",
+    "G": "gé", "H": "ache", "I": "i", "J": "ji", "K": "ka", "L": "elle",
+    "M": "emme", "N": "enne", "O": "o", "P": "pé", "Q": "cu", "R": "erre",
+    "S": "esse", "T": "té", "U": "u", "V": "vé", "W": "double vé",
+    "X": "ixe", "Y": "i grec", "Z": "zède",
+}
+# Unmapped 2-4 letter ALL-CAPS tokens (standalone words) get letter-spelled.
+_ACRONYM_RE = re.compile(r"\b([A-Z]{2,4})\b")
+
+
+def _tts_spoken_form(
+    text: str,
+    pronunciations: Optional[Dict[str, str]] = None,
+    spell_acronyms: bool = False,
+) -> str:
+    """Rewrite written-only conventions into something the TTS can pronounce.
+
+    Order matters: the pronunciation lexicon runs first (its phonetic
+    respellings must win over the generic acronym rule), then inclusive-dot
+    collapsing, then acronym letter-spelling on whatever ALL-CAPS tokens the
+    lexicon didn't claim."""
+    if pronunciations:
+        for written, spoken in pronunciations.items():
+            text = re.sub(
+                r"\b" + re.escape(written) + r"\b",
+                spoken.replace("\\", "\\\\"),
+                text,
+                flags=re.IGNORECASE,
+            )
+
     def _collapse(m: "re.Match") -> str:
         base, suffix = m.group(1), m.group(2)
         plural = suffix.rstrip("··‧•").endswith("s") and not base.endswith(("s", "x"))
@@ -2578,6 +2647,11 @@ def _tts_spoken_form(text: str) -> str:
 
     text = _INCLUSIVE_DOT_RE.sub(_collapse, text)
     text = text.translate(_TTS_STRIP_CHARS)
+
+    if spell_acronyms:
+        text = _ACRONYM_RE.sub(
+            lambda m: " ".join(_FR_LETTER_NAMES[ch] for ch in m.group(1)), text
+        )
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
@@ -2585,6 +2659,33 @@ def _tts_spoken_form(text: str) -> str:
 # still reduce quality. 250 chars/chunk keeps each call focused while allowing
 # longer sentences than XTTS permitted.
 _F5TTS_CHUNK_LIMIT = 250
+
+
+def _asr_normalize(text: str, mask_terms: Optional[List[str]] = None) -> str:
+    """Lowercase, strip punctuation, and mask lexicon terms for ASR comparison."""
+    t = text.lower()
+    for term in (mask_terms or []):
+        term = term.strip().lower()
+        if term:
+            t = re.sub(r"\b" + re.escape(term) + r"\b", " ", t)
+    t = re.sub(r"[^\w\s']", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _asr_similarity(
+    expected: str, transcribed: str, mask_terms: Optional[List[str]] = None,
+) -> float:
+    """Similarity of what the TTS was asked to say vs what an ASR heard (0-1).
+
+    Lexicon respellings and their written forms are masked from BOTH sides —
+    the ASR's spelling of a phonetically-respelled name is unpredictable and
+    must not fail an otherwise clean segment."""
+    import difflib
+    a = _asr_normalize(expected, mask_terms)
+    b = _asr_normalize(transcribed, mask_terms)
+    if not a:
+        return 1.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 # Runaway / quality guard. F5-TTS is much less prone to repetition loops than
 # autoregressive XTTS, but near-silent or oddly-long outputs can still occur on
@@ -2666,7 +2767,7 @@ def synthesize_all_segments(
         from f5_tts.api import F5TTS
     except ImportError:
         log.error("f5-tts not installed. Install: pip install f5-tts")
-        return [], 24000
+        return [], 24000, {}
 
     import torch as _torch
 
@@ -2734,7 +2835,7 @@ def synthesize_all_segments(
             f5 = F5TTS(model="F5TTS_Base", ckpt_file=ckpt_file, vocab_file=vocab_file, device=device)
         except Exception as e:
             log.error(f"Failed to load HuggingFace model '{config.f5tts_model}': {e}")
-            return [], 24000
+            return [], 24000, {}
     else:
         f5 = F5TTS(model=config.f5tts_model, device=device)
 
@@ -2929,14 +3030,44 @@ def synthesize_all_segments(
             log.debug(f"  Pace calibration failed for {Path(rw).name}: {e}")
             ref_speed[rw] = 1.0
 
+    # Pronunciation lexicon — applied to the TTS text only (subtitles keep the
+    # real spellings). Its terms are also masked out of ASR verification.
+    pronunciations = load_pronunciations(config.glossary_path, log)
+    _mask_terms = list(pronunciations.keys()) + list(pronunciations.values())
+
+    # ASR round-trip verifier — whisper "small" on CPU (same pattern as the
+    # ref-text prefetch) so it never competes with F5-TTS for VRAM.
+    _verifier: dict = {}
+
+    def _asr_heard(wav: np.ndarray) -> Optional[str]:
+        try:
+            if "model" not in _verifier:
+                from faster_whisper import WhisperModel as _WM
+                log.info("  Loading ASR verifier (whisper small, CPU) …")
+                _verifier["model"] = _WM("small", device="cpu", compute_type="int8",
+                                         download_root=config.models_folder)
+            audio16 = librosa.resample(wav.astype(np.float32), orig_sr=sr, target_sr=16000)
+            segs_iter, _ = _verifier["model"].transcribe(
+                audio16, language=config.target_lang, beam_size=1,
+                condition_on_previous_text=False,
+            )
+            return " ".join(s.text.strip() for s in segs_iter).strip()
+        except Exception as e:
+            log.debug(f"  ASR verification transcribe failed: {e}")
+            return None
+
     synthesized: List[Tuple[np.ndarray, float, float]] = []
     resynth_count = 0
+    verify_regen = 0
+    verify_low = 0
+    asr_scores: Dict[int, float] = {}   # round(start*1000) -> similarity
     # Per-speaker pace accounting on the FIRST pass (reflects the calibrated
     # voice, before any per-segment adaptive speed-up masks it).
     pace: Dict[str, List[float]] = {}   # speaker -> [chars, natural_seconds]
     with tqdm(total=len(segments), desc="Synthesizing (F5-TTS)") as pbar:
         for seg in segments:
-            text = _tts_spoken_form(_seg_text(seg))
+            text = _tts_spoken_form(_seg_text(seg), pronunciations,
+                                    spell_acronyms=config.tts_spell_acronyms)
             if not text:
                 pbar.update(1)
                 continue
@@ -2953,6 +3084,7 @@ def synthesize_all_segments(
                         f"({len(text)} chars, limit={_F5TTS_CHUNK_LIMIT})"
                     )
                 wav = _synth_segment(chunks, ref_wav, seg["id"])
+                seg_speed: Optional[float] = None   # final take's speed override
 
                 natural = len(wav) / sr
                 spk = seg.get("speaker", "default")
@@ -2978,9 +3110,53 @@ def synthesize_all_segments(
                                 f"at speed {faster_speed:.2f} → {len(cand) / sr:.1f}s"
                             )
                             wav = cand
+                            seg_speed = faster_speed
                             resynth_count += 1
                     except Exception as re_e:
                         log.debug(f"Segment {seg['id']}: adaptive re-synthesis failed: {re_e}")
+
+                # ASR round-trip verification: does the audio actually say the
+                # text? Catches vocabulary bleed, swallowed/duplicated words,
+                # and garbled output at normal duration/volume. Retries are
+                # independent samples (random seed); the best-scoring take wins.
+                if config.verify_tts:
+                    heard = _asr_heard(wav)
+                    score = (_asr_similarity(text, heard, _mask_terms)
+                             if heard is not None else 1.0)
+                    if score < config.verify_threshold:
+                        best_wav, best_score, best_heard = wav, score, heard
+                        for _ in range(max(0, config.verify_retries)):
+                            try:
+                                cand = _synth_segment(chunks, ref_wav, seg["id"],
+                                                      speed=seg_speed)
+                            except Exception as ve:
+                                log.debug(f"Segment {seg['id']}: verify retry failed: {ve}")
+                                continue
+                            c_heard = _asr_heard(cand)
+                            if c_heard is None:
+                                continue
+                            c_score = _asr_similarity(text, c_heard, _mask_terms)
+                            if c_score > best_score:
+                                best_wav, best_score, best_heard = cand, c_score, c_heard
+                            if best_score >= config.verify_threshold:
+                                break
+                        if best_wav is not wav:
+                            log.info(
+                                f"Segment {seg['id']}: ASR score {score:.2f} — "
+                                f"regenerated to {best_score:.2f}"
+                            )
+                            wav = best_wav
+                            verify_regen += 1
+                        score = best_score
+                        if score < config.verify_threshold:
+                            verify_low += 1
+                            log.warning(
+                                f"Segment {seg['id']}: ASR score {score:.2f} below "
+                                f"{config.verify_threshold:.2f} after retries\n"
+                                f"    expected: {text[:120]!r}\n"
+                                f"    heard   : {(best_heard or '')[:120]!r}"
+                            )
+                    asr_scores[round(float(seg['start']) * 1000)] = round(score, 3)
 
                 synthesized.append((wav, seg["start"], seg["end"]))
             except Exception as e:
@@ -2989,6 +3165,13 @@ def synthesize_all_segments(
 
     log.info(f"✓ Synthesized {len(synthesized)} segments at {sr} Hz"
              + (f" ({resynth_count} re-synthesized faster to fit)" if resynth_count else ""))
+    if config.verify_tts:
+        log.info(
+            f"✓ ASR verification: {len(asr_scores)} segment(s) scored, "
+            f"{verify_regen} regenerated, {verify_low} still below "
+            f"{config.verify_threshold:.2f}"
+        )
+        _verifier.pop("model", None)
 
     # Per-speaker pace report — a slow cloned voice means its reference clip
     # is pause-heavy or slow-spoken; no downstream stretching can absorb it.
@@ -3008,7 +3191,7 @@ def synthesize_all_segments(
 
     del f5
     free_vram(log)
-    return synthesized, sr
+    return synthesized, sr, asr_scores
 
 
 # ============================================================================
@@ -4483,7 +4666,7 @@ def process_video(
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
     log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")
-    synthesized, actual_sr = synthesize_all_segments(
+    synthesized, actual_sr, asr_scores = synthesize_all_segments(
         segments,
         speaker_wav,
         config,
@@ -4495,7 +4678,10 @@ def process_video(
     free_vram(log)
 
     # Ground-truth fit: did the natural TTS length fit each segment's window?
-    metrics.record_synthesis_fit(segments, synthesized, actual_sr)
+    metrics.record_synthesis_fit(
+        segments, synthesized, actual_sr, asr_scores=asr_scores,
+        verify_threshold=config.verify_threshold if config.verify_tts else 0.0,
+    )
 
     # ── 6. Assemble + encode + SRT ──────────────────────────────────────────
     log.info("\n[6/6] ASSEMBLING & ENCODING")
@@ -4955,7 +5141,7 @@ def process_video_phase2(
 
     # ── 5. TTS synthesis ────────────────────────────────────────────────────
     log.info("\n[5/6] SYNTHESIZING FRENCH AUDIO (F5-TTS)")
-    synthesized, actual_sr = synthesize_all_segments(
+    synthesized, actual_sr, asr_scores = synthesize_all_segments(
         segments,
         speaker_wav,
         config,
@@ -4966,7 +5152,10 @@ def process_video_phase2(
         return False
     free_vram(log)
 
-    metrics.record_synthesis_fit(segments, synthesized, actual_sr)
+    metrics.record_synthesis_fit(
+        segments, synthesized, actual_sr, asr_scores=asr_scores,
+        verify_threshold=config.verify_threshold if config.verify_tts else 0.0,
+    )
 
     # ── 6. Assemble + encode + SRT ──────────────────────────────────────────
     log.info("\n[6/6] ASSEMBLING & ENCODING")

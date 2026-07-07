@@ -131,6 +131,22 @@ subtitles by the CAPS style guide — are unpronounceable, so the TTS receives t
 base form (re‑pluralised when the suffix carried the plural). Guillemets are stripped. The
 subtitles keep the full inclusive written forms.
 
+The same pass applies the **pronunciation lexicon** (`pronunciations:` in
+[`canadian_glossary.yaml`](canadian_glossary.yaml), editable in the web UI's glossary editor):
+names and brands the voice mispronounces are respelled phonetically for the TTS only
+(*Vimeo → Viméo*), and — after the lexicon, so its entries win — unmapped 2–4‑letter
+ALL‑CAPS acronyms are spelled out with French letter names (*CSP → cé esse pé*;
+`tts.spell_acronyms`).
+
+**ASR round‑trip verification** (`tts.verify_tts`): each synthesized segment is transcribed
+back (faster‑whisper *small* on CPU — no VRAM contention with F5‑TTS) and scored against the
+exact text the TTS was asked to say (punctuation‑insensitive similarity; lexicon respellings
+masked from both sides). Segments below `verify_threshold` are re‑synthesized up to
+`verify_retries` times — retries are independent samples since the seed is random — and the
+best‑scoring take wins. This catches vocabulary bleed, swallowed/duplicated words, and
+garbled‑but‑normal‑length output that the duration/RMS guards can't see. Scores land in
+`synthesis_fit.csv` (`asr_score`) and the per‑run CSV (`tts_verify_flagged`).
+
 **Pace management** (two generative layers — F5's speed parameter *speaks* faster, which
 sounds far better than Rubber Band at 1.7–2.3×):
 

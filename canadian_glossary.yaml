@@ -14,6 +14,18 @@ acronyms:
   HoF: Hall of Fame
   GSF: Global Speakers Federation
 
+# ── Pronunciations (TTS only) ─────────────────────────────────────────────────
+# {written form: phonetic respelling}. Applied ONLY to the text sent to the
+# TTS — subtitles keep the real spelling. Use for names/brands the voice
+# mispronounces; spell them the way a French speaker would write the sound.
+# Entries here also override the automatic acronym letter-spelling
+# (tts.spell_acronyms), e.g. CAPS is spoken as a word, not spelled out.
+
+pronunciations:
+  CAPS: Capse
+  Vimeo: Viméo
+  keynote: kinote
+
 # ── Always-substitute (deterministic, enforced post-translation) ───────────────
 # {form_to_find: québécois_form}. The left side may be a standard-French term OR
 # an English term that leaked through; it is rewritten to the québécois form by

@@ -171,6 +171,23 @@ tts:
   # Speech rate multiplier. 1.0 = natural pace.
   f5tts_speed: 1.0
 
+  # Spell out unmapped 2-4 letter ALL-CAPS acronyms with French letter names
+  # for the TTS ("CSP" → "cé esse pé"). Entries in the glossary file's
+  # pronunciations: section override this per term (subtitles are unaffected).
+  spell_acronyms: true
+
+  # ASR round-trip verification — transcribe each synthesized segment
+  # (whisper small, CPU) and re-synthesize takes whose transcript diverges
+  # from the intended text (best-of-N; F5 retries are independent samples).
+  # Catches garbled names, vocabulary bleed, swallowed/duplicated words that
+  # the duration/RMS guards miss. Costs ~1 min per video.
+  verify_tts: true
+  # Similarity floor (0-1). Deliberately forgiving — whisper-small French is
+  # imperfect; the score gates *relative* retries, never drops a segment.
+  verify_threshold: 0.78
+  # Max re-synthesis attempts per flagged segment.
+  verify_retries: 2
+
   # Speaker reference clip for voice cloning.
   # Must be < 22s — see diarization.profile_duration comment above.
   speaker_profile_duration: 12

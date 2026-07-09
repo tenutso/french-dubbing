@@ -163,7 +163,7 @@ tts:
   # HuggingFace model: supply the repo ID (owner/repo) — the pipeline downloads
   #   the checkpoint and vocab automatically and uses the F5TTS_Base architecture.
   #   RASPIAUDIO/F5-French-MixedSpeakers-reduced is a French fine-tune of F5TTS_Base.
-  f5tts_model: RASPIAUDIO/F5-French-MixedSpeakers-reduced
+  f5tts_model: tontate/f5-tts-quebec-french-finetune
   # ODE solver steps. 16 = fast draft; 32 = high quality (default); 64 = max quality.
   f5tts_nfe_step: 32
   # Classifier-free guidance strength. 2.0 is a reliable default.

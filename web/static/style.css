@@ -469,3 +469,8 @@ progress::-webkit-progress-value { background: var(--accent); border-radius: 4px
 .vimeo-panel label.check { display: inline-flex; align-items: center; gap: 4px; }
 .vimeo-panel .vp-result { flex-basis: 100%; white-space: pre-wrap; }
 .vimeo-panel .vp-result.err { color: #f87171; }
+
+/* Cloned-voice test (review voice panel) */
+.voice-panel .vr-text { flex: 1 1 200px; min-width: 160px; }
+.voice-panel .vr-status { font-size: 12px; }
+.voice-panel .vr-status.err { color: #f87171; }

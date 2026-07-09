@@ -7,6 +7,7 @@ also the pipeline's own log) over Server-Sent Events.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +71,7 @@ TEMP_DIR     = WORKSPACE / "temp"
 VOICES_DIR   = WORKSPACE / "voices"   # curated clean reference clips ("preset voices")
 CONFIG_PATH  = WORKSPACE / "config.yaml"
 PIPELINE_PY  = WORKSPACE / "scripts" / "02_pipeline.py"
+PREVIEW_PY   = WORKSPACE / "scripts" / "voice_preview.py"
 
 # Mirror config writes to the source repo so the two copies stay in sync.
 # Any path that exists is written; missing paths are silently skipped.
@@ -1550,6 +1552,35 @@ async def voices_library_clip(filename: str) -> FileResponse:
     return FileResponse(str(target))
 
 
+def _validate_voice_override(ov: dict, vocals_dur: float, label: str = "selection") -> dict:
+    """Validate + normalize a single voice-reference override (range/library).
+
+    Shared by the voice-refs save and the voice-preview endpoint so both
+    enforce identical range bounds and library path containment."""
+    src = ov.get("source")
+    if src == "range":
+        try:
+            start = float(ov.get("start", 0.0)); dur = float(ov.get("duration", 0.0))
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{label}: start/duration must be numbers")
+        if dur <= 0:
+            raise HTTPException(400, f"{label}: duration must be > 0")
+        if start < 0:
+            raise HTTPException(400, f"{label}: start must be ≥ 0")
+        if vocals_dur and start + dur > vocals_dur + 0.5:
+            raise HTTPException(400, f"{label}: range exceeds vocals length ({vocals_dur:.1f}s)")
+        return {"source": "range", "start": start, "duration": dur,
+                "denoise": bool(ov.get("denoise", False))}
+    if src == "library":
+        fname = os.path.basename(ov.get("path") or ov.get("file") or "")
+        target = (VOICES_DIR / fname).resolve()
+        if VOICES_DIR.resolve() not in target.parents or not target.is_file():
+            raise HTTPException(400, f"{label}: library clip not found: {fname}")
+        return {"source": "library", "path": str(target),
+                "denoise": bool(ov.get("denoise", False))}
+    raise HTTPException(400, f"{label}: unknown source '{src}'")
+
+
 @app.put("/api/jobs/{job_id}/voice-refs")
 async def put_voice_refs(job_id: str, request: Request) -> JSONResponse:
     job = state.jobs.get(job_id)
@@ -1570,29 +1601,9 @@ async def put_voice_refs(job_id: str, request: Request) -> JSONResponse:
     for spk, ov in payload.items():
         if not isinstance(ov, dict):
             raise HTTPException(400, f"{spk}: selection must be an object")
-        src = ov.get("source")
-        if src == "auto":
+        if ov.get("source") == "auto":
             continue  # auto = no override; omit from the sidecar
-        if src == "range":
-            try:
-                start = float(ov.get("start", 0.0)); dur = float(ov.get("duration", 0.0))
-            except (TypeError, ValueError):
-                raise HTTPException(400, f"{spk}: start/duration must be numbers")
-            if dur <= 0:
-                raise HTTPException(400, f"{spk}: duration must be > 0")
-            if vdur and start + dur > vdur + 0.5:
-                raise HTTPException(400, f"{spk}: range exceeds vocals length ({vdur:.1f}s)")
-            cleaned[spk] = {"source": "range", "start": start, "duration": dur,
-                            "denoise": bool(ov.get("denoise", False))}
-        elif src == "library":
-            fname = os.path.basename(ov.get("path") or ov.get("file") or "")
-            target = (VOICES_DIR / fname).resolve()
-            if VOICES_DIR.resolve() not in target.parents or not target.is_file():
-                raise HTTPException(400, f"{spk}: library clip not found: {fname}")
-            cleaned[spk] = {"source": "library", "path": str(target),
-                            "denoise": bool(ov.get("denoise", False))}
-        else:
-            raise HTTPException(400, f"{spk}: unknown source '{src}'")
+        cleaned[spk] = _validate_voice_override(ov, vdur, label=spk)
 
     name = _job_name(job)
     refs_file = Path(job.output_dir) / f"{name}_voice_refs.json"
@@ -1609,6 +1620,84 @@ async def put_voice_refs(job_id: str, request: Request) -> JSONResponse:
     else:
         refs_file.unlink(missing_ok=True)  # all auto → clear any prior selection
     return JSONResponse({"ok": True, "overrides": len(cleaned)})
+
+
+# One preview at a time — each run loads F5-TTS (~2 GB VRAM) in a subprocess.
+_preview_lock = asyncio.Lock()
+
+
+@app.post("/api/jobs/{job_id}/voices/preview")
+async def voice_preview(job_id: str, request: Request):
+    """Synthesize one short sentence with the selected voice reference.
+
+    Lets the review UI audition the *cloned* voice (not just the raw source
+    clip) before committing to a full Phase-2 run. Body: the same override
+    object the panel builds ({source, start, duration, path, denoise}) plus an
+    optional "text". Returns the WAV; results are cached per selection so
+    replays are instant."""
+    job = state.jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    if job.status != STATUS_AWAITING_REVIEW:
+        raise HTTPException(409, f"job is not awaiting review (status: {job.status})")
+    if state.current_job_id:
+        raise HTTPException(409, "a pipeline job is running — the GPU is busy; "
+                                 "try again when it finishes")
+    if not PREVIEW_PY.exists():
+        raise HTTPException(500, f"voice_preview.py not installed at {PREVIEW_PY} — "
+                                 f"re-run 04_setup.sh")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "body must be a JSON object")
+
+    vocals = _locate_vocals(job)
+    vdur = _audio_duration(vocals) if vocals else 0.0
+    ov = _validate_voice_override(payload, vdur)
+    if ov["source"] == "range" and not vocals:
+        raise HTTPException(404, "vocals not found (job has no preserved Phase 1 audio)")
+
+    text = str(payload.get("text") or "").strip()[:200]
+    spec = dict(ov, text=text)
+    if ov["source"] == "range":
+        spec["vocals"] = str(vocals)
+
+    # Cache per exact selection — tweaking a slider makes a new clip, replaying
+    # the same one is instant.
+    preview_dir = TEMP_DIR / _job_name(job)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha1(
+        json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    out_wav = preview_dir / f"voice_preview_{digest}.wav"
+    if out_wav.exists() and out_wav.stat().st_size > 1000:
+        return FileResponse(str(out_wav), media_type="audio/wav")
+
+    if _preview_lock.locked():
+        raise HTTPException(409, "another voice preview is already generating — "
+                                 "wait for it to finish")
+    async with _preview_lock:
+        job_json = preview_dir / f"voice_preview_{digest}.json"
+        job_json.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+        cmd = [sys.executable, str(PREVIEW_PY),
+               "--config", str(CONFIG_PATH),
+               "--job", str(job_json),
+               "--out", str(out_wav)]
+        log.info("voice preview job=%s: %s", job_id, {k: spec[k] for k in spec if k != "vocals"})
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=240,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(500, "voice preview timed out (4 min)")
+        if proc.returncode != 0 or not out_wav.exists():
+            tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+            log.warning("voice preview failed (rc=%s): %s", proc.returncode, tail)
+            raise HTTPException(500, f"voice preview failed: {tail or 'no output'}")
+
+    return FileResponse(str(out_wav), media_type="audio/wav")
 
 
 # ── Vimeo integration ─────────────────────────────────────────────────────────

@@ -993,6 +993,9 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
       <select class="vr-lib">${libOpts || "<option>(no clips)</option>"}</select>
     </span>
     <button type="button" class="vr-preview">▶ Preview</button>
+    <button type="button" class="vr-test" title="Synthesize a short sentence with this reference so you can hear the cloned voice before re-processing">🎤 Test voice</button>
+    <input type="text" class="vr-text" placeholder="custom test sentence (optional)">
+    <span class="vr-status muted"></span>
     <audio class="vr-audio" controls hidden></audio>
   `;
 
@@ -1000,11 +1003,16 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
   const rangeBox = wrap.querySelector(".vr-range");
   const libBox = wrap.querySelector(".vr-library");
   const preview = wrap.querySelector(".vr-preview");
+  const test = wrap.querySelector(".vr-test");
+  const textInp = wrap.querySelector(".vr-text");
+  const status = wrap.querySelector(".vr-status");
   const audio = wrap.querySelector(".vr-audio");
   modeSel.addEventListener("change", () => {
     rangeBox.hidden = modeSel.value !== "range";
     libBox.hidden = modeSel.value !== "library";
     preview.hidden = modeSel.value === "auto";
+    test.hidden = textInp.hidden = modeSel.value === "auto";
+    status.textContent = "";
     audio.hidden = true;
   });
   // Talk-time chip → set the range to that turn and preview it immediately.
@@ -1016,6 +1024,7 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
     });
   });
   preview.hidden = mode === "auto";
+  test.hidden = textInp.hidden = mode === "auto";
   preview.addEventListener("click", () => {
     if (modeSel.value === "range") {
       const s = parseFloat(wrap.querySelector(".vr-start").value) || 0;
@@ -1027,6 +1036,43 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
     } else { return; }
     audio.hidden = false;
     audio.play().catch(() => {});
+  });
+  // Cloned-voice test: one F5 synthesis with the current selection, so the
+  // reference can be polished in seconds instead of a Phase-2 run per attempt.
+  test.addEventListener("click", async () => {
+    const m = modeSel.value;
+    if (m === "auto") return;
+    const body = m === "range"
+      ? { source: "range",
+          start: parseFloat(wrap.querySelector(".vr-start").value) || 0,
+          duration: parseFloat(wrap.querySelector(".vr-dur").value) || 12 }
+      : { source: "library", path: wrap.querySelector(".vr-lib").value };
+    body.text = textInp.value.trim();
+    test.disabled = true;
+    status.classList.remove("err");
+    status.textContent = "cloning… (~30 s first time)";
+    try {
+      const r = await fetch(`/api/jobs/${jobId}/voices/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        status.textContent = err.detail || `preview failed (HTTP ${r.status})`;
+        status.classList.add("err");
+      } else {
+        const blob = await r.blob();
+        audio.src = URL.createObjectURL(blob);
+        audio.hidden = false;
+        audio.play().catch(() => {});
+        status.textContent = "cloned voice:";
+      }
+    } catch (e) {
+      status.textContent = "network error: " + e;
+      status.classList.add("err");
+    }
+    test.disabled = false;
   });
   return wrap;
 }

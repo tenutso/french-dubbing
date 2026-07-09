@@ -530,7 +530,7 @@ fi
 
 log_step "Installing pipeline scripts …"
 
-for script in 02_pipeline.py 03_batch_runner.py verify_setup.py 05_web.sh metrics.py; do
+for script in 02_pipeline.py 03_batch_runner.py verify_setup.py 05_web.sh metrics.py voice_preview.py; do
     if [[ -f "$SCRIPT_DIR/$script" ]]; then
         cp "$SCRIPT_DIR/$script" /workspace/scripts/
         chmod +x "/workspace/scripts/$script"

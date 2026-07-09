@@ -125,6 +125,7 @@ A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in
 
 - Drag‑drop MP4 upload with progress bar (or a Vimeo URL, or an on‑pod path for big files).
 - Per‑job options: locale, **speaker count** (blank = auto; `1` = solo presenter), volume boost, and an optional pause‑for‑review stage to edit translations and pick voice references before synthesis.
+- **Voice polishing loop**: in the review stage, each speaker's reference can be re‑picked (time range with per‑speaker turn suggestions, or a library clip), auditioned raw (▶ Preview), and **tested as a cloned voice** (🎤 Test voice — one F5‑TTS synthesis of a short sentence, ~30 s first call, instant on replay; supports a custom sentence for checking name pronunciation). Re‑opening a finished job re‑runs only Phase 2, so fixing an artifact‑y voice never repeats transcription/translation.
 - Single‑job FIFO queue; live log via Server‑Sent Events.
 - Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
 - An **Advanced options** panel edits the per‑video subset of `config.yaml` (source language, vocabulary hint, translation model/review pass, output toggles). The tuned timing/quality internals are deliberately not exposed — edit `config.yaml` directly for experiments.

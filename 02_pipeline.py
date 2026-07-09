@@ -2755,6 +2755,57 @@ def _split_for_tts(text: str, limit: int) -> List[str]:
     return [c for c in out if c]
 
 
+def _torchcodec_ok() -> bool:
+    """Return True if torchcodec's shared library loads successfully.
+
+    Importing torchcodec eagerly loads its native libs and raises OSError when
+    the matching libnvrtc.so is missing (the cu128-vs-CUDA13 mismatch), so a
+    clean `import torchcodec` + AudioDecoder import is a reliable signal across
+    torchcodec versions. (The old `_internally_replaced_utils` symbol was
+    removed in torchcodec 0.7+, so the previous check always returned False.)
+    """
+    try:
+        import torchcodec  # noqa: F401
+        from torchcodec.decoders import AudioDecoder  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def load_f5tts_model(config: "PipelineConfig", log: logging.Logger):
+    """Load F5-TTS from a built-in model name or a HuggingFace repo ID.
+
+    Returns (model, sample_rate); raises on failure. Shared by the pipeline
+    synthesis path and the review UI's voice-preview subprocess."""
+    from f5_tts.api import F5TTS
+    import torch as _torch
+
+    log.info(f"Loading F5-TTS: {config.f5tts_model} …")
+    device = "cuda" if _torch.cuda.is_available() else "cpu"
+
+    if "/" in config.f5tts_model:
+        # HuggingFace repo ID — download checkpoint + vocab, use F5TTS_Base arch.
+        # Community fine-tunes like RASPIAUDIO/F5-French-MixedSpeakers-reduced are
+        # based on the original F5TTS_Base (not v1), so we use that config for the
+        # model architecture while supplying the custom weights.
+        from huggingface_hub import hf_hub_download
+        repo_id = config.f5tts_model
+        log.info(f"  Fetching weights from HuggingFace: {repo_id} …")
+        # Try the reduced checkpoint first; fall back to the full one.
+        try:
+            ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last_reduced.pt")
+        except Exception:
+            ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last.pt")
+        vocab_file = hf_hub_download(repo_id=repo_id, filename="vocab.txt")
+        f5 = F5TTS(model="F5TTS_Base", ckpt_file=ckpt_file, vocab_file=vocab_file, device=device)
+    else:
+        f5 = F5TTS(model=config.f5tts_model, device=device)
+
+    sr = 24000  # F5-TTS/vocos native rate
+    log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
+    return f5, sr
+
+
 def synthesize_all_segments(
     segments: List[dict],
     speaker_wav: Optional[str],
@@ -2764,12 +2815,10 @@ def synthesize_all_segments(
 ) -> Tuple[List[Tuple[np.ndarray, float, float]], int]:
     """Synthesize every segment with F5-TTS (flow-matching zero-shot voice cloning)."""
     try:
-        from f5_tts.api import F5TTS
+        from f5_tts.api import F5TTS  # noqa: F401 — early, readable failure
     except ImportError:
         log.error("f5-tts not installed. Install: pip install f5-tts")
         return [], 24000, {}
-
-    import torch as _torch
 
     # F5-TTS's max_chars formula: ref_text_bytes / ref_dur_s * (22 - ref_dur_s) * speed
     # When ref_dur_s > 22 the result is negative → chunk_text splits every sentence into
@@ -2814,33 +2863,11 @@ def synthesize_all_segments(
         raw = _raw_pick_wav(seg)
         return _ref_wav_trunc.get(raw, raw) if raw else raw
 
-    log.info(f"Loading F5-TTS: {config.f5tts_model} …")
-    device = "cuda" if _torch.cuda.is_available() else "cpu"
-
-    if "/" in config.f5tts_model:
-        # HuggingFace repo ID — download checkpoint + vocab, use F5TTS_Base arch.
-        # Community fine-tunes like RASPIAUDIO/F5-French-MixedSpeakers-reduced are
-        # based on the original F5TTS_Base (not v1), so we use that config for the
-        # model architecture while supplying the custom weights.
-        try:
-            from huggingface_hub import hf_hub_download
-            repo_id = config.f5tts_model
-            log.info(f"  Fetching weights from HuggingFace: {repo_id} …")
-            # Try the reduced checkpoint first; fall back to the full one.
-            try:
-                ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last_reduced.pt")
-            except Exception:
-                ckpt_file = hf_hub_download(repo_id=repo_id, filename="model_last.pt")
-            vocab_file = hf_hub_download(repo_id=repo_id, filename="vocab.txt")
-            f5 = F5TTS(model="F5TTS_Base", ckpt_file=ckpt_file, vocab_file=vocab_file, device=device)
-        except Exception as e:
-            log.error(f"Failed to load HuggingFace model '{config.f5tts_model}': {e}")
-            return [], 24000, {}
-    else:
-        f5 = F5TTS(model=config.f5tts_model, device=device)
-
-    sr = 24000  # F5-TTS/vocos native rate
-    log.info(f"✓ F5-TTS ready (output: {sr} Hz, device: {device})")
+    try:
+        f5, sr = load_f5tts_model(config, log)
+    except Exception as e:
+        log.error(f"Failed to load F5-TTS model '{config.f5tts_model}': {e}")
+        return [], 24000, {}
 
     # When ref_text="" F5-TTS auto-transcribes its reference clips internally.
     # That path uses torchcodec, which fails on systems missing the matching
@@ -2856,22 +2883,6 @@ def synthesize_all_segments(
     # "vidéo" and ref_text is passed, F5-TTS's combined ref+gen sequence can
     # echo that word near sentence boundaries.
     _ref_text_cache: dict = {}
-
-    def _torchcodec_ok() -> bool:
-        """Return True if torchcodec's shared library loads successfully.
-
-        Importing torchcodec eagerly loads its native libs and raises OSError when
-        the matching libnvrtc.so is missing (the cu128-vs-CUDA13 mismatch), so a
-        clean `import torchcodec` + AudioDecoder import is a reliable signal across
-        torchcodec versions. (The old `_internally_replaced_utils` symbol was
-        removed in torchcodec 0.7+, so the previous check always returned False.)
-        """
-        try:
-            import torchcodec  # noqa: F401
-            from torchcodec.decoders import AudioDecoder  # noqa: F401
-            return True
-        except Exception:
-            return False
 
     def _prefetch_ref_texts() -> None:
         unique_refs = {

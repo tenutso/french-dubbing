@@ -1654,6 +1654,25 @@ async def voice_preview(job_id: str, request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(400, "body must be a JSON object")
 
+    speaker = str(payload.get("speaker") or "")
+
+    # "auto" tests the speaker's OWN longest turn — the same audio the
+    # automatic profile builder will lean on — resolved server-side by
+    # speaker label so every panel is guaranteed to test its own voice.
+    if payload.get("source") == "auto":
+        seg_file = Path(job.output_dir) / f"{_job_name(job)}_segments.json"
+        sug = None
+        try:
+            segs = json.loads(seg_file.read_text(encoding="utf-8"))
+            sug = _speaker_ranges(segs).get(speaker, {}).get("suggested")
+        except Exception:
+            pass
+        if not sug:
+            raise HTTPException(400, f"{speaker or 'speaker'}: no known turns — "
+                                     f"pick a range manually")
+        payload = {"source": "range", "start": sug["start"],
+                   "duration": sug["duration"], "text": payload.get("text", "")}
+
     vocals = _locate_vocals(job)
     vdur = _audio_duration(vocals) if vocals else 0.0
     ov = _validate_voice_override(payload, vdur)
@@ -1672,8 +1691,15 @@ async def voice_preview(job_id: str, request: Request):
     digest = hashlib.sha1(
         json.dumps(spec, sort_keys=True).encode("utf-8")).hexdigest()[:16]
     out_wav = preview_dir / f"voice_preview_{digest}.wav"
+    # Tell the UI exactly which audio produced the clip, so a wrong-voice
+    # result is diagnosable at a glance.
+    range_hdr = (
+        f"{ov['start']:.0f}-{ov['start'] + ov['duration']:.0f}s"
+        if ov["source"] == "range" else Path(ov.get("path", "")).name
+    )
     if out_wav.exists() and out_wav.stat().st_size > 1000:
-        return FileResponse(str(out_wav), media_type="audio/wav")
+        return FileResponse(str(out_wav), media_type="audio/wav",
+                            headers={"X-Voice-Source": range_hdr})
 
     if _preview_lock.locked():
         raise HTTPException(409, "another voice preview is already generating — "
@@ -1685,7 +1711,8 @@ async def voice_preview(job_id: str, request: Request):
                "--config", str(CONFIG_PATH),
                "--job", str(job_json),
                "--out", str(out_wav)]
-        log.info("voice preview job=%s: %s", job_id, {k: spec[k] for k in spec if k != "vocals"})
+        log.info("voice preview job=%s speaker=%s: %s", job_id, speaker or "?",
+                 {k: spec[k] for k in spec if k != "vocals"})
         try:
             proc = await asyncio.to_thread(
                 subprocess.run, cmd, capture_output=True, text=True, timeout=240,
@@ -1697,7 +1724,8 @@ async def voice_preview(job_id: str, request: Request):
             log.warning("voice preview failed (rc=%s): %s", proc.returncode, tail)
             raise HTTPException(500, f"voice preview failed: {tail or 'no output'}")
 
-    return FileResponse(str(out_wav), media_type="audio/wav")
+    return FileResponse(str(out_wav), media_type="audio/wav",
+                        headers={"X-Voice-Source": range_hdr})
 
 
 # ── Vimeo integration ─────────────────────────────────────────────────────────

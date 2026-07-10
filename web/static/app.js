@@ -1011,7 +1011,6 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
     rangeBox.hidden = modeSel.value !== "range";
     libBox.hidden = modeSel.value !== "library";
     preview.hidden = modeSel.value === "auto";
-    test.hidden = textInp.hidden = modeSel.value === "auto";
     status.textContent = "";
     audio.hidden = true;
   });
@@ -1024,7 +1023,6 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
     });
   });
   preview.hidden = mode === "auto";
-  test.hidden = textInp.hidden = mode === "auto";
   preview.addEventListener("click", () => {
     if (modeSel.value === "range") {
       const s = parseFloat(wrap.querySelector(".vr-start").value) || 0;
@@ -1039,14 +1037,17 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
   });
   // Cloned-voice test: one F5 synthesis with the current selection, so the
   // reference can be polished in seconds instead of a Phase-2 run per attempt.
+  // In Auto mode the server tests this speaker's own longest turn.
   test.addEventListener("click", async () => {
     const m = modeSel.value;
-    if (m === "auto") return;
     const body = m === "range"
       ? { source: "range",
           start: parseFloat(wrap.querySelector(".vr-start").value) || 0,
           duration: parseFloat(wrap.querySelector(".vr-dur").value) || 12 }
-      : { source: "library", path: wrap.querySelector(".vr-lib").value };
+      : m === "library"
+      ? { source: "library", path: wrap.querySelector(".vr-lib").value }
+      : { source: "auto" };
+    body.speaker = speaker;
     body.text = textInp.value.trim();
     test.disabled = true;
     status.classList.remove("err");
@@ -1066,7 +1067,8 @@ function buildVoicePanel(jobId, speaker, saved, rangeInfo) {
         audio.src = URL.createObjectURL(blob);
         audio.hidden = false;
         audio.play().catch(() => {});
-        status.textContent = "cloned voice:";
+        const src = r.headers.get("X-Voice-Source");
+        status.textContent = "cloned voice" + (src ? ` (from ${src})` : "") + ":";
       }
     } catch (e) {
       status.textContent = "network error: " + e;

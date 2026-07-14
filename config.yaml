@@ -75,7 +75,7 @@ source_separation:
 # Transcription — faster-whisper (CTranslate2)
 # ============================================================
 whisper:
-  model: large
+  model: large-v3
   device: cuda
   # float16       → best quality on RTX 4090
   # int8_float16  → lower VRAM, marginal accuracy loss

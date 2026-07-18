@@ -423,6 +423,10 @@ async def _run_job(job: Job) -> None:
             cmd += ["--volume-boost", str(opts["volume_boost"])]
         if opts.get("speakers"):
             cmd += ["--speakers", str(opts["speakers"])]
+        # Per-job Wav2Lip toggle persists in job.options, so re-opening a job for
+        # review (phase 2 re-synth) lip-syncs again without re-checking the box.
+        if opts.get("wav2lip"):
+            cmd.append("--wav2lip")
         if _is_phase1:
             cmd += ["--phase", "1"]
         elif _is_phase2:
@@ -578,13 +582,18 @@ def _collect_outputs(job: Job) -> None:
     od = Path(job.output_dir)
     if not od.exists():
         return
+    # Note: "*_french.mp4" does not match "*_french_wav2lip.mp4" (different suffix),
+    # so the standard video and the lip-synced video are collected separately.
     video   = sorted(od.glob("*_french.mp4"))
+    lipsync = sorted(od.glob("*_french_wav2lip.mp4"))
     audio   = sorted(od.glob("*_french.m4a"))
     srt     = sorted(od.glob("*_french.srt"))
     full    = sorted(od.glob("*_french_full.m4a"))
     eng_srt = sorted(od.glob("*_english.srt"))
     if video:
         job.outputs["video"] = str(video[0])
+    if lipsync:
+        job.outputs["video_lipsync"] = str(lipsync[0])
     if audio:
         job.outputs["audio"] = str(audio[0])
     if srt:
@@ -911,6 +920,7 @@ async def submit(
     speakers: str = Form(""),
     force: str = Form(""),
     review: str = Form(""),
+    wav2lip: str = Form(""),
     vimeo_push: str = Form(""),
 ) -> JSONResponse:
     # Validate options against allow-lists (empty = use config default)
@@ -961,6 +971,7 @@ async def submit(
         "speakers": spk,
         "force": force.lower() in ("1", "true", "on", "yes"),
         "review": review.lower() in ("1", "true", "on", "yes"),
+        "wav2lip": wav2lip.lower() in ("1", "true", "on", "yes"),
         "vimeo_push": want_autopush,
     }
     output_dir = OUTPUT_DIR / job_id
@@ -1152,6 +1163,7 @@ def _download(job: Job, kind: str) -> FileResponse:
     ext = Path(path).suffix
     base = {
         "video": "_french",
+        "video_lipsync": "_french_wav2lip",
         "audio": "_french",
         "srt": "_french",
         "full": "_french_full",
@@ -1306,8 +1318,8 @@ def _rewrite_glossary_sections(path: Path, by_mode: dict) -> None:
 
 @app.get("/api/jobs/{job_id}/download/{kind}")
 async def download(job_id: str, kind: str) -> FileResponse:
-    if kind not in ("video", "audio", "srt", "full", "english_srt"):
-        raise HTTPException(400, "kind must be video|audio|srt|full|english_srt")
+    if kind not in ("video", "video_lipsync", "audio", "srt", "full", "english_srt"):
+        raise HTTPException(400, "kind must be video|video_lipsync|audio|srt|full|english_srt")
     job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(404, "job not found")

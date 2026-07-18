@@ -37,6 +37,44 @@ output:
   burn_subs: false
 
 # ============================================================
+# Lip-sync — Wav2Lip (optional post-processing stage)
+# Re-syncs the on-screen speaker's mouth to the FRENCH dub, producing an
+# extra {name}_french_wav2lip.mp4 alongside the normal {name}_french.mp4
+# (the standard outputs are never modified). Heavy GPU stage — best for
+# talking-head footage; slide-only clips have no face to sync and the stage
+# skips gracefully (all other outputs are unaffected).
+#
+# Wav2Lip pins old, conflicting dependencies (librosa 0.9 / numpy 1.x /
+# opencv), so it is installed by 04_setup.sh into an ISOLATED virtualenv and
+# invoked here as a subprocess — it never touches the main pipeline env.
+# Off by default; enable per-run with --wav2lip (CLI) or the web UI checkbox.
+# ============================================================
+wav2lip:
+  enabled: false
+  # Cloned Wav2Lip repo and its dedicated interpreter (both created by 04_setup.sh).
+  repo_dir: /workspace/wav2lip/Wav2Lip
+  python:   /workspace/wav2lip/venv/bin/python
+  # wav2lip_gan.pth → sharper, more natural mouth (recommended).
+  # wav2lip.pth     → tighter lip-sync accuracy, slightly less smooth visually.
+  checkpoint: /workspace/models/wav2lip/wav2lip_gan.pth
+  # Downscale input frames by this integer factor before inference.
+  # 1 = full resolution; 2 ≈ 4× faster and much lower VRAM (good for 1080p+).
+  resize_factor: 1
+  # Face bounding-box padding in pixels: [top, bottom, left, right].
+  # Raise the second value if the chin/jaw is being clipped.
+  pads: [0, 10, 0, 0]
+  # Inference batch sizes. Lower these if the A4000 (20 GB) runs out of VRAM
+  # on high-resolution video; raise them for a bit more throughput.
+  face_det_batch_size: 16
+  wav2lip_batch_size: 128
+  # true = disable the temporal face-smoothing (helps on fast motion or
+  #        profile shots where smoothing drags the mouth off the face).
+  nosmooth: false
+  # Hard ceiling for the lip-sync subprocess (seconds). Wav2Lip processes every
+  # frame, so long videos are slow — keep this generous.
+  timeout_seconds: 7200
+
+# ============================================================
 # Speaker Diarization — pyannote.audio (optional)
 # Detects who is speaking when and builds a separate voice-clone
 # reference for each speaker, so every voice is dubbed distinctly.

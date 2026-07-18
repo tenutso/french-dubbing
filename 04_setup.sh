@@ -341,6 +341,89 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 grep -q "HF_HUB_ENABLE_HF_TRANSFER" /workspace/.env 2>/dev/null \
     || echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> /workspace/.env
 
+# ── Step 9b: Wav2Lip — optional lip-sync stage (ISOLATED virtualenv) ─────────
+# Wav2Lip re-syncs the on-screen speaker's mouth to the dubbed audio. It pins
+# OLD, conflicting dependencies (librosa 0.9 / numpy 1.x / opencv) that would
+# break the main pipeline stack, so it lives in a DEDICATED virtualenv and is
+# invoked by 02_pipeline.py as a subprocess — it never touches the main env.
+#
+# The whole step is OPT-IN and NON-FATAL: every failure is a warning, not an
+# abort, because the stage is disabled by default (config wav2lip.enabled:false)
+# and only runs when a job passes --wav2lip / ticks the web checkbox.
+log_step "Installing Wav2Lip (optional lip-sync stage) …"
+
+W2L_ROOT=/workspace/wav2lip
+W2L_REPO="$W2L_ROOT/Wav2Lip"
+W2L_VENV="$W2L_ROOT/venv"
+W2L_MODELS="$MODELS_FOLDER/wav2lip"
+# Checkpoint sources are overridable — upstream's original Google-Drive/SharePoint
+# links are flaky. Defaults point at a long-lived Hugging Face mirror (GAN weights)
+# and the canonical S3FD face-detector weights. Override with WAV2LIP_GAN_URL /
+# S3FD_URL if a mirror goes down.
+WAV2LIP_GAN_URL="${WAV2LIP_GAN_URL:-https://huggingface.co/rippertnt/wav2lip/resolve/main/checkpoints/wav2lip_gan.pth}"
+S3FD_URL="${S3FD_URL:-https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth}"
+
+mkdir -p "$W2L_ROOT" "$W2L_MODELS"
+
+# 1. Clone the Wav2Lip repo (idempotent — shallow to keep it small).
+if [ -d "$W2L_REPO/.git" ]; then
+    log_success "Wav2Lip repo already present"
+elif git clone --depth 1 https://github.com/Rudrabha/Wav2Lip "$W2L_REPO" 2>&1 | tail -2 | tee -a "$LOGFILE"; then
+    log_success "Wav2Lip repo cloned"
+else
+    log_warn "Wav2Lip clone failed — lip-sync stage unavailable (opt-in, safe to ignore)"
+fi
+
+# 2. Dedicated virtualenv with pinned, self-contained deps. torch/torchaudio are
+#    matched to the pod's CUDA 12.8; librosa is held at 0.9.2 because Wav2Lip's
+#    audio.py calls librosa.filters.mel() positionally, which breaks on 0.10+.
+if [ -d "$W2L_REPO" ] && [ ! -x "$W2L_VENV/bin/python" ]; then
+    if python3 -m venv "$W2L_VENV" 2>&1 | tee -a "$LOGFILE"; then
+        "$W2L_VENV/bin/pip" install --no-cache-dir --upgrade pip >/dev/null 2>&1 || true
+        if "$W2L_VENV/bin/pip" install --no-cache-dir \
+               torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 \
+               2>&1 | tail -2 | tee -a "$LOGFILE" \
+           && "$W2L_VENV/bin/pip" install --no-cache-dir \
+               "numpy<2" "librosa==0.9.2" opencv-python scipy numba tqdm \
+               2>&1 | tail -2 | tee -a "$LOGFILE"; then
+            log_success "Wav2Lip virtualenv ready ($W2L_VENV)"
+        else
+            log_warn "Wav2Lip dependency install failed — lip-sync stage unavailable (opt-in)"
+        fi
+    else
+        log_warn "Wav2Lip venv creation failed — lip-sync stage unavailable (opt-in)"
+    fi
+elif [ -x "$W2L_VENV/bin/python" ]; then
+    log_success "Wav2Lip virtualenv already present"
+fi
+
+# 3. Download the model weights (idempotent): the Wav2Lip GAN generator and the
+#    S3FD face detector (the repo expects it at face_detection/detection/sfd/).
+if [ -d "$W2L_REPO" ]; then
+    S3FD_DIR="$W2L_REPO/face_detection/detection/sfd"
+    mkdir -p "$S3FD_DIR"
+    if [ ! -s "$W2L_MODELS/wav2lip_gan.pth" ]; then
+        if wget -q --show-progress -O "$W2L_MODELS/wav2lip_gan.pth" "$WAV2LIP_GAN_URL" 2>&1 | tail -1 | tee -a "$LOGFILE"; then
+            log_success "Downloaded wav2lip_gan.pth (~436 MB)"
+        else
+            rm -f "$W2L_MODELS/wav2lip_gan.pth"
+            log_warn "wav2lip_gan.pth download failed — set WAV2LIP_GAN_URL to a mirror and re-run (opt-in)"
+        fi
+    else
+        log_success "wav2lip_gan.pth already present"
+    fi
+    if [ ! -s "$S3FD_DIR/s3fd.pth" ]; then
+        if wget -q --show-progress -O "$S3FD_DIR/s3fd.pth" "$S3FD_URL" 2>&1 | tail -1 | tee -a "$LOGFILE"; then
+            log_success "Downloaded s3fd.pth (face detector)"
+        else
+            rm -f "$S3FD_DIR/s3fd.pth"
+            log_warn "s3fd.pth download failed — set S3FD_URL to a mirror and re-run (opt-in)"
+        fi
+    else
+        log_success "s3fd.pth already present"
+    fi
+fi
+
 # ── Step 10: Ollama ───────────────────────────────────────────────────────
 
 log_step "Setting up Ollama …"

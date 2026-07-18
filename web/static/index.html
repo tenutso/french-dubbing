@@ -58,6 +58,10 @@
         <label class="check">
           <input type="checkbox" id="review" name="review" checked> Pause for translation review
         </label>
+        <label class="check"
+               title="Re-sync the on-screen speaker's lips to the French dub (Wav2Lip). Heavy GPU stage, best for talking-head video; produces an extra *_french_wav2lip.mp4 alongside the normal output. Slide-only footage is skipped gracefully.">
+          <input type="checkbox" id="wav2lip" name="wav2lip"> Lip-sync (Wav2Lip)
+        </label>
         <label class="check" id="vimeo-push-label"
                title="When the job completes, automatically upload the French subtitles and dubbed audio track onto the source Vimeo video — safe to walk away from long jobs on an auto-stopping pod. Requires a Vimeo URL source and a Vimeo connection.">
           <input type="checkbox" id="vimeo_push" name="vimeo_push"> Auto-push to Vimeo

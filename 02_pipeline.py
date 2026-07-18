@@ -26,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import types
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -241,6 +241,23 @@ class PipelineConfig:
     burn_subs: bool = False   # True = burn subtitles into the picture (re-encode);
                               # False = soft-embed the SRT track (mov_text, copy video).
 
+    # Lip-sync — Wav2Lip (optional post-processing stage). Re-syncs the on-screen
+    # speaker's mouth to the French dub, emitting an extra {name}_french_wav2lip.mp4
+    # (the standard outputs are untouched). Runs last, in an ISOLATED virtualenv via
+    # subprocess (Wav2Lip pins old librosa/numpy/opencv that would break this env),
+    # so a failure — or the stage simply not being installed locally — never affects
+    # the normal outputs. Off by default; enable with --wav2lip or the web checkbox.
+    wav2lip_enabled: bool = False
+    wav2lip_repo_dir: str = "/workspace/wav2lip/Wav2Lip"
+    wav2lip_python: str = "/workspace/wav2lip/venv/bin/python"
+    wav2lip_checkpoint: str = "/workspace/models/wav2lip/wav2lip_gan.pth"
+    wav2lip_resize_factor: int = 1
+    wav2lip_pads: List[int] = field(default_factory=lambda: [0, 10, 0, 0])
+    wav2lip_face_det_batch: int = 16
+    wav2lip_batch: int = 128
+    wav2lip_nosmooth: bool = False
+    wav2lip_timeout: int = 7200
+
     timeout_seconds: int = 7200
 
     # Debug — keep all temp files and dump intermediate segment JSON
@@ -295,6 +312,7 @@ def load_config(path: str) -> PipelineConfig:
     dia  = c.get("diarization", {})
     out  = c.get("output", {})
     met  = c.get("metrics", {})
+    w2l  = c.get("wav2lip", {})
     return PipelineConfig(
         input_folder=p.get("input_folder", "/workspace/videos/input"),
         output_folder=p.get("output_folder", "/workspace/outputs"),
@@ -371,6 +389,16 @@ def load_config(path: str) -> PipelineConfig:
         output_sample_rate=aud.get("output_sample_rate", 48000),
         mux_video=bool(out.get("mux_video", True)),
         burn_subs=bool(out.get("burn_subs", False)),
+        wav2lip_enabled=bool(w2l.get("enabled", False)),
+        wav2lip_repo_dir=w2l.get("repo_dir", "/workspace/wav2lip/Wav2Lip"),
+        wav2lip_python=w2l.get("python", "/workspace/wav2lip/venv/bin/python"),
+        wav2lip_checkpoint=w2l.get("checkpoint", "/workspace/models/wav2lip/wav2lip_gan.pth"),
+        wav2lip_resize_factor=int(w2l.get("resize_factor", 1)),
+        wav2lip_pads=[int(x) for x in (w2l.get("pads") or [0, 10, 0, 0])],
+        wav2lip_face_det_batch=int(w2l.get("face_det_batch_size", 16)),
+        wav2lip_batch=int(w2l.get("wav2lip_batch_size", 128)),
+        wav2lip_nosmooth=bool(w2l.get("nosmooth", False)),
+        wav2lip_timeout=int(w2l.get("timeout_seconds", 7200)),
         timeout_seconds=proc.get("timeout_seconds", 7200),
         keep_temp=bool(proc.get("keep_temp", False)),
         metrics_enabled=bool(met.get("enabled", False)),
@@ -3740,6 +3768,114 @@ def mux_final_video(
         return False
 
 
+def run_wav2lip(
+    face_video: str,
+    dub_audio: str,
+    srt_path: str,
+    output_path: str,
+    config: PipelineConfig,
+    log: logging.Logger,
+    temp_dir: str,
+) -> bool:
+    """Optional post-processing: re-sync the speaker's lips to the French dub.
+
+    Feeds the ORIGINAL video (``face_video``) plus the dubbed audio
+    (``dub_audio``) to Wav2Lip and writes a lip-synced ``output_path``. The SRT
+    is then re-attached with :func:`mux_final_video` (video stream-copied), so
+    the result carries the same subtitle track as ``{name}_french.mp4``.
+
+    Wav2Lip runs in a **separate virtualenv** (``config.wav2lip_python``) as a
+    subprocess — its pinned librosa/numpy/opencv would otherwise conflict with
+    this pipeline's environment. The stage is deliberately best-effort: any
+    problem (not installed, checkpoint missing, no detectable face on screen)
+    is logged and returns ``False`` **without raising**, because the caller has
+    already produced every standard output before this runs.
+
+    Returns True only when a lip-synced file was written.
+    """
+    repo_dir = config.wav2lip_repo_dir
+    py = config.wav2lip_python
+    ckpt = config.wav2lip_checkpoint
+    inference_py = os.path.join(repo_dir, "inference.py")
+
+    # --- Preflight: everything must be present, or we skip cleanly. -----------
+    missing = [
+        label for label, pth in (
+            ("wav2lip python", py),
+            ("inference.py", inference_py),
+            ("checkpoint", ckpt),
+        ) if not os.path.exists(pth)
+    ]
+    if missing:
+        log.warning(
+            "Wav2Lip not available (missing: %s) — skipping lip-sync. "
+            "Run 04_setup.sh on the pod to install it." % ", ".join(missing)
+        )
+        return False
+
+    # Wav2Lip reads audio through librosa; hand it a plain 16 kHz mono WAV so we
+    # never hit an m4a/codec edge case inside the isolated env.
+    tmp_wav = os.path.join(temp_dir, "wav2lip_audio.wav")
+    tmp_out = os.path.join(temp_dir, "wav2lip_raw.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", dub_audio, "-ar", "16000", "-ac", "1", tmp_wav],
+            check=True, capture_output=True, timeout=600,
+        )
+    except Exception as e:
+        log.warning(f"Wav2Lip: could not extract audio ({e}) — skipping lip-sync.")
+        return False
+
+    cmd = [
+        py, inference_py,
+        "--checkpoint_path", ckpt,
+        "--face", face_video,
+        "--audio", tmp_wav,
+        "--outfile", tmp_out,
+        "--resize_factor", str(config.wav2lip_resize_factor),
+        "--pads", *[str(p) for p in config.wav2lip_pads],
+        "--face_det_batch_size", str(config.wav2lip_face_det_batch),
+        "--wav2lip_batch_size", str(config.wav2lip_batch),
+    ]
+    if config.wav2lip_nosmooth:
+        cmd.append("--nosmooth")
+
+    log.info("  Running Wav2Lip in isolated env (this processes every frame) …")
+    try:
+        # cwd=repo_dir so Wav2Lip resolves its bundled face_detection weights.
+        subprocess.run(
+            cmd, check=True, capture_output=True,
+            timeout=config.wav2lip_timeout, cwd=repo_dir,
+        )
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"").decode("utf-8", "ignore")[-800:]
+        # "Face not detected" is the common, expected case for slide-only footage.
+        if "Face not detected" in err:
+            log.warning("Wav2Lip: no face detected in the video — skipping lip-sync.")
+        else:
+            log.warning(f"Wav2Lip failed: {err}")
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning(
+            f"Wav2Lip timed out after {config.wav2lip_timeout}s — skipping lip-sync."
+        )
+        return False
+    except Exception as e:
+        log.warning(f"Wav2Lip failed: {e}")
+        return False
+
+    if not os.path.exists(tmp_out):
+        log.warning("Wav2Lip produced no output file — skipping lip-sync.")
+        return False
+
+    # Re-attach the delivery audio (AAC) + subtitles onto the lip-synced picture.
+    # mux_final_video stream-copies the video, so this is fast and lossless.
+    return mux_final_video(
+        tmp_out, dub_audio, srt_path, output_path, log,
+        burn_subs=config.burn_subs,
+    )
+
+
 # ============================================================================
 # Step 8: SRT generation — direct from merged segment timings
 # ============================================================================
@@ -4771,6 +4907,20 @@ def process_video(
         ):
             final_mp4 = candidate
 
+    # Optional lip-sync — re-sync the mouth to the French dub. Runs last so the
+    # standard outputs above are already written; a failure here never loses them.
+    # Not emitted as a "[N/6]" banner so the web progress bar (which parses that
+    # pattern) is unaffected; Wav2Lip's own progress still streams to the log.
+    wav2lip_mp4: Optional[str] = None
+    if config.wav2lip_enabled and final_mp4:
+        log.info("Lip-sync (Wav2Lip) — re-syncing the mouth to the French dub (this can take a while) …")
+        candidate_w2l = os.path.join(output_dir, f"{name}_french_wav2lip.mp4")
+        if run_wav2lip(video_path, mux_audio, final_srt, candidate_w2l, config, log, temp_dir):
+            wav2lip_mp4 = candidate_w2l
+            log.info(f"  Lip-synced video: {Path(candidate_w2l).name}")
+        else:
+            log.warning("  Wav2Lip stage did not complete — standard outputs are unaffected.")
+
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
     else:
@@ -4782,6 +4932,8 @@ def process_video(
     log.info(f"  Subs  : {final_srt}")
     if final_mp4:
         log.info(f"  Video : {final_mp4}")
+    if wav2lip_mp4:
+        log.info(f"  Lip-sync : {wav2lip_mp4}")
     log.info(f"{'=' * 60}\n")
     return True
 
@@ -5244,6 +5396,20 @@ def process_video_phase2(
         ):
             final_mp4 = candidate
 
+    # Optional lip-sync — re-sync the mouth to the French dub. Runs last so the
+    # standard outputs above are already written; a failure here never loses them.
+    # Not emitted as a "[N/6]" banner so the web progress bar (which parses that
+    # pattern) is unaffected; Wav2Lip's own progress still streams to the log.
+    wav2lip_mp4: Optional[str] = None
+    if config.wav2lip_enabled and final_mp4:
+        log.info("Lip-sync (Wav2Lip) — re-syncing the mouth to the French dub (this can take a while) …")
+        candidate_w2l = os.path.join(output_dir, f"{name}_french_wav2lip.mp4")
+        if run_wav2lip(video_path, mux_audio, final_srt, candidate_w2l, config, log, temp_dir):
+            wav2lip_mp4 = candidate_w2l
+            log.info(f"  Lip-synced video: {Path(candidate_w2l).name}")
+        else:
+            log.warning("  Wav2Lip stage did not complete — standard outputs are unaffected.")
+
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
     else:
@@ -5255,6 +5421,8 @@ def process_video_phase2(
     log.info(f"  Subs  : {final_srt}")
     if final_mp4:
         log.info(f"  Video : {final_mp4}")
+    if wav2lip_mp4:
+        log.info(f"  Lip-sync : {wav2lip_mp4}")
     log.info(f"{'=' * 60}\n")
     return True
 
@@ -5306,6 +5474,14 @@ def process_video_phase2(
     default=None,
     help="Phase 2: load segments from this path instead of the default location.",
 )
+@click.option(
+    "--wav2lip/--no-wav2lip",
+    "wav2lip_flag",
+    default=None,
+    help="Run (or skip) the optional Wav2Lip lip-sync stage, overriding "
+         "wav2lip.enabled in config.yaml for this run. Emits an extra "
+         "{name}_french_wav2lip.mp4 with the mouth re-synced to the French dub.",
+)
 def main(
     video: str,
     output_dir: str,
@@ -5317,6 +5493,7 @@ def main(
     keep_temp: bool,
     phase: Optional[str],
     segments_file: Optional[str],
+    wav2lip_flag: Optional[bool],
 ) -> None:
     """Dub a video to French (audio track + SRT subtitles).
 
@@ -5347,6 +5524,9 @@ def main(
             config.diarization_max_speakers = speakers
     if keep_temp:
         config.keep_temp = True
+    if wav2lip_flag is not None:
+        # Explicit --wav2lip/--no-wav2lip overrides config.yaml for this run only.
+        config.wav2lip_enabled = wav2lip_flag
     log = setup_logging(config.logs_folder, Path(video).stem)
     if phase == "1":
         success = process_video_phase1(video, output_dir, config, log, force=force)

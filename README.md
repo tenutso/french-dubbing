@@ -28,6 +28,7 @@ The pipeline does everything from source separation through translation, voice�
 - **Reading‑speed coupling.** Speech runs whose translated text is denser than `tts.reading_cps` (16) are gently *slowed* toward that pace (capped at `tts.max_slowdown`, 1.25×, and never past the slot edge under `anchored`). This de‑rushes the dub and keeps subtitles under the 17 CPS reading‑speed limit.
 - **Per‑voice pace management.** F5‑TTS clones each reference clip's speaking rate, so a pause‑heavy or slow‑spoken reference would make that speaker's entire dub run long. Three layers prevent it: reference clips are **pause‑condensed** (gaps capped at 300 ms), each cloned voice is **calibrated** once and slow voices get a gentle generative speed‑up (≤1.25×), and any segment that still can't fit its window is **adaptively re‑synthesized** faster instead of relying on time‑stretch. Per‑speaker pace is logged after synthesis, with a warning when a voice is too slow to fit a dub timeline.
 - **Name pronunciation + ASR verification.** A **pronunciation lexicon** (`pronunciations:` in the glossary, editable in the web UI) phonetically respells names/brands for the TTS only — subtitles keep real spellings — and unmapped ALL‑CAPS acronyms are spelled out with French letter names. Then every synthesized segment is **transcribed back** (whisper‑small, CPU) and scored against its intended text; low‑similarity takes are re‑synthesized best‑of‑N (`tts.verify_tts`), catching garbled names, vocabulary bleed, and swallowed words that duration/volume checks miss.
+- **Optional lip‑sync (Wav2Lip).** An opt‑in final stage re‑syncs the on‑screen speaker's mouth to the French dub, emitting an extra `{name}_french_wav2lip.mp4` **alongside** the untouched `{name}_french.mp4`. Enable per‑run with `--wav2lip` (CLI) or the **Lip‑sync (Wav2Lip)** checkbox in the web UI. It runs in an isolated virtualenv (installed by `04_setup.sh`) as a subprocess, so its old pinned dependencies never touch the main stack, and it's best‑effort: a failure — or slide‑only footage with no face to sync — is logged and the standard outputs are unaffected. Best for talking‑head video; it processes every frame, so it's slow on long programs (raise `wav2lip.resize_factor` to trade a little quality for speed). See [Configuration](#configuration).
 
 ### Localisation
 
@@ -88,7 +89,8 @@ Open the RunPod‑proxied URL for port 7860, drop in a video, pick locale, speak
 python /workspace/scripts/02_pipeline.py \
     --video /workspace/videos/input/webinar.mp4 \
     --locale fr-ca \
-    --volume-boost 15
+    --volume-boost 15 \
+    --wav2lip                 # optional: also lip-sync the mouth to the dub
 ```
 
 | Flag | Choices / Type | Effect |
@@ -99,6 +101,7 @@ python /workspace/scripts/02_pipeline.py \
 | `--locale` | `fr` \| `fr-ca` | `fr-ca` loads the Canadian glossary |
 | `--speakers` | int 1–20 | Exact speaker count for this video (overrides diarization min/max). `1` = solo presenter: skips diarization entirely |
 | `--volume-boost` | float, % | Boost output loudness (shifts the −16 LUFS loudnorm target) |
+| `--wav2lip` / `--no-wav2lip` | flag | Run (or skip) the optional Wav2Lip lip‑sync stage for this run, overriding `wav2lip.enabled`. Emits an extra `{name}_french_wav2lip.mp4` |
 | `--phase` | `1` \| `2` | `1` = transcribe+translate then stop (for review); `2` = TTS+assembly from the saved segments |
 | `--segments-file` | path | Phase 2: load segments from a custom path |
 | `--keep-temp` | flag | Keep intermediate stage JSON for debugging |
@@ -111,7 +114,7 @@ cp ~/incoming/*.mp4 /workspace/videos/input/
 python /workspace/scripts/03_batch_runner.py
 ```
 
-One job at a time (VRAM‑safe). Reports to `/workspace/logs/batch_report.json`.
+One job at a time (VRAM‑safe). Reports to `/workspace/logs/batch_report.json`. The batch runner is config‑driven, so it lip‑syncs every video when `wav2lip.enabled: true` in `config.yaml`.
 
 ### 5. Stop the pod
 
@@ -124,7 +127,7 @@ One job at a time (VRAM‑safe). Reports to `/workspace/logs/batch_report.json`.
 A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in [web/static/](web/static/). Launch with `bash 05_web.sh` (binds `0.0.0.0:7860`).
 
 - Drag‑drop MP4 upload with progress bar (or a Vimeo URL, or an on‑pod path for big files).
-- Per‑job options: locale, **speaker count** (blank = auto; `1` = solo presenter), volume boost, and an optional pause‑for‑review stage to edit translations and pick voice references before synthesis.
+- Per‑job options: locale, **speaker count** (blank = auto; `1` = solo presenter), volume boost, an optional pause‑for‑review stage to edit translations and pick voice references before synthesis, and an optional **Lip‑sync (Wav2Lip)** toggle that adds a `_french_wav2lip.mp4` download when the job finishes.
 - **Voice polishing loop**: in the review stage, each speaker's reference can be re‑picked (time range with per‑speaker turn suggestions, or a library clip), auditioned raw (▶ Preview), and **tested as a cloned voice** (🎤 Test voice — one F5‑TTS synthesis of a short sentence, ~30 s first call, instant on replay; supports a custom sentence for checking name pronunciation). Re‑opening a finished job re‑runs only Phase 2, so fixing an artifact‑y voice never repeats transcription/translation.
 - Single‑job FIFO queue; live log via Server‑Sent Events.
 - Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
@@ -224,6 +227,13 @@ output:
   mux_video: true           # also emit _french.mp4 (video + dub audio + subs)
   burn_subs: false          # false = soft SRT track (copy video) | true = burn in (re‑encode)
 
+wav2lip:
+  enabled: false            # opt‑in lip‑sync stage; per‑job override: --wav2lip / web checkbox
+  checkpoint: /workspace/models/wav2lip/wav2lip_gan.pth   # or wav2lip.pth (tighter sync, less smooth)
+  resize_factor: 1          # downscale frames by N before inference (2 ≈ 4× faster, lower VRAM)
+  pads: [0, 10, 0, 0]       # face padding top,bottom,left,right (raise 2nd value if chin is clipped)
+  nosmooth: false           # true = disable temporal smoothing (fast motion / profile faces)
+
 subtitles:
   standard: netflix         # netflix (≤42 cpl) | bbc (≤37 cpl) | kapwing (legacy karaoke)
   max_cps: 17.0             # reading‑speed cap
@@ -246,6 +256,7 @@ For each `webinar.mp4`, in `/workspace/outputs/`:
 - `webinar_french.srt` — UTF‑8 SRT, BBC/Netflix‑shaped cues
 - `webinar_french_full.m4a` — full mix: French vocals + original background bed (when Demucs separation succeeded and `source_separation.preserve_background: true`)
 - `webinar_french.mp4` — original video + dubbed audio + subtitles, muxed for one‑file review (when `output.mux_video: true`). The dub is held to the source length, so audio, subs, and picture stay in sync end‑to‑end.
+- `webinar_french_wav2lip.mp4` — the same muxed video with the speaker's **lips re‑synced** to the French dub (only when the lip‑sync stage ran and found a face — `wav2lip.enabled` / `--wav2lip` / the web checkbox). Produced **in addition to** `webinar_french.mp4`, which is left untouched.
 
 For Vimeo, use the built‑in push (below) — or manually upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
 
@@ -320,6 +331,9 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mi
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
 | A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
 | Ollama model re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
+| `--wav2lip` produced no `_french_wav2lip.mp4` (log: "no face detected") | Slide‑only / no on‑screen face for Wav2Lip to track | Expected — the stage skips and leaves the normal outputs intact. Use talking‑head footage, or leave lip‑sync off |
+| Lip‑sync log: "Wav2Lip not available (missing: …)" | The isolated venv / checkpoints aren't installed (e.g. running locally) | Run `04_setup.sh` on the pod; set `WAV2LIP_GAN_URL` / `S3FD_URL` to a working mirror if a download failed |
+| Lip‑sync stage very slow | Wav2Lip processes every frame at full resolution | Raise `wav2lip.resize_factor` (2 ≈ 4× faster); lower `wav2lip.wav2lip_batch_size` if VRAM is tight on the A4000 |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.
 

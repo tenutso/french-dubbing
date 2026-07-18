@@ -139,6 +139,7 @@ $("#submit-form").addEventListener("submit", e => {
   fd.append("volume_boost", $("#volume_boost").value);
   if ($("#force").checked) fd.append("force", "on");
   if ($("#review").checked) fd.append("review", "on");
+  if ($("#wav2lip").checked) fd.append("wav2lip", "on");
   if ($("#vimeo_push").checked) fd.append("vimeo_push", "on");
 
   const xhr = new XMLHttpRequest();
@@ -381,7 +382,8 @@ function renderCard(job) {
   // Downloads
   const dl = $(".job-downloads", root);
   for (const [kind, label] of [
-    ["video", "Video (MP4)"], ["audio", "Audio"],
+    ["video", "Video (MP4)"], ["video_lipsync", "Video (lip-synced)"],
+    ["audio", "Audio"],
     ["srt", "French SRT"], ["full", "Full mix"], ["english_srt", "English SRT"],
   ]) {
     if (job.outputs && job.outputs[kind]) {

@@ -207,6 +207,27 @@ second lossy encode) and subtitles (soft `mov_text` track by default, or burned 
 `output.burn_subs`) — for one‑file sync verification; because the dub is held to the source
 length, the streams end together.
 
+## 9. Lip-sync — Wav2Lip (optional)
+
+An opt-in final stage (`wav2lip.enabled`, or per-run `--wav2lip` / the web checkbox) re-syncs the
+on-screen speaker's mouth to the French dub. `run_wav2lip` feeds the **original video** (as the face
+source) and the **dubbed delivery audio** (`mux_audio`) to Wav2Lip, then re-attaches the SRT with
+`mux_final_video` (video stream-copied), writing a separate `{name}_french_wav2lip.mp4`. The standard
+`{name}_french.mp4` is never modified.
+
+Wav2Lip pins old, conflicting dependencies (librosa 0.9 / numpy 1.x / opencv), so `04_setup.sh`
+installs it into a **dedicated virtualenv** under `/workspace/wav2lip`, and `run_wav2lip` invokes
+`inference.py` there as a subprocess — it never imports into, or perturbs, the main environment. The
+stage runs **last** and is deliberately best-effort: a missing install, a missing checkpoint, or
+slide-only footage with no detectable face is logged as a warning and returns without touching the
+already-written outputs. It is not emitted as a `[N/6]` phase banner, so the web progress bar (which
+parses that pattern) is unaffected while Wav2Lip's own progress streams to the live log.
+
+**VRAM:** the Wav2Lip GAN generator plus the S3FD face detector total only a few hundred MB, and the
+stage runs after F5-TTS has freed the GPU, so it fits comfortably on the 20 GB A4000. Because it
+processes every frame, throughput — not memory — is the cost; `wav2lip.resize_factor` trades a little
+resolution for speed, and `wav2lip.wav2lip_batch_size` / `face_det_batch_size` cap peak VRAM.
+
 ---
 
 ## VRAM budget (RTX 4090, 24 GB)
@@ -228,4 +249,5 @@ during synthesis — each phase fits comfortably within 24 GB. Smaller translati
 | TTS + spoken-form normalization | `synthesize_all_segments`, `_tts_spoken_form` |
 | Timeline / anchored / drift re‑anchoring | `assemble_and_encode` |
 | Video mux | `mux_final_video` |
+| Lip-sync (optional, isolated env) | `run_wav2lip` |
 | Subtitles | `create_srt`, `_split_into_chunks`, `_wrap_two_lines`, `_enforce_subtitle_timing` |

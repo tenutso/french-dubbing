@@ -3840,12 +3840,22 @@ def run_wav2lip(
     if config.wav2lip_nosmooth:
         cmd.append("--nosmooth")
 
+    # The parent may export an empty/invalid PYTHONHASHSEED (e.g. "" from the web
+    # launcher), which makes a freshly-started Python abort at init with
+    # "PYTHONHASHSEED must be 'random' or an integer …" before running any code.
+    # Force a valid value for the isolated interpreter so it always starts.
+    child_env = os.environ.copy()
+    _hs = (child_env.get("PYTHONHASHSEED") or "").strip()
+    _hs_valid = _hs == "random" or (_hs.isdigit() and 0 <= int(_hs) <= 4294967295)
+    if not _hs_valid:
+        child_env["PYTHONHASHSEED"] = "0"
+
     log.info("  Running Wav2Lip in isolated env (this processes every frame) …")
     try:
         # cwd=repo_dir so Wav2Lip resolves its bundled face_detection weights.
         subprocess.run(
             cmd, check=True, capture_output=True,
-            timeout=config.wav2lip_timeout, cwd=repo_dir,
+            timeout=config.wav2lip_timeout, cwd=repo_dir, env=child_env,
         )
     except subprocess.CalledProcessError as e:
         err = (e.stderr or b"").decode("utf-8", "ignore")[-800:]

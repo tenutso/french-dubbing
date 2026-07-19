@@ -3851,31 +3851,59 @@ def run_wav2lip(
         child_env["PYTHONHASHSEED"] = "0"
 
     log.info("  Running Wav2Lip in isolated env (this processes every frame) …")
+    # Merge stderr into stdout so tqdm progress AND any Python traceback are
+    # captured together, and keep the full transcript on disk for inspection —
+    # a bare "Wav2Lip failed:" with empty stderr (e.g. a signal kill) is useless.
+    w2l_log = os.path.join(temp_dir, "wav2lip.log")
+
+    def _save(text: str) -> None:
+        try:
+            with open(w2l_log, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+
     try:
         # cwd=repo_dir so Wav2Lip resolves its bundled face_detection weights.
-        subprocess.run(
-            cmd, check=True, capture_output=True,
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=config.wav2lip_timeout, cwd=repo_dir, env=child_env,
         )
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or b"").decode("utf-8", "ignore")[-800:]
-        # "Face not detected" is the common, expected case for slide-only footage.
-        if "Face not detected" in err:
-            log.warning("Wav2Lip: no face detected in the video — skipping lip-sync.")
-        else:
-            log.warning(f"Wav2Lip failed: {err}")
-        return False
-    except subprocess.TimeoutExpired:
+        out = (proc.stdout or b"").decode("utf-8", "ignore")
+        rc = proc.returncode
+    except subprocess.TimeoutExpired as e:
+        out = (e.output or b"").decode("utf-8", "ignore") if e.output else ""
+        _save(out)
         log.warning(
-            f"Wav2Lip timed out after {config.wav2lip_timeout}s — skipping lip-sync."
+            f"Wav2Lip timed out after {config.wav2lip_timeout}s — skipping lip-sync. "
+            f"Partial log: {w2l_log}"
         )
         return False
     except Exception as e:
-        log.warning(f"Wav2Lip failed: {e}")
+        log.warning(f"Wav2Lip could not be launched: {e}")
+        return False
+
+    _save(out)
+
+    if rc != 0:
+        tail = "\n".join(out.strip().splitlines()[-25:]) or "(no output captured)"
+        # "Face not detected" is the common, expected case for slide-only footage.
+        if "Face not detected" in out:
+            log.warning("Wav2Lip: no face detected in the video — skipping lip-sync.")
+        elif rc < 0:
+            log.warning(
+                f"Wav2Lip was killed by signal {-rc} — this is usually out-of-VRAM. "
+                f"Lower wav2lip.wav2lip_batch_size / face_det_batch_size, or raise "
+                f"wav2lip.resize_factor, then retry. Full log: {w2l_log}\n{tail}"
+            )
+        else:
+            log.warning(f"Wav2Lip failed (exit {rc}). Full log: {w2l_log}\n{tail}")
         return False
 
     if not os.path.exists(tmp_out):
-        log.warning("Wav2Lip produced no output file — skipping lip-sync.")
+        log.warning(
+            f"Wav2Lip exited cleanly but produced no output file. Log: {w2l_log}"
+        )
         return False
 
     # Re-attach the delivery audio (AAC) + subtitles onto the lip-synced picture.

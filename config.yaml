@@ -70,7 +70,15 @@ wav2lip:
   # true = disable the temporal face-smoothing (helps on fast motion or
   #        profile shots where smoothing drags the mouth off the face).
   nosmooth: false
-  # Hard ceiling for the lip-sync subprocess (seconds). Wav2Lip processes every
+  # Stock Wav2Lip loads the ENTIRE video into RAM before it does anything, so a
+  # long/HD clip is SIGKILLed (out-of-memory) while "Reading video frames". To
+  # avoid that we split the video into ~chunk_seconds segments, lip-sync each,
+  # and concatenate — peak RAM scales with the chunk length, not the whole video.
+  # 20s @ 1080p keeps a chunk well under ~10 GB. Lower it if a pod with little
+  # RAM still gets killed; raise it (fewer seams) if you have RAM to spare.
+  # 0 disables chunking (single pass — only safe for short clips).
+  chunk_seconds: 20
+  # Hard ceiling for EACH Wav2Lip subprocess (seconds). Wav2Lip processes every
   # frame, so long videos are slow — keep this generous.
   timeout_seconds: 7200
 

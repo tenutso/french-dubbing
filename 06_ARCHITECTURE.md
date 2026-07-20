@@ -223,10 +223,18 @@ slide-only footage with no detectable face is logged as a warning and returns wi
 already-written outputs. It is not emitted as a `[N/6]` phase banner, so the web progress bar (which
 parses that pattern) is unaffected while Wav2Lip's own progress streams to the live log.
 
+**Chunked to bound RAM:** stock Wav2Lip loads the *entire* video into a RAM list before it does
+anything (the "Reading video frames" phase), so a long or HD clip is SIGKILLed by the host OOM
+killer — ~70 GB for a 6-minute 1080p video. `run_wav2lip` therefore splits the source into
+`wav2lip.chunk_seconds` segments (one keyframe-forced ffmpeg pass), lip-syncs each against its audio
+slice, and concatenates the results, so peak RAM scales with the *chunk* length, not the whole video.
+A/V sync is preserved by deriving each audio slice from the *probed* segment durations
+(`_wav2lip_audio_ranges`). Set `chunk_seconds: 0` to force the legacy single pass.
+
 **VRAM:** the Wav2Lip GAN generator plus the S3FD face detector total only a few hundred MB, and the
-stage runs after F5-TTS has freed the GPU, so it fits comfortably on the 20 GB A4000. Because it
-processes every frame, throughput — not memory — is the cost; `wav2lip.resize_factor` trades a little
-resolution for speed, and `wav2lip.wav2lip_batch_size` / `face_det_batch_size` cap peak VRAM.
+stage runs after F5-TTS has freed the GPU, so GPU memory is never the constraint on the 20 GB A4000 —
+the earlier failure mode was host RAM (signal 9), not VRAM. `wav2lip.resize_factor` trades a little
+resolution for speed/RAM, and `wav2lip.wav2lip_batch_size` / `face_det_batch_size` cap peak VRAM.
 
 ---
 

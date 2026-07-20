@@ -230,7 +230,8 @@ output:
 wav2lip:
   enabled: false            # opt‑in lip‑sync stage; per‑job override: --wav2lip / web checkbox
   checkpoint: /workspace/models/wav2lip/wav2lip_gan.pth   # or wav2lip.pth (tighter sync, less smooth)
-  resize_factor: 1          # downscale frames by N before inference (2 ≈ 4× faster, lower VRAM)
+  chunk_seconds: 20         # split into N‑sec segments so long/HD video doesn't OOM (0 = single pass)
+  resize_factor: 1          # downscale frames by N before inference (2 ≈ 4× faster, lower RAM/VRAM)
   pads: [0, 10, 0, 0]       # face padding top,bottom,left,right (raise 2nd value if chin is clipped)
   nosmooth: false           # true = disable temporal smoothing (fast motion / profile faces)
 
@@ -333,7 +334,9 @@ Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mi
 | Ollama model re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 | `--wav2lip` produced no `_french_wav2lip.mp4` (log: "no face detected") | Slide‑only / no on‑screen face for Wav2Lip to track | Expected — the stage skips and leaves the normal outputs intact. Use talking‑head footage, or leave lip‑sync off |
 | Lip‑sync log: "Wav2Lip not available (missing: …)" | The isolated venv / checkpoints aren't installed (e.g. running locally) | Run `04_setup.sh` on the pod; set `WAV2LIP_GAN_URL` / `S3FD_URL` to a working mirror if a download failed |
-| Lip‑sync stage very slow | Wav2Lip processes every frame at full resolution | Raise `wav2lip.resize_factor` (2 ≈ 4× faster); lower `wav2lip.wav2lip_batch_size` if VRAM is tight on the A4000 |
+| Lip‑sync log: "Wav2Lip killed by signal 9" | System‑**RAM** OOM — stock Wav2Lip loads the whole video into RAM ("Reading video frames") | Lower `wav2lip.chunk_seconds` (e.g. 10) so less video is in RAM at once; raising `wav2lip.resize_factor` also helps. (Signal 9 is host RAM, not GPU VRAM.) |
+| Lip‑sync log: "CUDA out of memory" (exit 1, not signal 9) | GPU **VRAM** pressure during inference | Lower `wav2lip.wav2lip_batch_size` / `wav2lip.face_det_batch_size` |
+| Lip‑sync stage very slow | Wav2Lip processes every frame | Raise `wav2lip.resize_factor` (2 ≈ 4× faster). It runs in `chunk_seconds` segments, so total time ≈ sum of the chunks |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.
 

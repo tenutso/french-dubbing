@@ -129,12 +129,15 @@ translation:
   # no further progress is made. More rounds = tighter fit, slightly more calls.
   compression_rounds: 3
   # Character budget per second of audio that Qwen is asked to fit each segment
-  # into. Tuning history: 13 over-compressed (mean_expansion 0.78, fidelity risk);
-  # 14 was the prior default but left 62%+ segments over budget with Mistral-small;
-  # 16 gives the model breathing room while remaining under subtitles.max_cps (17).
+  # into (integer). Tuning history: 13 over-compressed (mean_expansion 0.78,
+  # fidelity risk); 14 was an earlier default but left 62%+ segments over budget
+  # with Mistral-small — measured while the compression trigger was miscalibrated
+  # (_FR_SYL_PER_CHAR 0.32), so most offenders were never re-prompted. 16 then
+  # leaned on time-stretch: cloned voices typically speak ~12.5 chars/s, so a
+  # 16 CPS line needs ~1.27x speed-up. 14 targets ~1.15x.
   # Track mean_expansion and final_over_readability_pct in
   # _dubbing_metrics_runs.csv after changing. Keep ≤ subtitles.max_cps.
-  budget_cps: 16
+  budget_cps: 14
 
   # Target language for the dub. Drives the prompt language label.
   # Supported: fr, es, de, it, pt, nl, pl, ru, ja, ko, zh, ar, tr, hi, vi.

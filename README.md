@@ -250,19 +250,6 @@ For Vimeo, upload `_full.m4a` as the alternate audio track and `.srt` as the Fre
 
 ---
 
-## Evaluation harness
-
-[`eval/`](eval/) contains the quality tooling used to validate the pipeline:
-
-| Script | Measures |
-|---|---|
-| `srt_lint.py` | BBC/Netflix compliance (line length, reading speed, durations, gaps) + chrF/BLEU vs a reference SRT |
-| `audio_eval.py` | ASR round‑trip word‑recall (dropped words) + duration drift |
-| `translate_bench.py` | Head‑to‑head LLM translation scoring (reuses the pipeline's own translate path) |
-| `tts_mos.py` | Reference‑free speech quality (SQUIM PESQ / STOI / SI‑SDR) |
-
----
-
 ## Running outside RunPod
 
 Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mistral‑small:22b co‑resident) and an NVIDIA driver ≥ 580 (CUDA 13.x). On Ubuntu 24.04 / Python 3.12, run `04_setup.sh` directly — it installs PyTorch 2.15 from `requirements.txt`. To install only the Python stack (e.g. into a virtualenv):

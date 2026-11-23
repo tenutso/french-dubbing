@@ -4,6 +4,11 @@ How a video moves through the pipeline, stage by stage. The single source of tru
 [`02_pipeline.py`](02_pipeline.py); this document explains the *why* behind each stage and
 the knobs that matter. All settings live in [`config.yaml`](config.yaml).
 
+**Runtime stack:** PyTorch 2.15.0 (CUDA 13.2 build) with torchaudio 2.11.1, torchvision 0.29.2
+and torchcodec 0.17.0, on an NVIDIA driver ≥ 580 (CUDA 13.x) and Python 3.12. The versions are
+pinned together in [`requirements.txt`](requirements.txt); see
+[README → System requirements](README.md#system-requirements) for why each pin exists.
+
 ```
 MP4
  │

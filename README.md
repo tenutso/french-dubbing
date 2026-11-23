@@ -2,6 +2,8 @@
 
 Turn English webinar / presentation MP4s into natural **French (or French‑Canadian) audio tracks** with broadcast‑grade **SRT subtitles**. Runs end‑to‑end on a single RTX 4090 (24 GB) — locally or on RunPod — with no proprietary APIs.
 
+**Requires an NVIDIA driver ≥ 580 (CUDA 13.x) and PyTorch 2.15**; see [System requirements](#system-requirements).
+
 The pipeline does everything from source separation through translation, voice‑cloned TTS, and subtitle generation, and exposes both a **CLI** and a small **web UI** for non‑technical users to submit jobs, watch progress, and download results.
 
 ---
@@ -36,12 +38,36 @@ The pipeline does everything from source separation through translation, voice�
 
 ---
 
+## System requirements
+
+| Component | Required | Notes |
+|---|---|---|
+| **NVIDIA driver** | **≥ 580** (reports **CUDA 13.x**) | The PyTorch wheels are built for CUDA 13. Check with `nvidia-smi`: the top‑right "CUDA Version" must be 13.0 or higher. `04_setup.sh` stops with a clear error on older drivers. |
+| **GPU** | ≥ 16 GB VRAM, **24 GB recommended** | Whisper large‑v3, mistral‑small:22b and F5‑TTS load one after another; 24 GB leaves headroom. |
+| **OS / Python** | Ubuntu 24.04, **Python 3.12** | |
+| **CUDA toolkit** | Not needed | The CUDA 13 runtime libraries come with the PyTorch wheels from PyPI. Only the driver has to be on the host. |
+| **System tools** | `ffmpeg`, `sox`, `libsndfile1` | Installed by `04_setup.sh`. |
+
+The PyTorch stack is pinned in [`requirements.txt`](requirements.txt) and installed by `04_setup.sh`. These versions must match each other, so upgrade them together:
+
+| Package | Version | Why it's pinned |
+|---|---|---|
+| `torch` | **2.15.0** (CUDA 13.2 build) | Base of the stack |
+| `torchaudio` | **2.11.1** | Last torchaudio release; requires `torch>=2.11` and works with 2.15 |
+| `torchvision` | **0.29.2** | Not used directly, but transformers imports it. A torchvision left over from the base image breaks the F5‑TTS import (`operator torchvision::nms does not exist`). |
+| `torchcodec` | **0.17.0** | Must match torch. A mismatch breaks pyannote diarization (`AudioDecoder` NameError) and F5‑TTS reference loading. |
+| `av` (PyAV) | **< 19** | faster‑whisper 1.2.1 still uses an `av.open()` argument PyAV 19 removed (`unexpected keyword argument 'metadata_errors'`). |
+
+Tested end‑to‑end on an NVIDIA A40 (46 GB), driver 595.112.07 / CUDA 13.2, Ubuntu 24.04, Python 3.12. Run `python /workspace/scripts/verify_setup.py` after installing; it checks the driver, the PyTorch/CUDA build and the torchcodec link.
+
+---
+
 ## Quick start on RunPod
 
 ### 1. Launch a pod
 
 1. <https://runpod.io> → **Pods → Deploy**.
-2. **GPU**: RTX 4090 (24 GB) recommended (A5000 / A6000 / H100 also work).
+2. **GPU**: RTX 4090 (24 GB) recommended (A5000 / A6000 / A40 / H100 also work). See [System requirements](#system-requirements).
 3. **Template**: any Ubuntu 24.04 / Python 3.12 `runpod/pytorch` template, on a host whose **CUDA version filter is 13.x** (NVIDIA driver ≥ 580). `04_setup.sh` installs the pinned stack itself — **PyTorch 2.15 / torchaudio 2.11 / torchcodec 0.17, CUDA 13 wheels** — upgrading whatever torch the image ships.
 4. **Storage**: ≥100 GB container disk; persist a 50 GB+ volume at `/workspace` so models survive restarts.
 5. **Expose HTTP port** `7860` (web UI).
@@ -252,7 +278,7 @@ For Vimeo, upload `_full.m4a` as the alternate audio track and `.srt` as the Fre
 
 ## Running outside RunPod
 
-Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mistral‑small:22b co‑resident) and an NVIDIA driver ≥ 580 (CUDA 13.x). On Ubuntu 24.04 / Python 3.12, run `04_setup.sh` directly — it installs PyTorch 2.15 from `requirements.txt`. To install only the Python stack (e.g. into a virtualenv):
+Any NVIDIA GPU with ≥16 GB VRAM (24 GB recommended for Whisper + F5‑TTS + mistral‑small:22b co‑resident) and an NVIDIA driver ≥ 580 (CUDA 13.x); see [System requirements](#system-requirements). On Ubuntu 24.04 / Python 3.12, run `04_setup.sh` directly — it installs PyTorch 2.15 from `requirements.txt`. To install only the Python stack (e.g. into a virtualenv):
 
 ```bash
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
@@ -273,6 +299,9 @@ python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 | Output too quiet | Loudness target (−16 LUFS) | `--volume-boost 20` (shifts the loudnorm target ~+1.6 dB) |
 | Dub runs longer than the source / drifts out of sync on long videos | `timing_policy: no_drop` extends the timeline on dense passages | Use the default `timing_policy: anchored` (holds the source timeline); tighten `translation.budget_cps` (≈15) so the French fits, or use `lock` for exact timing |
 | A dense line sounds slightly rushed | `anchored` sped that group up to fit its slot | Raise `tts.max_stretch` cap relief is the wrong way — instead *lower* `translation.budget_cps` so the line is shorter; or accept it (capped at `tts.max_stretch`, ~1.30×) |
+| Setup: `NVIDIA driver … is too old for the CUDA 13 PyTorch wheels`, or `torch.cuda.is_available()` is False | Host driver < 580 | Use a host/pod with CUDA 13.x (RunPod: filter by CUDA version) — see [System requirements](#system-requirements) |
+| `operator torchvision::nms does not exist` / F5‑TTS fails to import | Stale torchvision from the base image | `pip install -r requirements.txt` (pins `torchvision==0.29.2`) |
+| `open() got an unexpected keyword argument 'metadata_errors'` at transcription | PyAV 19 installed | `pip install -r requirements.txt` (pins `av<19`) |
 | Ollama model re‑downloads each restart | Ollama reading ephemeral `~/.ollama` | Export `OLLAMA_MODELS=/workspace/.ollama/models` before `ollama serve` |
 
 See [06_ARCHITECTURE.md](06_ARCHITECTURE.md) and the comments in [02_pipeline.py](02_pipeline.py) for deeper detail.

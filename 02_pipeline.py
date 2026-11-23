@@ -953,6 +953,61 @@ def collapse_intrasegment_loops(
 # Step 3b: Segment merging — into sentence-scale chunks
 # ============================================================================
 
+_SENT_END_RE   = re.compile(r"[.!?…][\"'»”)\]]*$")
+_CLAUSE_END_RE = re.compile(r"[,;:—–][\"'»”)\]]*$")
+# Run-on speech often has no punctuation for 15-20 s and Whisper's word
+# timestamps abut (0.00 s gaps), so neither punctuation nor pauses offer a cut.
+# Starting a new chunk just before one of these words lands on a phrase break.
+_PHRASE_START_WORDS = frozenset(
+    "and so but because or then which when where while if although though "
+    "um uh yeah okay ok like actually anyway now well".split()
+)
+_REAL_PAUSE_S = 0.25
+
+
+def _merge_units(segments: List[dict]) -> List[dict]:
+    """Flatten Whisper fragments into the smallest units we may cut between.
+
+    A fragment whose word timestamps rebuild its text exactly contributes one
+    unit per word, so a chunk can be cut at a sentence end *inside* a Whisper
+    fragment. A fragment whose words are missing or out of sync with its text
+    (dedupe / loop-collapse may edit the text) stays one atomic unit, so the
+    cleaned text is never replaced by stale words.
+    """
+    units: List[dict] = []
+    for seg in segments:
+        words = seg.get("words") or []
+        text = seg.get("text", "")
+        norm = lambda t: re.sub(r"\s+", "", t).lower()
+        usable = (
+            words
+            and all("start" in w and "end" in w and "word" in w for w in words)
+            and norm("".join(w["word"] for w in words)) == norm(text)
+        )
+        if usable:
+            for w in words:
+                units.append({"start": float(w["start"]), "end": float(w["end"]),
+                              "text": w["word"], "words": [w],
+                              "speaker": seg.get("speaker")})
+        else:
+            units.append({"start": float(seg["start"]), "end": float(seg["end"]),
+                          "text": " " + text.strip(), "words": list(words),
+                          "speaker": seg.get("speaker")})
+    return units
+
+
+def _chunk_from_units(units: List[dict]) -> dict:
+    chunk = {
+        "start": units[0]["start"],
+        "end": units[-1]["end"],
+        "text": "".join(u["text"] for u in units).strip(),
+        "words": [w for u in units for w in u["words"]],
+    }
+    if units[0].get("speaker") is not None:
+        chunk["speaker"] = units[0]["speaker"]
+    return chunk
+
+
 def merge_segments(
     segments: List[dict],
     max_gap: float,
@@ -960,76 +1015,105 @@ def merge_segments(
     min_duration: float,
     log: logging.Logger,
 ) -> List[dict]:
-    """Merge Whisper fragments into sentence-scale chunks.
+    """Merge Whisper fragments into sentence-scale chunks, cutting at sentence ends.
+
+    Works on word timestamps (see _merge_units), not on Whisper's fragments:
+    Whisper rarely ends a fragment on a sentence (51/321 on a 29-min webinar),
+    so cutting only between fragments put 82% of chunk boundaries mid-sentence
+    — almost all forced by the max_duration cap. Translated one batch at a time,
+    those fragments made the LLM slide content between neighbouring segments.
 
     Strategy:
-      - Keep merging across pauses ≤ max_gap until either max_duration is hit
-        or we cross min_duration AND hit a sentence-ending punctuation.
-      - Never merge across a speaker change (segments carry a "speaker" key
-        when diarization ran) — a chunk spanning two speakers would be dubbed
-        entirely in one cloned voice.
-      - Never emit a chunk shorter than min_duration: force-merge tiny chunks
-        with their previous neighbour as a final sweep (same-speaker only).
-
-    This eliminates the sub-second fragments that broke SRT timing in v3 and
-    gives the TTS enough context per call for natural prosody.
+      - Close a chunk at a sentence end once it is ≥ min_duration.
+      - Close it at a pause > max_gap or a speaker change (never merge across
+        speakers — a chunk spanning two speakers would be dubbed in one voice).
+      - When the next word would push a chunk past max_duration, cut it at the
+        best earlier boundary that leaves ≥ min_duration: the latest sentence
+        end, else the latest clause break (, ; : —), else the longest real
+        pause (≥ 0.25 s), else just before a conjunction/filler ("and", "so",
+        "um" …), else the latest word. The remainder starts the next chunk.
+      - Final sweep: fold chunks shorter than min_duration into the previous
+        one (same speaker only).
     """
     if not segments:
         return segments
 
-    def _same_speaker(a: dict, b: dict) -> bool:
-        return a.get("speaker") == b.get("speaker")
-
+    units = _merge_units(segments)
     merged: List[dict] = []
-    current = dict(segments[0])
+    cur: List[dict] = []
+    cut_kinds = {"sentence": 0, "clause": 0, "pause": 0, "phrase": 0, "forced": 0}
 
-    for seg in segments[1:]:
-        gap          = seg["start"] - current["end"]
-        combined_dur = seg["end"]   - current["start"]
-        current_dur  = current["end"] - current["start"]
-        ends_sent    = bool(re.search(r"[.!?]\s*$", current["text"].rstrip()))
+    def _best_cut(chunk: List[dict]) -> Optional[int]:
+        """Index j to cut chunk into chunk[:j] | chunk[j:], or None."""
+        t0 = chunk[0]["start"]
+        cands = [j for j in range(1, len(chunk)) if chunk[j - 1]["end"] - t0 >= min_duration]
+        if not cands:
+            return None
+        for kind, rx in (("sentence", _SENT_END_RE), ("clause", _CLAUSE_END_RE)):
+            hits = [j for j in cands if rx.search(chunk[j - 1]["text"].strip())]
+            if hits:
+                cut_kinds[kind] += 1
+                return hits[-1]
+        pauses = [j for j in cands if chunk[j]["start"] - chunk[j - 1]["end"] >= _REAL_PAUSE_S]
+        if pauses:
+            cut_kinds["pause"] += 1
+            return max(pauses, key=lambda j: (chunk[j]["start"] - chunk[j - 1]["end"], j))
+        phrase = [j for j in cands
+                  if chunk[j]["text"].strip().strip(".,!?;:\"'").lower() in _PHRASE_START_WORDS]
+        if phrase:
+            cut_kinds["phrase"] += 1
+            return phrase[-1]
+        cut_kinds["forced"] += 1
+        return cands[-1]
 
-        # Merge if gap small enough, combined stays under cap, same speaker, AND
-        # either we haven't reached min_duration or the last clause didn't end.
-        should_merge = (
-            gap <= max_gap
-            and combined_dur <= max_duration
-            and _same_speaker(current, seg)
-            and (current_dur < min_duration or not ends_sent)
-        )
-        if should_merge:
-            current["end"]  = seg["end"]
-            current["text"] = current["text"].rstrip() + " " + seg["text"].lstrip()
-            if seg.get("words"):
-                current["words"] = (current.get("words") or []) + seg["words"]
-        else:
-            merged.append(current)
-            current = dict(seg)
-
-    merged.append(current)
+    for u in units:
+        if cur:
+            gap = u["start"] - cur[-1]["end"]
+            if gap > max_gap or u.get("speaker") != cur[-1].get("speaker"):
+                merged.append(_chunk_from_units(cur))
+                cur = []
+            elif u["end"] - cur[0]["start"] > max_duration:
+                j = _best_cut(cur)
+                if j is None:
+                    merged.append(_chunk_from_units(cur))
+                    cur = []
+                else:
+                    merged.append(_chunk_from_units(cur[:j]))
+                    cur = cur[j:]
+        cur.append(u)
+        if (cur[-1]["end"] - cur[0]["start"] >= min_duration
+                and _SENT_END_RE.search(cur[-1]["text"].strip())):
+            merged.append(_chunk_from_units(cur))
+            cur = []
+    if cur:
+        merged.append(_chunk_from_units(cur))
 
     # Final sweep: absorb any still-too-short chunks into the previous chunk.
     if len(merged) > 1:
         cleaned: List[dict] = [merged[0]]
         for chunk in merged[1:]:
             dur = chunk["end"] - chunk["start"]
-            prev_dur = cleaned[-1]["end"] - cleaned[-1]["start"]
-            if (dur < min_duration and (prev_dur + dur) <= max_duration * 1.25
-                    and _same_speaker(cleaned[-1], chunk)):
-                cleaned[-1]["end"]  = chunk["end"]
-                cleaned[-1]["text"] = cleaned[-1]["text"].rstrip() + " " + chunk["text"].lstrip()
-                if chunk.get("words"):
-                    cleaned[-1]["words"] = (cleaned[-1].get("words") or []) + chunk["words"]
+            prev = cleaned[-1]
+            if (dur < min_duration
+                    and (chunk["end"] - prev["start"]) <= max_duration * 1.25
+                    and prev.get("speaker") == chunk.get("speaker")):
+                prev["end"] = chunk["end"]
+                prev["text"] = prev["text"].rstrip() + " " + chunk["text"].lstrip()
+                prev["words"] = (prev.get("words") or []) + (chunk.get("words") or [])
             else:
                 cleaned.append(chunk)
         merged = cleaned
 
-    for i, s in enumerate(merged):
-        s["id"] = i
+    for i, s_ in enumerate(merged):
+        s_["id"] = i
 
+    ends_sent = sum(bool(_SENT_END_RE.search(c["text"].strip())) for c in merged)
     log.info(
         f"✓ Merged {len(segments)} Whisper fragments → {len(merged)} chunks "
-        f"(target {min_duration:.0f}s–{max_duration:.0f}s)"
+        f"(target {min_duration:.0f}s–{max_duration:.0f}s; {ends_sent} end a sentence; "
+        f"length-cap cuts: sentence {cut_kinds['sentence']} / clause "
+        f"{cut_kinds['clause']} / pause {cut_kinds['pause']} / before a "
+        f"conjunction {cut_kinds['phrase']} / forced {cut_kinds['forced']})"
     )
     return merged
 
@@ -1296,6 +1380,13 @@ You are a professional {language} dubbing translator.{locale_note}
 
 Translate each numbered English segment into natural spoken {language} suitable for AI voice dubbing.
 
+The segments are CONSECUTIVE pieces of one continuous talk, and each translation is dubbed
+over exactly its own segment's audio. A segment may begin or end in the middle of a sentence:
+translate exactly that piece, even if it is an incomplete phrase. Never move words or ideas
+into a neighbouring segment's translation, never complete a sentence using the next
+segment's words, and never merge or skip segments. Translation N must express only what
+English segment N says.
+
 Each segment is tagged:
 
 [N.Ns, ~W words, ≤M chars]
@@ -1334,7 +1425,7 @@ Character Limits:
 Output Rules:
 
 * Output ONLY the numbered translations.
-* One translation per line.
+* One translation per line, exactly one for every numbered segment.
 * Preserve the original numbering.
 * Do not output notes, explanations, brackets, character counts, or commentary.
 

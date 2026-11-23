@@ -109,6 +109,9 @@ translation:
   # Translation model via Ollama. /no_think is sent automatically for qwen3.* tags.
   # mistral-small:22b is recommended for French — Mistral is a French company with
   # native-quality FR training data. Any model available in Ollama can be used here.
+  # LICENCE: mistral-small:22b is under the Mistral Research License
+  # (non-commercial). For commercial work use an Apache-2.0 model such as
+  # mistral-small:24b or qwen3:14b. See README → License & attribution.
   model: mistral-small:22b
   temperature: 0.3
   # 20 segments per Ollama call. Bigger batches save calls but risk hitting
@@ -166,6 +169,9 @@ tts:
   # HuggingFace model: supply the repo ID (owner/repo) — the pipeline downloads
   #   the checkpoint and vocab automatically and uses the F5TTS_Base architecture.
   #   RASPIAUDIO/F5-French-MixedSpeakers-reduced is a French fine-tune of F5TTS_Base.
+  # LICENCE: every F5-TTS checkpoint listed here (official F5TTS_v1_* weights,
+  # RASPIAUDIO and tontate fine-tunes) is CC-BY-NC-4.0, non-commercial only.
+  # See README → License & attribution before using output commercially.
   f5tts_model: tontate/f5-tts-quebec-french-finetune
   # ODE solver steps. 16 = fast draft; 32 = high quality (default); 64 = max quality.
   f5tts_nfe_step: 32

@@ -324,9 +324,24 @@ french-dubbing/
 
 ## License & attribution
 
-- Pipeline code, web UI, glue: **MIT**
-- faster‑whisper (CTranslate2): MIT · pyannote.audio: MIT · Demucs: MIT · noisereduce: MIT · translation LLM: per‑model licence (check your Ollama tag — e.g. `mistral-small:22b` is Mistral Research License, `mistral-small:24b` and `qwen3:14b` are Apache 2.0) · FFmpeg: LGPL/GPL
-- **F5‑TTS**: MIT licence (model weights and code). All pipeline components are now commercial‑friendly.
+The pipeline **code** is MIT, but **the default configuration is not cleared for commercial use**: the voice model weights and the default translation model are licensed for non‑commercial use only. Code licences and model‑weight licences are separate; check both before using output in paid or client work.
+
+| Component (default) | Licence | Commercial use |
+|---|---|---|
+| Pipeline code, web UI, glue | MIT | ✓ |
+| **F5‑TTS model weights**, all supported checkpoints: the default `tontate/f5-tts-quebec-french-finetune`, its base `RASPIAUDIO/F5-French-MixedSpeakers-reduced`, and the official `F5TTS_v1_*` weights | **CC‑BY‑NC‑4.0** (the official weights are trained on the in‑the‑wild Emilia dataset, and the fine‑tunes inherit it) | **✗ non‑commercial only** |
+| F5‑TTS code · Vocos vocoder (`charactr/vocos-mel-24khz`) | MIT | ✓ |
+| **Translation LLM** `mistral-small:22b` (Ollama) | **Mistral Research License** | **✗ non‑commercial only** |
+| Whisper large‑v3 (faster‑whisper / CTranslate2) | MIT | ✓ |
+| pyannote.audio code · `speaker-diarization-community-1` model | MIT · CC‑BY‑4.0 (attribution required) | ✓ |
+| Demucs (`htdemucs`) · noisereduce | MIT | ✓ |
+| FFmpeg | LGPL/GPL (depends on the build) | ✓, with LGPL/GPL obligations |
+
+For commercial work:
+- **Translation:** switch `translation.model` to an Apache‑2.0 model, e.g. `mistral-small:24b` or `qwen3:14b`, and re‑check quality.
+- **TTS:** all the F5‑TTS checkpoints above are non‑commercial. You need a voice model whose weights are licensed for commercial use: a commercially licensed TTS model or service, or a model trained on data you hold training rights to (CC0 Mozilla Common Voice, or licensed / consented recordings). Training from such a base also needs a commercially licensed base checkpoint, not the ones above.
+
+Each model's own licence is the authority; these are summarised from the model cards as of November 2026. Voice cloning also needs the consent of the person whose voice is cloned, whatever the licence.
 
 No proprietary APIs are required to run the pipeline end‑to‑end.
 

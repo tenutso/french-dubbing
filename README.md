@@ -123,13 +123,12 @@ One job at a time (VRAM‑safe). Reports to `/workspace/logs/batch_report.json`.
 
 A single FastAPI app at [web/app.py](web/app.py) with a vanilla‑JS frontend in [web/static/](web/static/). Launch with `bash 05_web.sh` (binds `0.0.0.0:7860`).
 
-- Drag‑drop MP4 upload with progress bar (or a Vimeo URL, or an on‑pod path for big files).
+- Drag‑drop MP4 upload with progress bar (or an on‑pod path for big files).
 - Per‑job options: locale, **speaker count** (blank = auto; `1` = solo presenter), volume boost, an optional pause‑for‑review stage to edit translations and pick voice references before synthesis.
 - **Voice polishing loop**: in the review stage, each speaker's reference can be re‑picked (time range with per‑speaker turn suggestions, or a library clip), auditioned raw (▶ Preview), and **tested as a cloned voice** (🎤 Test voice — one F5‑TTS synthesis of a short sentence, ~30 s first call, instant on replay; supports a custom sentence for checking name pronunciation). Re‑opening a finished job re‑runs only Phase 2, so fixing an artifact‑y voice never repeats transcription/translation.
 - Single‑job FIFO queue; live log via Server‑Sent Events.
 - Download buttons for `_french.m4a`, `_french.srt`, the optional `_french_full.m4a`, and the muxed `_french.mp4`.
 - An **Advanced options** panel edits the per‑video subset of `config.yaml` (source language, vocabulary hint, translation model/review pass, output toggles). The tuned timing/quality internals are deliberately not exposed — edit `config.yaml` directly for experiments.
-- **Push to Vimeo**: connect once (personal access token or OAuth), then deliver subtitles + dubbed audio track onto the source video from the job card — see [Push to Vimeo](#push-to-vimeo).
 - Crash‑safe: a job interrupted by a server restart is recovered as `failed`; queued jobs resume.
 - Footer shows live GPU / VRAM / disk / Ollama / HF‑token status.
 
@@ -153,7 +152,7 @@ cost is volume storage, a few $/month):
 
 1. **Put `/workspace` on a RunPod network volume** so pods can be stopped (or even terminated
    and re‑created) without losing models, jobs, or outputs. Cold start with warm volume ≈ 30 s
-   via [bootstrap.sh](bootstrap.sh). Secrets (`DUBBING_UI_TOKEN`, `VIMEO_ACCESS_TOKEN`,
+   via [bootstrap.sh](bootstrap.sh). Secrets (`DUBBING_UI_TOKEN`,
    `RUNPOD_API_KEY`, `HF_TOKEN`) can live in `/workspace/.env` on the volume — both the
    pipeline and the web app load it at startup, so fresh pods boot fully configured without
    template edits.
@@ -173,11 +172,10 @@ cost is volume storage, a few $/month):
 
    ```bash
    export RUNPOD_API_KEY=... RUNPOD_POD_ID=... DUBBING_UI_TOKEN=...
-   ./trigger.sh --vimeo https://vimeo.com/12345 --locale fr-ca --speakers 3 --wait --download ./out
+   ./trigger.sh --path /workspace/videos/input/webinar.mp4 --locale fr-ca --speakers 3 --wait --download ./out
    ```
 
-   It starts the pod, waits for the API, submits the job (Vimeo URL, on‑pod path, or file
-   upload), and optionally polls to completion and downloads the outputs. The pod then
+   It starts the pod, waits for the API, submits the job (on‑pod path or file upload), and optionally polls to completion and downloads the outputs. The pod then
    idle‑stops on its own. Any backend can do the same three HTTP calls directly:
    `POST rest.runpod.io/v1/pods/{id}/start` → poll `GET /api/health` → `POST /api/jobs`.
 
@@ -248,40 +246,7 @@ For each `webinar.mp4`, in `/workspace/outputs/`:
 - `webinar_french_full.m4a` — full mix: French vocals + original background bed (when Demucs separation succeeded and `source_separation.preserve_background: true`)
 - `webinar_french.mp4` — original video + dubbed audio + subtitles, muxed for one‑file review (when `output.mux_video: true`). The dub is held to the source length, so audio, subs, and picture stay in sync end‑to‑end.
 
-For Vimeo, use the built‑in push (below) — or manually upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
-
----
-
-## Push to Vimeo
-
-The web UI can deliver a finished dub straight onto the source Vimeo video: the SRT as an
-**active French text track** and the full‑mix M4A as a **dubbed audio track**
-(multi‑audio requires a Vimeo plan that supports it; the UI surfaces Vimeo's exact error if not).
-
-**Connect once** (token persists on the volume across pod stops):
-
-- *Hands‑off*: set `VIMEO_ACCESS_TOKEN` (a [personal access token](https://developer.vimeo.com/apps)
-  with scopes `public private edit upload`) in the pod template env or in `/workspace/.env` —
-  the app verifies and connects automatically at every boot. A token pasted in the UI takes
-  precedence over the env seed.
-- *UI*: paste the same personal access token into the Vimeo card.
-- *Or OAuth*: create a Vimeo API app, set `VIMEO_CLIENT_ID` / `VIMEO_CLIENT_SECRET`, register
-  `{pod-url}/api/vimeo/callback` as the redirect URL, and use **Connect to Vimeo**.
-
-**Push**: completed jobs show a *Push to Vimeo* button — target video pre‑filled from the job's
-Vimeo URL (editable for uploaded files), language defaults to `fr-CA` for `fr-ca` jobs, with
-per‑item results shown inline.
-
-**Auto‑push**: tick *Auto‑push to Vimeo* at submit time (Vimeo‑URL sources; `--auto-push` in
-`trigger.sh`) and the push runs as the final step of the job itself — safe to walk away from a
-long job on an idle‑stopping pod, since the pod can't power down between the dub finishing and
-the outputs reaching Vimeo. Results land in the job log and on the job card; a push failure
-never fails the job (re‑push manually from the card).
-
-**Automation** (n8n etc.): the same action is one API call —
-`POST /api/jobs/{id}/vimeo-push` with `{"video": "...", "language": "fr-CA", "subtitles": true, "audio": true}`
-(Bearer‑auth with `DUBBING_UI_TOKEN`), so a workflow can go submit → wait → push without
-downloading any files itself.
+For Vimeo, upload `_full.m4a` as the alternate audio track and `.srt` as the French subtitle file. The `_french.mp4` is mainly for verifying sync locally.
 
 ---
 

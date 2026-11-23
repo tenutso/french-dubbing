@@ -13,9 +13,6 @@ let lastJobsHash = "";
 let reviewJobId = null;
 let reviewSegments = [];
 
-// Vimeo connection state (used by the submit form before the status loads)
-let vimeoConnected = false;
-
 // ── Options ──────────────────────────────────────────────────────────────────
 async function loadOptions() {
   const r = await fetch("/api/options");
@@ -86,9 +83,7 @@ function updateDropText() {
   }
 }
 
-// ── Source toggle: upload file vs. Vimeo URL vs. on-pod path ──────────────────
-const vimeoField = $("#vimeo-field");
-const vimeoInput = $("#vimeo_url");
+// ── Source toggle: upload file vs. on-pod path ───────────────────────────────
 const pathField = $("#path-field");
 const pathInput = $("#local_path");
 function sourceMode() {
@@ -98,18 +93,10 @@ function sourceMode() {
 function updateSourceMode() {
   const mode = sourceMode();
   dropEl.hidden = mode !== "file";
-  vimeoField.hidden = mode !== "vimeo";
   pathField.hidden = mode !== "path";
   // Only the active input is required so the form doesn't block the other modes.
   fileInput.required = mode === "file";
-  vimeoInput.required = mode === "vimeo";
   pathInput.required = mode === "path";
-  // Auto-push needs a Vimeo source (the push target) and a Vimeo connection.
-  const pushBox = $("#vimeo_push");
-  const usable = mode === "vimeo" && vimeoConnected;
-  pushBox.disabled = !usable;
-  if (!usable) pushBox.checked = false;
-  $("#vimeo-push-label").classList.toggle("muted", !usable);
 }
 document.querySelectorAll('input[name="source"]').forEach(r =>
   r.addEventListener("change", updateSourceMode)
@@ -121,9 +108,7 @@ $("#submit-form").addEventListener("submit", e => {
   const mode = sourceMode();
   const isUpload = mode === "file";
   const status = $("#upload-status");
-  if (mode === "vimeo") {
-    if (!vimeoInput.value.trim()) { status.textContent = "enter a Vimeo URL"; return; }
-  } else if (mode === "path") {
+  if (mode === "path") {
     if (!pathInput.value.trim()) { status.textContent = "enter a path to a file on the pod"; return; }
   } else if (!fileInput.files.length) {
     return;
@@ -131,15 +116,13 @@ $("#submit-form").addEventListener("submit", e => {
 
   // Send only the fields for the active mode (skip the empty other inputs).
   const fd = new FormData();
-  if (mode === "vimeo") fd.append("vimeo_url", vimeoInput.value.trim());
-  else if (mode === "path") fd.append("local_path", pathInput.value.trim());
+  if (mode === "path") fd.append("local_path", pathInput.value.trim());
   else fd.append("video", fileInput.files[0]);
   fd.append("locale", $("#locale").value);
   fd.append("speakers", $("#speakers").value);
   fd.append("volume_boost", $("#volume_boost").value);
   if ($("#force").checked) fd.append("force", "on");
   if ($("#review").checked) fd.append("review", "on");
-  if ($("#vimeo_push").checked) fd.append("vimeo_push", "on");
 
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/api/jobs");
@@ -243,103 +226,6 @@ function renderList(selector, list, emptyMsg) {
   }
 }
 
-// ── Vimeo connection ─────────────────────────────────────────────────────────
-async function loadVimeoStatus() {
-  try {
-    const r = await fetch("/api/vimeo/status");
-    if (!r.ok) return;
-    const s = await r.json();
-    vimeoConnected = s.connected;
-    $("#vimeo-status").textContent = s.connected
-      ? `Connected as ${s.user || "Vimeo user"} (${s.via})`
-      : "Not connected";
-    $("#vimeo-connect").hidden = s.connected || !s.oauth_available;
-    $("#vimeo-disconnect").hidden = !s.connected;
-    $("#vimeo-token-input").hidden = s.connected;
-    $("#vimeo-token-save").hidden = s.connected;
-    updateSourceMode();   // (re)enable the auto-push checkbox
-  } catch (e) { /* leave as-is */ }
-}
-
-function initVimeoControls() {
-  $("#vimeo-connect").addEventListener("click", () => {
-    window.location.href = "/api/vimeo/connect";
-  });
-  $("#vimeo-token-save").addEventListener("click", async () => {
-    const token = $("#vimeo-token-input").value.trim();
-    if (!token) return;
-    const r = await fetch("/api/vimeo/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-    if (r.ok) {
-      $("#vimeo-token-input").value = "";
-      await loadVimeoStatus();
-      refreshJobs();
-    } else {
-      const err = await r.json().catch(() => ({}));
-      $("#vimeo-status").textContent = err.detail || `token rejected (HTTP ${r.status})`;
-    }
-  });
-  $("#vimeo-disconnect").addEventListener("click", async () => {
-    if (!confirm("Disconnect from Vimeo?")) return;
-    await fetch("/api/vimeo/token", { method: "DELETE" });
-    await loadVimeoStatus();
-    refreshJobs();
-  });
-}
-
-// Inline "Push to Vimeo" panel on a completed job card.
-function buildVimeoPanel(job, root) {
-  const panel = document.createElement("div");
-  panel.className = "vimeo-panel";
-  panel.hidden = true;
-  const locale = (job.options || {}).locale || "";
-  panel.innerHTML = `
-    <input class="vp-video" placeholder="vimeo.com URL or video id">
-    <input class="vp-lang" title="Track language code">
-    <label class="check"><input type="checkbox" class="vp-subs" checked> Subtitles (.srt)</label>
-    <label class="check"><input type="checkbox" class="vp-audio" checked> Audio track (full mix)</label>
-    <button type="button" class="vp-go">Push</button>
-    <div class="vp-result muted"></div>`;
-  // Values assigned via DOM (not interpolated into HTML) so a hostile
-  // source_url can't inject markup.
-  panel.querySelector(".vp-video").value = job.source_url || "";
-  panel.querySelector(".vp-lang").value = locale === "fr-ca" ? "fr-CA" : "fr";
-  const result = panel.querySelector(".vp-result");
-  panel.querySelector(".vp-go").addEventListener("click", async (e) => {
-    const btn = e.target;
-    btn.disabled = true;
-    result.textContent = "pushing…";
-    try {
-      const r = await fetch(`/api/jobs/${job.id}/vimeo-push`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          video: panel.querySelector(".vp-video").value.trim(),
-          language: panel.querySelector(".vp-lang").value.trim(),
-          subtitles: panel.querySelector(".vp-subs").checked,
-          audio: panel.querySelector(".vp-audio").checked,
-        }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        result.textContent = d.detail || `push failed (HTTP ${r.status})`;
-      } else {
-        const parts = Object.entries(d.results || {}).map(([k, v]) =>
-          v.ok ? `${k}: ✓` : `${k}: ✗ ${v.step} — ${v.detail}`);
-        result.textContent = parts.join("   ") || "nothing selected";
-        result.classList.toggle("err", !d.ok);
-      }
-    } catch (err) {
-      result.textContent = "network error: " + err;
-    }
-    btn.disabled = false;
-  });
-  return panel;
-}
-
 function renderCard(job) {
   const tpl = $("#job-card-tpl").content.cloneNode(true);
   const root = tpl.querySelector(".job");
@@ -355,7 +241,6 @@ function renderCard(job) {
   if (o.speakers) meta.push(`${o.speakers} spk`);
   if (o.volume_boost != null) meta.push(`+${o.volume_boost}%`);
   if (o.force) meta.push("force");
-  if (o.vimeo_push) meta.push("auto-push");
   const dur = job.ended_at ? (job.ended_at - job.started_at)
             : job.started_at ? (Date.now() / 1000 - job.started_at) : 0;
   if (dur > 0) meta.push(`${Math.round(dur)}s`);
@@ -401,21 +286,6 @@ function renderCard(job) {
     dl.appendChild(e);
   }
 
-  // Vimeo push outcome (auto or manual), persisted on the job.
-  if (job.vimeo && job.vimeo.results) {
-    const v = document.createElement("div");
-    v.className = job.vimeo.ok ? "muted" : "err";
-    const parts = Object.entries(job.vimeo.results).map(([k, r]) =>
-      r.ok ? `${k} ✓` : `${k} ✗ ${r.step || ""} — ${r.detail || ""}`);
-    v.textContent = `Vimeo (${job.vimeo.auto ? "auto" : "manual"} → ${job.vimeo.video_id}): ${parts.join("   ")}`;
-    dl.appendChild(v);
-  } else if (job.vimeo && job.vimeo.detail) {
-    const v = document.createElement("div");
-    v.className = "err";
-    v.textContent = `Vimeo auto-push skipped: ${job.vimeo.detail}`;
-    dl.appendChild(v);
-  }
-
   // Log panel: reuse any buffered text we already streamed
   const logEl = $(".job-log", root);
   const buf = logBuffers.get(job.id);
@@ -451,19 +321,6 @@ function renderCard(job) {
       document.getElementById("review-section").scrollIntoView({ behavior: "smooth" })
     );
     $(".job-actions", root).insertBefore(btn, $(".show-log", root));
-  }
-
-  // "Push to Vimeo" for completed jobs (needs a Vimeo connection).
-  if (job.status === "completed" && vimeoConnected &&
-      job.outputs && (job.outputs.srt || job.outputs.full || job.outputs.audio)) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.textContent = "Push to Vimeo";
-    btn.title = "Upload the French subtitles and dubbed audio track onto the source Vimeo video";
-    const panel = buildVimeoPanel(job, root);
-    btn.addEventListener("click", () => { panel.hidden = !panel.hidden; });
-    $(".job-actions", root).insertBefore(btn, $(".show-log", root));
-    root.appendChild(panel);
   }
 
   // "Re-open review" for finished jobs — step back to the review stage and
@@ -1122,8 +979,6 @@ async function init() {
   await loadConfig();
   await loadGlossary();
   await refreshHealth();
-  initVimeoControls();
-  await loadVimeoStatus();
   await refreshJobs();
   $("#config-save").addEventListener("click", () => saveConfig(false));
   $("#config-revert").addEventListener("click", revertConfig);

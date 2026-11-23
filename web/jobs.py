@@ -39,9 +39,6 @@ class Job:
     outputs: dict = field(default_factory=dict)
     phase: str = ""
     returncode: Optional[int] = None
-    source_url: str = ""
-    # Result of the (auto or manual) push to Vimeo: {ok, video_id, results}.
-    vimeo: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)

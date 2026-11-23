@@ -18,7 +18,6 @@
     <form id="submit-form">
       <div class="source-toggle" id="source-toggle">
         <label><input type="radio" name="source" value="file" checked> Upload file</label>
-        <label><input type="radio" name="source" value="vimeo"> Vimeo URL</label>
         <label><input type="radio" name="source" value="path"> File on pod</label>
       </div>
 
@@ -26,11 +25,6 @@
         <input type="file" id="video" name="video"
                accept=".mp4,.mov,.mkv,.webm,video/*" required>
         <span id="drop-text">Drop a video file here or click to choose</span>
-      </label>
-
-      <label class="vimeo-field" id="vimeo-field" hidden>Vimeo URL
-        <input type="url" id="vimeo_url" name="vimeo_url"
-               placeholder="https://vimeo.com/123456789">
       </label>
 
       <label class="path-field" id="path-field" hidden>Path to file on the pod
@@ -58,10 +52,6 @@
         <label class="check">
           <input type="checkbox" id="review" name="review" checked> Pause for translation review
         </label>
-        <label class="check" id="vimeo-push-label"
-               title="When the job completes, automatically upload the French subtitles and dubbed audio track onto the source Vimeo video — safe to walk away from long jobs on an auto-stopping pod. Requires a Vimeo URL source and a Vimeo connection.">
-          <input type="checkbox" id="vimeo_push" name="vimeo_push"> Auto-push to Vimeo
-        </label>
       </div>
 
       <div class="actions">
@@ -70,20 +60,6 @@
       </div>
       <progress id="upload-progress" value="0" max="100" hidden></progress>
     </form>
-  </section>
-
-  <section class="card" id="vimeo-card">
-    <h2>Vimeo</h2>
-    <div id="vimeo-status" class="muted">checking connection…</div>
-    <div id="vimeo-controls" class="vimeo-controls">
-      <button type="button" id="vimeo-connect" hidden>Connect to Vimeo</button>
-      <input type="password" id="vimeo-token-input"
-             placeholder="…or paste a personal access token (scopes: public private edit upload)">
-      <button type="button" id="vimeo-token-save">Save token</button>
-      <button type="button" id="vimeo-disconnect" hidden>Disconnect</button>
-    </div>
-    <p class="muted small">Once connected, completed jobs get a “Push to Vimeo” button that
-      uploads the French subtitles and the dubbed audio track onto the source video.</p>
   </section>
 
   <section class="card" id="advanced-section">

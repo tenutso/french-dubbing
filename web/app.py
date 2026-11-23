@@ -22,9 +22,7 @@ import time
 from collections import deque
 from pathlib import Path
 from typing import Dict, Optional
-from urllib.parse import urlparse
 
-import requests as _rq
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import (
@@ -42,8 +40,8 @@ from .jobs import (
 def _load_dotenv() -> None:
     """Load .env (repo checkout, then /workspace/.env) before reading config.
 
-    Putting secrets — DUBBING_UI_TOKEN, VIMEO_ACCESS_TOKEN, RUNPOD_API_KEY,
-    VIMEO_CLIENT_ID/SECRET — in /workspace/.env keeps them on the volume, so
+    Putting secrets — DUBBING_UI_TOKEN, RUNPOD_API_KEY — in /workspace/.env
+    keeps them on the volume, so
     freshly created pods boot fully configured without template edits.
     Values already set in the environment win (override=False)."""
     try:
@@ -371,8 +369,7 @@ async def _idle_watchdog() -> None:
 async def _run_job(job: Job) -> None:
     """Execute one pipeline subprocess; stream its stdout into the job's log buffer.
 
-    Every exit path — success, failure, cancel (including cancel during a Vimeo
-    download), worker exception — goes through the ``finally`` block, which
+    Every exit path — success, failure, cancel, worker exception — goes through the ``finally`` block, which
     publishes the terminal status, closes SSE streams, and clears the
     current-job state. Without that, a cancel during download left
     ``current_job_id`` set (blocking config edits) and SSE streams open forever.
@@ -394,13 +391,6 @@ async def _run_job(job: Job) -> None:
                 state.publish(job.id, f"... snapshot: {snap}")
         except Exception as e:
             state.publish(job.id, f"!!! snapshot failed: {e}")
-
-        # Pending Vimeo job — fetch the video before running the pipeline.
-        if not job.video_path and job.source_url:
-            if not await _download_vimeo(job):
-                return  # job already marked failed/cancelled
-            if job.status == STATUS_CANCELLED:
-                return  # cancelled between download and launch
 
         opts = job.options or {}
         _is_phase1 = opts.get("review") and not opts.get("_p2")
@@ -478,12 +468,6 @@ async def _run_job(job: Job) -> None:
             job.status = STATUS_FAILED
             job.error = job.error or f"pipeline exited with code {rc}"
 
-        # Auto-push to Vimeo — runs inside the job (before the finally block
-        # ends it), so the idle auto-stop can't power the pod down between a
-        # long job finishing unattended and its outputs reaching Vimeo.
-        if job.status == STATUS_COMPLETED and opts.get("vimeo_push"):
-            await _auto_vimeo_push(job)
-
     finally:
         if not job.ended_at:
             job.ended_at = time.time()
@@ -499,67 +483,6 @@ async def _run_job(job: Job) -> None:
         state.current_job_id = None
         state.touch()   # the idle clock starts when the job ends, not when it started
         state.save()
-
-
-async def _download_vimeo(job: Job) -> bool:
-    """Fetch a Vimeo video into UPLOAD_DIR via yt-dlp, streaming progress to the
-    job log. On success sets job.video_path / video_filename and returns True.
-    On failure marks the job failed, saves state, and returns False."""
-    url = job.source_url
-    out_tmpl = str(UPLOAD_DIR / f"{job.id}__%(title).80s.%(ext)s")
-    cmd = [
-        "yt-dlp",
-        "--no-playlist", "--newline", "--restrict-filenames",
-        "-f", "bv*+ba/b",
-        "--remux-video", "mp4",
-        "-o", out_tmpl,
-        url,
-    ]
-    # [0/6] so the existing PHASE_RE renders it as a phase in the UI.
-    state.publish(job.id, "[0/6] Downloading from Vimeo…")
-    state.publish(job.id, "$ " + " ".join(cmd))
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        return _fail_job(job, "yt-dlp not installed on the server")
-    except Exception as e:
-        return _fail_job(job, f"failed to launch yt-dlp: {e}")
-
-    state.current_proc = proc
-    try:
-        assert proc.stdout is not None
-        while True:
-            line_bytes = await proc.stdout.readline()
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace").rstrip()
-            if line:
-                state.publish(job.id, line)
-    except Exception as e:
-        state.publish(job.id, f"!!! download-stream error: {e}")
-
-    rc = await proc.wait()
-    if job.status == STATUS_CANCELLED:
-        return False
-    if rc != 0:
-        return _fail_job(job, f"yt-dlp exited with code {rc}")
-
-    # yt-dlp names the file from the title; find what it produced for this job.
-    produced = sorted(UPLOAD_DIR.glob(f"{job.id}__*"))
-    if not produced:
-        return _fail_job(job, "download finished but no file was produced")
-    dest = produced[0]
-    job.video_path = str(dest)
-    job.video_filename = dest.name
-    state.publish(job.id, f"... downloaded: {dest.name}")
-    state.save()
-    return True
 
 
 def _fail_job(job: Job, msg: str) -> bool:
@@ -648,8 +571,6 @@ async def _startup() -> None:
             "idle auto-stop enabled: pod stops after %.0f min without jobs "
             "(pod %s)", IDLE_STOP_MIN, RUNPOD_POD_ID or "unknown — set RUNPOD_POD_ID",
         )
-    # Off the event loop — it's a network call to Vimeo.
-    await asyncio.to_thread(_vimeo_seed_from_env)
     log.info("dubbing web UI started")
 
 
@@ -904,14 +825,12 @@ def _rewrite_yaml_leaves(path: Path, updates: dict) -> list[str]:
 @app.post("/api/jobs")
 async def submit(
     video: UploadFile = File(None),
-    vimeo_url: str = Form(""),
     local_path: str = Form(""),
     locale: str = Form(""),
     volume_boost: str = Form(""),
     speakers: str = Form(""),
     force: str = Form(""),
     review: str = Form(""),
-    vimeo_push: str = Form(""),
 ) -> JSONResponse:
     # Validate options against allow-lists (empty = use config default)
     if locale and locale not in LOCALE_CHOICES:
@@ -931,28 +850,19 @@ async def submit(
         if not 1 <= spk <= 20:
             raise HTTPException(400, "speakers must be between 1 and 20")
 
-    # Exactly one source: a browser upload, a Vimeo URL, or a path to a file
-    # already on the pod. The on-pod path bypasses the browser/proxy upload
+    # Exactly one source: a browser upload or a path to a file already on the
+    # pod. The on-pod path bypasses the browser/proxy upload
     # entirely (copy big files in via runpodctl/scp/volume), avoiding the
     # Cloudflare proxy 502 that kills large uploads.
     has_file = bool(video and video.filename)
-    vimeo_url = vimeo_url.strip()
     local_path = local_path.strip()
     active = [n for n, on in
-              (("file", has_file), ("vimeo", bool(vimeo_url)), ("path", bool(local_path)))
+              (("file", has_file), ("path", bool(local_path)))
               if on]
     if len(active) > 1:
-        raise HTTPException(400, "provide exactly one source: a file, a Vimeo URL, or an on-pod path")
+        raise HTTPException(400, "provide exactly one source: a file or an on-pod path")
     if not active:
-        raise HTTPException(400, "no source provided: upload a file, give a Vimeo URL, or an on-pod path")
-
-    want_autopush = vimeo_push.lower() in ("1", "true", "on", "yes")
-    if want_autopush:
-        if not vimeo_url:
-            raise HTTPException(400, "auto-push to Vimeo needs a Vimeo URL source "
-                                     "(the push target is the source video)")
-        if not _vimeo_load_token().get("access_token"):
-            raise HTTPException(400, "auto-push requested but not connected to Vimeo")
+        raise HTTPException(400, "no source provided: upload a file or give an on-pod path")
 
     job_id = new_job_id()
     options = {
@@ -961,27 +871,11 @@ async def submit(
         "speakers": spk,
         "force": force.lower() in ("1", "true", "on", "yes"),
         "review": review.lower() in ("1", "true", "on", "yes"),
-        "vimeo_push": want_autopush,
     }
     output_dir = OUTPUT_DIR / job_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if vimeo_url:
-        # URL branch — defer the download to the worker so the request stays fast.
-        host = (urlparse(vimeo_url).hostname or "").lower()
-        if host not in ("vimeo.com", "www.vimeo.com", "player.vimeo.com"):
-            raise HTTPException(400, "URL must be a vimeo.com link")
-        log_path = LOG_DIR / f"{job_id}.log"
-        job = Job(
-            id=job_id,
-            video_filename=vimeo_url,  # replaced with the real title after download
-            video_path="",             # pending — set once downloaded
-            output_dir=str(output_dir),
-            log_path=str(log_path),
-            options=options,
-            source_url=vimeo_url,
-        )
-    elif local_path:
+    if local_path:
         # On-pod path branch — the file is already on the pod (copied in via
         # runpodctl/scp/volume), so no bytes flow through the browser/proxy.
         # Symlink it into UPLOAD_DIR under the usual {job_id}__{stem}.mp4 name so
@@ -1726,599 +1620,6 @@ async def voice_preview(job_id: str, request: Request):
 
     return FileResponse(str(out_wav), media_type="audio/wav",
                         headers={"X-Voice-Source": range_hdr})
-
-
-# ── Vimeo integration ─────────────────────────────────────────────────────────
-# Push a finished dub straight onto the source Vimeo video: the SRT as an
-# active French text track, and the full-mix M4A as a dubbed audio track.
-#
-# Two ways to connect:
-#   * "Connect to Vimeo" (OAuth code flow) — requires a Vimeo API app; set
-#     VIMEO_CLIENT_ID / VIMEO_CLIENT_SECRET and register
-#     {pod-url}/api/vimeo/callback as the app's redirect URL.
-#   * Paste a personal access token (scopes: public private edit upload) —
-#     zero app setup; recommended for a single-user pod.
-# The token is stored on the /workspace volume so it survives pod stops.
-VIMEO_API = "https://api.vimeo.com"
-VIMEO_ACCEPT = "application/vnd.vimeo.*+json;version=3.4"
-VIMEO_TOKEN_FILE = WORKSPACE / "web" / "vimeo_token.json"
-VIMEO_CLIENT_ID = os.environ.get("VIMEO_CLIENT_ID", "")
-VIMEO_CLIENT_SECRET = os.environ.get("VIMEO_CLIENT_SECRET", "")
-VIMEO_REDIRECT_URL = os.environ.get("VIMEO_REDIRECT_URL", "")  # optional override
-# Personal access token supplied via the environment (pod template or
-# /workspace/.env) — the app connects with it automatically at startup, so a
-# fresh pod boots ready to push without touching the UI. A token pasted in
-# the UI takes precedence; the env seed only (re)applies when the stored
-# connection is absent or itself env-sourced.
-VIMEO_ACCESS_TOKEN_ENV = os.environ.get("VIMEO_ACCESS_TOKEN", "")
-VIMEO_OAUTH_SCOPES = "public private edit upload"
-
-_vimeo_oauth_states: Dict[str, float] = {}   # state -> expiry ts
-
-_VIMEO_ID_RES = [
-    re.compile(r"vimeo\.com/(?:video/|manage/videos/)?(\d+)"),
-    re.compile(r"^(\d{6,})$"),
-]
-
-
-def _vimeo_video_id(target: str) -> Optional[str]:
-    target = (target or "").strip()
-    for rx in _VIMEO_ID_RES:
-        m = rx.search(target)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _vimeo_load_token() -> dict:
-    try:
-        return json.loads(VIMEO_TOKEN_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _vimeo_save_token(data: dict) -> None:
-    VIMEO_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    VIMEO_TOKEN_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.chmod(VIMEO_TOKEN_FILE, 0o600)
-
-
-def _vimeo_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}", "Accept": VIMEO_ACCEPT}
-
-
-def _vimeo_err(r: "_rq.Response") -> str:
-    try:
-        j = r.json()
-        return f"HTTP {r.status_code}: {j.get('error') or j.get('developer_message') or r.text[:200]}"
-    except Exception:
-        return f"HTTP {r.status_code}: {r.text[:200]}"
-
-
-def _vimeo_me(token: str) -> Optional[dict]:
-    try:
-        r = _rq.get(f"{VIMEO_API}/me", headers=_vimeo_headers(token), timeout=15)
-        return r.json() if r.status_code == 200 else None
-    except Exception:
-        return None
-
-
-def _vimeo_seed_from_env() -> None:
-    """Connect with VIMEO_ACCESS_TOKEN at startup (see its comment above)."""
-    if not VIMEO_ACCESS_TOKEN_ENV:
-        return
-    stored = _vimeo_load_token()
-    if stored.get("access_token"):
-        if stored.get("via") != "environment":
-            return  # user connected explicitly — don't override
-        if stored.get("access_token") == VIMEO_ACCESS_TOKEN_ENV:
-            return  # same env token already stored
-    me = _vimeo_me(VIMEO_ACCESS_TOKEN_ENV)
-    if not me:
-        log.warning("VIMEO_ACCESS_TOKEN set but Vimeo rejected it "
-                    "(check scopes: public private edit upload)")
-        return
-    _vimeo_save_token({
-        "access_token": VIMEO_ACCESS_TOKEN_ENV,
-        "user": me.get("name", ""),
-        "via": "environment",
-        "connected_at": time.time(),
-    })
-    log.info("Vimeo connected from environment as %s", me.get("name", "?"))
-
-
-def _find_upload_link(obj) -> Optional[str]:
-    """Recursively find the signed upload URL in a Vimeo create response.
-
-    texttracks return it as top-level "link"; other resources nest it under
-    "upload"/"upload_link". Search known shapes before giving up."""
-    if isinstance(obj, dict):
-        up = obj.get("upload")
-        if isinstance(up, dict) and up.get("upload_link"):
-            return up["upload_link"]
-        for key in ("upload_link", "link"):
-            v = obj.get(key)
-            if isinstance(v, str) and v.startswith("http"):
-                return v
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                found = _find_upload_link(v)
-                if found:
-                    return found
-    elif isinstance(obj, list):
-        for v in obj:
-            found = _find_upload_link(v)
-            if found:
-                return found
-    return None
-
-
-_SRT_TS_RE = re.compile(r"(\d{2,}):(\d{2}):(\d{2}),(\d{3})")
-
-
-def _srt_to_vtt(srt_text: str) -> str:
-    """Convert SRT to WebVTT — Vimeo's native caption format.
-
-    Vimeo's SRT parser rejects files its VTT parser accepts ("Unable to parse
-    captions"), so uploads always go up as VTT: strip index lines, add the
-    header, and swap the millisecond comma for a period."""
-    out = ["WEBVTT", ""]
-    for block in re.split(r"\r?\n\s*\r?\n", srt_text.lstrip("﻿").strip()):
-        lines = [ln.rstrip("\r") for ln in block.splitlines() if ln.strip()]
-        # Skip anything before the timestamp line (index number, stray BOM).
-        ts_i = next((i for i, ln in enumerate(lines[:2]) if "-->" in ln), None)
-        if ts_i is None:
-            continue
-        lines = lines[ts_i:]
-        lines[0] = _SRT_TS_RE.sub(lambda m: f"{m.group(1)}:{m.group(2)}:{m.group(3)}.{m.group(4)}", lines[0])
-        out.extend(lines)
-        out.append("")
-    return "\n".join(out)
-
-
-def _vimeo_push_subtitles(token: str, video_id: str, srt_path: str,
-                          language: str, name: str = "Français") -> dict:
-    """Create a text track, upload the captions (as WebVTT), activate it."""
-    with open(srt_path, encoding="utf-8-sig") as f:
-        vtt = _srt_to_vtt(f.read())
-    if vtt.count("-->") == 0:
-        return {"ok": False, "step": "convert captions", "detail": "no cues found in SRT"}
-    r = _rq.post(
-        f"{VIMEO_API}/videos/{video_id}/texttracks",
-        headers=_vimeo_headers(token),
-        json={"type": "subtitles", "language": language, "name": name},
-        timeout=30,
-    )
-    if r.status_code not in (200, 201):
-        return {"ok": False, "step": "create texttrack", "detail": _vimeo_err(r)}
-    tt = r.json()
-    link = _find_upload_link(tt)
-    if not link:
-        return {"ok": False, "step": "create texttrack",
-                "detail": f"no upload link in response: {json.dumps(tt)[:300]}"}
-    put = _rq.put(link, data=vtt.encode("utf-8"),
-                  headers={"Content-Type": "text/vtt"}, timeout=120)
-    if put.status_code not in (200, 201, 204):
-        return {"ok": False, "step": "upload captions", "detail": _vimeo_err(put)}
-    uri = tt.get("uri")
-    if uri:
-        act = _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
-                        json={"active": True}, timeout=30)
-        if act.status_code not in (200, 201, 204):
-            return {"ok": False, "step": "activate texttrack", "detail": _vimeo_err(act)}
-    return {"ok": True, "uri": uri or ""}
-
-
-_VIMEO_SPEC_CACHE = WORKSPACE / "web" / "vimeo_openapi.json"
-
-
-def _vimeo_openapi(token: str) -> dict:
-    """Fetch (and cache for a day) Vimeo's live OpenAPI spec for this token.
-
-    The docs site is JS-rendered, and plan-gated endpoints 404 rather than
-    403 — so the only reliable source for the audio-tracks contract is the
-    spec Vimeo serves for the authenticated account."""
-    try:
-        if (_VIMEO_SPEC_CACHE.exists()
-                and time.time() - _VIMEO_SPEC_CACHE.stat().st_mtime < 86400):
-            return json.loads(_VIMEO_SPEC_CACHE.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    try:
-        r = _rq.get(f"{VIMEO_API}/?openapi=1", headers=_vimeo_headers(token), timeout=60)
-        if r.status_code != 200:
-            log.warning("vimeo: openapi fetch failed: %s", _vimeo_err(r))
-            return {}
-        spec = r.json()
-    except Exception as e:
-        log.warning("vimeo: openapi fetch failed: %s", e)
-        return {}
-    try:
-        _VIMEO_SPEC_CACHE.write_text(json.dumps(spec), encoding="utf-8")
-    except Exception:
-        pass
-    return spec
-
-
-def _op_body_props(post: dict, spec: dict) -> Dict[str, dict]:
-    """Body properties of an operation: {name: schema} (OpenAPI 3 + Swagger 2)."""
-    props: Dict[str, dict] = {}
-    rb = post.get("requestBody") or {}
-    if "$ref" in rb:   # resolve one level of components ref
-        ref = rb["$ref"].lstrip("#/").split("/")
-        node = spec
-        for part in ref:
-            node = (node or {}).get(part, {})
-        rb = node or {}
-    for mt in (rb.get("content") or {}).values():
-        for name, schema in (((mt.get("schema") or {}).get("properties")) or {}).items():
-            props[name] = schema or {}
-    for p in post.get("parameters") or []:
-        if p.get("in") in ("body", "formData"):
-            schema_props = ((p.get("schema") or {}).get("properties") or {})
-            if schema_props:
-                for name, schema in schema_props.items():
-                    props[name] = schema or {}
-            elif p.get("name"):
-                props[p["name"]] = {}
-    return props
-
-
-def _vimeo_audio_create_op(spec: dict) -> Optional[Tuple[str, Dict[str, dict]]]:
-    """Locate the create-audio-track operation: (path_template, body_props)."""
-    paths = spec.get("paths") or {}
-    # Exact operationId first (matches the docs anchor), then any audio POST
-    # under a video path.
-    for match_exact in (True, False):
-        for path, ops in paths.items():
-            post = (ops or {}).get("post")
-            if not post:
-                continue
-            opid = (post.get("operationId") or "").lower()
-            if match_exact and opid != "create_audio_track":
-                continue
-            if not match_exact and not ("audio" in path.lower() and "video" in path.lower()):
-                continue
-            return path, _op_body_props(post, spec)
-    return None
-
-
-def _pick_track_type(enum: List[str]) -> Optional[str]:
-    """Choose the audio-track type meaning 'dubbed into another language'.
-
-    The enum comes from the account's API spec and its naming varies. Never
-    pick commentary/description (players present those differently) and never
-    pick main/original (could displace the source audio) — when nothing
-    dubbing-ish exists, return None and omit the field so the API applies its
-    own default (or rejects it, which the adaptive retry absorbs)."""
-    if not enum:
-        return "dubbed"
-    by_lower = {e.lower(): e for e in enum}
-    for cand in ("dubbed", "dub", "dubbing", "translation", "translated",
-                 "alternative", "alternate", "secondary"):
-        if cand in by_lower:
-            return by_lower[cand]
-    for e in enum:   # anything containing "dub" ("dubbed_audio", …)
-        if "dub" in e.lower():
-            return e
-    avoid = ("main", "original", "primary", "commentary",
-             "audio_description", "description", "descriptive")
-    for e in enum:
-        if e.lower() not in avoid:
-            return e
-    return None
-
-
-def _tus_upload(link: str, file_path: str) -> Optional[str]:
-    """Single-shot tus upload (Vimeo's resumable protocol). None on success.
-
-    Vimeo's modern upload endpoints return a tus upload_link; the bytes go up
-    as a PATCH with offset headers — a plain PUT is rejected."""
-    size = os.path.getsize(file_path)
-    with open(file_path, "rb") as f:
-        r = _rq.patch(link, data=f, headers={
-            "Tus-Resumable": "1.0.0",
-            "Upload-Offset": "0",
-            "Content-Type": "application/offset+octet-stream",
-        }, timeout=600)
-    if r.status_code not in (200, 204):
-        return _vimeo_err(r)
-    offset = getattr(r, "headers", {}).get("Upload-Offset")
-    if offset is not None and int(offset) != size:
-        return f"tus upload incomplete: offset {offset} of {size} bytes"
-    return None
-
-
-def _vimeo_current_version(token: str, video_id: str) -> Optional[str]:
-    """Id of the video's active (current) version — audio tracks attach to it."""
-    r = _rq.get(f"{VIMEO_API}/videos/{video_id}/versions",
-                headers=_vimeo_headers(token), timeout=30)
-    if r.status_code != 200:
-        return None
-    data = (r.json() or {}).get("data") or []
-    chosen = next((d for d in data if d.get("active")), data[0] if data else None)
-    if not chosen:
-        return None
-    m = re.search(r"/versions/(\d+)", chosen.get("uri", ""))
-    return m.group(1) if m else None
-
-
-def _vimeo_push_audio(token: str, video_id: str, m4a_path: str,
-                      language: str, name: str = "Français") -> dict:
-    """Create a dubbed audio track and upload the full-mix M4A.
-
-    The endpoint path and body fields are discovered from Vimeo's live
-    OpenAPI spec (cached daily). Multi-audio is plan-gated: if the spec for
-    this account has no audio-track create operation, say so explicitly."""
-    spec = _vimeo_openapi(token)
-    found = _vimeo_audio_create_op(spec) if spec else None
-    if not found:
-        if spec:
-            return {"ok": False, "step": "create audio track",
-                    "detail": "no audio-track endpoint in the API spec for this "
-                              "account — multi-audio may not be available on this "
-                              "Vimeo plan (or token scopes)"}
-        return {"ok": False, "step": "create audio track",
-                "detail": "could not fetch the Vimeo API spec to locate the "
-                          "audio-track endpoint — retry, or check token scopes"}
-
-    path_tpl, props = found
-    path = path_tpl.replace("{video_id}", video_id)
-    # Audio tracks attach to a video *version* — resolve the active one.
-    if "{version_id}" in path:
-        version_id = _vimeo_current_version(token, video_id)
-        if not version_id:
-            return {"ok": False, "step": "resolve video version",
-                    "detail": f"could not read the active version of video {video_id} "
-                              f"(needed for {path_tpl})"}
-        path = path.replace("{version_id}", version_id)
-    if "{" in path:
-        return {"ok": False, "step": "create audio track",
-                "detail": f"unresolved placeholder in endpoint {path_tpl}"}
-
-    track_type = _pick_track_type((props.get("type") or {}).get("enum") or [])
-    # Contract learned from the live API (400 invalid_parameters): the create
-    # body REQUIRES language_code and an upload object (tus, like video
-    # uploads) — the account spec under-reports its own properties.
-    payload: dict = {
-        "active": True,
-        "language_code": language,
-        "upload": {"approach": "tus", "size": os.path.getsize(m4a_path)},
-    }
-    if track_type:
-        payload["type"] = track_type
-    log.info("vimeo: audio-track endpoint %s (spec props: %s) payload %s",
-             path_tpl,
-             {k: (v.get("enum") or v.get("type", "?")) for k, v in props.items()} or "unknown",
-             {k: v for k, v in payload.items() if k != "upload"} | {"upload": payload["upload"]})
-
-    r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
-                 json=payload, timeout=30)
-    if r.status_code == 400:
-        # Adaptive retry: drop only *optional* fields the API flags as invalid
-        # (never the required language_code/upload).
-        try:
-            flagged = [p.get("field") for p in (r.json().get("invalid_parameters") or [])]
-        except Exception:
-            flagged = []
-        droppable = [f for f in flagged if f in ("type", "active", "name")]
-        if droppable and set(flagged) == set(droppable):
-            payload = {k: v for k, v in payload.items() if k not in droppable}
-            log.info("vimeo: retrying audio-track create without %s", droppable)
-            r = _rq.post(f"{VIMEO_API}{path}", headers=_vimeo_headers(token),
-                         json=payload, timeout=30)
-    if r.status_code not in (200, 201):
-        hint = " — multi-audio may not be available on this Vimeo plan" if r.status_code in (403, 404) else ""
-        return {"ok": False, "step": "create audio track",
-                "detail": f"POST {path} {sorted(payload)} → {_vimeo_err(r)}{hint}"}
-    created = r.json()
-
-    up = created.get("upload") or {}
-    link = up.get("upload_link") or _find_upload_link(created)
-    if not link:
-        return {"ok": False, "step": "create audio track",
-                "detail": f"created but no upload link in response: {json.dumps(created)[:300]}"}
-    if (up.get("approach") or "tus") == "tus":
-        err = _tus_upload(link, m4a_path)
-        if err:
-            return {"ok": False, "step": "upload audio (tus)", "detail": err}
-    else:
-        with open(m4a_path, "rb") as f:
-            put = _rq.put(link, data=f, headers={"Content-Type": "audio/mp4"}, timeout=600)
-        if put.status_code not in (200, 201, 204):
-            return {"ok": False, "step": "upload audio", "detail": _vimeo_err(put)}
-    uri = created.get("uri")
-    if uri:
-        # Best-effort: ensure the track is active and human-labeled.
-        _rq.patch(f"{VIMEO_API}{uri}", headers=_vimeo_headers(token),
-                  json={"active": True, "name": name}, timeout=30)
-    return {"ok": True, "uri": uri or "", "endpoint": path_tpl}
-
-
-def _job_language(job: Job) -> str:
-    """Vimeo track language for a job: its locale option, else the config default."""
-    loc = (job.options or {}).get("locale") or ""
-    if not loc:
-        try:
-            cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) or {}
-            loc = (cfg.get("translation") or {}).get("locale", "")
-        except Exception:
-            loc = ""
-    return "fr-CA" if loc == "fr-ca" else "fr"
-
-
-async def _auto_vimeo_push(job: Job) -> None:
-    """Push a just-completed job's outputs to its source Vimeo video.
-
-    Runs in the worker as part of the job, streaming results into the job log.
-    A push failure never fails the job itself — the dub succeeded; the result
-    is stored on the job (job.vimeo) so the card shows what happened."""
-    token = _vimeo_load_token().get("access_token", "")
-    video_id = _vimeo_video_id(job.source_url or "")
-    if not token or not video_id:
-        reason = "not connected to Vimeo" if not token else "job has no Vimeo source URL"
-        job.vimeo = {"auto": True, "ok": False, "detail": reason}
-        state.publish(job.id, f"!!! auto-push to Vimeo skipped: {reason}")
-        return
-
-    language = _job_language(job)
-    srt = job.outputs.get("srt")
-    m4a = job.outputs.get("full") or job.outputs.get("audio")
-    state.publish(job.id, f">>> auto-pushing to Vimeo video {video_id} ({language}) …")
-    results: dict = {}
-    if srt and os.path.exists(srt):
-        results["subtitles"] = await asyncio.to_thread(
-            _vimeo_push_subtitles, token, video_id, srt, language)
-    if m4a and os.path.exists(m4a):
-        results["audio"] = await asyncio.to_thread(
-            _vimeo_push_audio, token, video_id, m4a, language)
-
-    ok = bool(results) and all(v.get("ok") for v in results.values())
-    job.vimeo = {"auto": True, "ok": ok, "video_id": video_id,
-                 "language": language, "results": results}
-    for kind, res in results.items():
-        state.publish(job.id, "    vimeo %s: %s" % (
-            kind, "✓" if res.get("ok")
-            else f"✗ {res.get('step', '')} — {res.get('detail', '')}"))
-    state.publish(job.id, "<<< auto-push %s" % (
-        "complete" if ok else "FAILED (the dub itself succeeded — push manually from the job card)"))
-    log.info("vimeo auto-push job=%s video=%s ok=%s", job.id, video_id, ok)
-
-
-def _external_base(request: Request) -> str:
-    proto = request.headers.get("x-forwarded-proto", "https")
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-    return f"{proto}://{host}"
-
-
-@app.get("/api/vimeo/status")
-async def vimeo_status() -> JSONResponse:
-    tok = _vimeo_load_token()
-    return JSONResponse({
-        "connected": bool(tok.get("access_token")),
-        "user": tok.get("user", ""),
-        "via": tok.get("via", ""),
-        "oauth_available": bool(VIMEO_CLIENT_ID and VIMEO_CLIENT_SECRET),
-    })
-
-
-@app.post("/api/vimeo/token")
-async def vimeo_set_token(payload: dict) -> JSONResponse:
-    """Connect with a pasted personal access token."""
-    token = (payload.get("token") or "").strip()
-    if not token:
-        raise HTTPException(400, "token required")
-    me = _vimeo_me(token)
-    if not me:
-        raise HTTPException(400, "Vimeo rejected the token (check scopes: public private edit upload)")
-    _vimeo_save_token({
-        "access_token": token,
-        "user": me.get("name", ""),
-        "via": "personal access token",
-        "connected_at": time.time(),
-    })
-    return JSONResponse({"ok": True, "user": me.get("name", "")})
-
-
-@app.delete("/api/vimeo/token")
-async def vimeo_disconnect() -> JSONResponse:
-    VIMEO_TOKEN_FILE.unlink(missing_ok=True)
-    return JSONResponse({"ok": True})
-
-
-@app.get("/api/vimeo/connect")
-async def vimeo_connect(request: Request):
-    if not (VIMEO_CLIENT_ID and VIMEO_CLIENT_SECRET):
-        raise HTTPException(400, "set VIMEO_CLIENT_ID / VIMEO_CLIENT_SECRET (or paste a personal access token instead)")
-    st = secrets.token_urlsafe(24)
-    now = time.time()
-    for k in [k for k, exp in _vimeo_oauth_states.items() if exp < now]:
-        _vimeo_oauth_states.pop(k, None)
-    _vimeo_oauth_states[st] = now + 600
-    redirect = VIMEO_REDIRECT_URL or f"{_external_base(request)}/api/vimeo/callback"
-    from urllib.parse import urlencode
-    return RedirectResponse(
-        "https://api.vimeo.com/oauth/authorize?" + urlencode({
-            "response_type": "code",
-            "client_id": VIMEO_CLIENT_ID,
-            "redirect_uri": redirect,
-            "state": st,
-            "scope": VIMEO_OAUTH_SCOPES,
-        })
-    )
-
-
-@app.get("/api/vimeo/callback")
-async def vimeo_callback(request: Request, code: str = "", state: str = ""):
-    if not code or _vimeo_oauth_states.pop(state, 0) < time.time():
-        raise HTTPException(400, "invalid or expired OAuth state — retry Connect to Vimeo")
-    redirect = VIMEO_REDIRECT_URL or f"{_external_base(request)}/api/vimeo/callback"
-    r = _rq.post(
-        f"{VIMEO_API}/oauth/access_token",
-        auth=(VIMEO_CLIENT_ID, VIMEO_CLIENT_SECRET),
-        headers={"Accept": VIMEO_ACCEPT},
-        json={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect},
-        timeout=30,
-    )
-    if r.status_code not in (200, 201):
-        raise HTTPException(502, f"Vimeo token exchange failed: {_vimeo_err(r)}")
-    data = r.json()
-    _vimeo_save_token({
-        "access_token": data.get("access_token", ""),
-        "user": (data.get("user") or {}).get("name", ""),
-        "via": "oauth",
-        "scope": data.get("scope", ""),
-        "connected_at": time.time(),
-    })
-    return RedirectResponse("/", status_code=303)
-
-
-@app.post("/api/jobs/{job_id}/vimeo-push")
-async def vimeo_push(job_id: str, request: Request) -> JSONResponse:
-    job = state.jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "job not found")
-    if job.status != STATUS_COMPLETED:
-        raise HTTPException(409, f"job is not completed (status: {job.status})")
-    tok = _vimeo_load_token()
-    token = tok.get("access_token", "")
-    if not token:
-        raise HTTPException(400, "not connected to Vimeo")
-
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    want_subs = bool(payload.get("subtitles", True))
-    want_audio = bool(payload.get("audio", True))
-    language = (payload.get("language") or "").strip() or "fr-CA"
-    video_id = _vimeo_video_id(payload.get("video") or job.source_url or "")
-    if not video_id:
-        raise HTTPException(400, "no Vimeo video id — provide a vimeo.com URL or numeric id")
-
-    srt = job.outputs.get("srt")
-    m4a = job.outputs.get("full") or job.outputs.get("audio")
-    results: dict = {}
-    if want_subs:
-        if srt and os.path.exists(srt):
-            results["subtitles"] = await asyncio.to_thread(
-                _vimeo_push_subtitles, token, video_id, srt, language)
-        else:
-            results["subtitles"] = {"ok": False, "step": "locate file", "detail": "no SRT output on this job"}
-    if want_audio:
-        if m4a and os.path.exists(m4a):
-            results["audio"] = await asyncio.to_thread(
-                _vimeo_push_audio, token, video_id, m4a, language)
-        else:
-            results["audio"] = {"ok": False, "step": "locate file", "detail": "no audio output on this job"}
-
-    ok = all(v.get("ok") for v in results.values()) if results else False
-    job.vimeo = {"auto": False, "ok": ok, "video_id": video_id,
-                 "language": language, "results": results}
-    state.save()
-    log.info("vimeo push job=%s video=%s → %s", job_id, video_id,
-             {k: v.get("ok") for k, v in results.items()})
-    return JSONResponse({"ok": ok, "video_id": video_id, "language": language, "results": results})
 
 
 @app.get("/api/health")

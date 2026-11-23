@@ -18,7 +18,6 @@ Stack (single, fixed path):
 """
 
 import gc
-import glob
 import json
 import logging
 import os
@@ -27,7 +26,7 @@ import shutil
 import subprocess
 import sys
 import types
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -242,29 +241,6 @@ class PipelineConfig:
     burn_subs: bool = False   # True = burn subtitles into the picture (re-encode);
                               # False = soft-embed the SRT track (mov_text, copy video).
 
-    # Lip-sync — Wav2Lip (optional post-processing stage). Re-syncs the on-screen
-    # speaker's mouth to the French dub, emitting an extra {name}_french_wav2lip.mp4
-    # (the standard outputs are untouched). Runs last, in an ISOLATED virtualenv via
-    # subprocess (Wav2Lip pins old librosa/numpy/opencv that would break this env),
-    # so a failure — or the stage simply not being installed locally — never affects
-    # the normal outputs. Off by default; enable with --wav2lip or the web checkbox.
-    wav2lip_enabled: bool = False
-    wav2lip_repo_dir: str = "/workspace/wav2lip/Wav2Lip"
-    wav2lip_python: str = "/workspace/wav2lip/venv/bin/python"
-    wav2lip_checkpoint: str = "/workspace/models/wav2lip/wav2lip_gan.pth"
-    wav2lip_resize_factor: int = 1
-    wav2lip_pads: List[int] = field(default_factory=lambda: [0, 10, 0, 0])
-    wav2lip_face_det_batch: int = 16
-    wav2lip_batch: int = 128
-    wav2lip_nosmooth: bool = False
-    # Stock Wav2Lip loads the ENTIRE video into RAM before it does anything, so a
-    # long/HD clip OOMs (the process is SIGKILLed while "Reading video frames").
-    # We split the video into ~chunk_seconds segments, lip-sync each, and
-    # concatenate, so peak RAM is bounded by the chunk length, not the whole
-    # video. 0 disables chunking (single pass — only safe for short clips).
-    wav2lip_chunk_seconds: int = 20
-    wav2lip_timeout: int = 7200
-
     timeout_seconds: int = 7200
 
     # Debug — keep all temp files and dump intermediate segment JSON
@@ -319,7 +295,6 @@ def load_config(path: str) -> PipelineConfig:
     dia  = c.get("diarization", {})
     out  = c.get("output", {})
     met  = c.get("metrics", {})
-    w2l  = c.get("wav2lip", {})
     return PipelineConfig(
         input_folder=p.get("input_folder", "/workspace/videos/input"),
         output_folder=p.get("output_folder", "/workspace/outputs"),
@@ -396,17 +371,6 @@ def load_config(path: str) -> PipelineConfig:
         output_sample_rate=aud.get("output_sample_rate", 48000),
         mux_video=bool(out.get("mux_video", True)),
         burn_subs=bool(out.get("burn_subs", False)),
-        wav2lip_enabled=bool(w2l.get("enabled", False)),
-        wav2lip_repo_dir=w2l.get("repo_dir", "/workspace/wav2lip/Wav2Lip"),
-        wav2lip_python=w2l.get("python", "/workspace/wav2lip/venv/bin/python"),
-        wav2lip_checkpoint=w2l.get("checkpoint", "/workspace/models/wav2lip/wav2lip_gan.pth"),
-        wav2lip_resize_factor=int(w2l.get("resize_factor", 1)),
-        wav2lip_pads=[int(x) for x in (w2l.get("pads") or [0, 10, 0, 0])],
-        wav2lip_face_det_batch=int(w2l.get("face_det_batch_size", 16)),
-        wav2lip_batch=int(w2l.get("wav2lip_batch_size", 128)),
-        wav2lip_nosmooth=bool(w2l.get("nosmooth", False)),
-        wav2lip_chunk_seconds=int(w2l.get("chunk_seconds", 20)),
-        wav2lip_timeout=int(w2l.get("timeout_seconds", 7200)),
         timeout_seconds=proc.get("timeout_seconds", 7200),
         keep_temp=bool(proc.get("keep_temp", False)),
         metrics_enabled=bool(met.get("enabled", False)),
@@ -3776,295 +3740,6 @@ def mux_final_video(
         return False
 
 
-def _write_text_file(path: str, text: str) -> None:
-    """Best-effort text write; never raises (used for diagnostic logs)."""
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-    except OSError:
-        pass
-
-
-def _ffprobe_duration(path: str) -> Optional[float]:
-    """Container duration in seconds via ffprobe, or None on any failure."""
-    try:
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nw=1:nk=1", path],
-            capture_output=True, timeout=120,
-        )
-        return float((r.stdout or b"").decode("utf-8", "ignore").strip())
-    except Exception:
-        return None
-
-
-def _wav2lip_audio_ranges(durations: List[float]) -> List[Tuple[float, float]]:
-    """Map per-chunk video durations to (start, dur) audio slices.
-
-    Offsets accumulate from the *raw* durations so the concatenated audio slices
-    line up exactly with the concatenated video — this is what keeps A/V in sync
-    across chunk boundaries. Pure function (no I/O) so it can be unit-tested.
-    """
-    ranges: List[Tuple[float, float]] = []
-    start = 0.0
-    for d in durations:
-        ranges.append((round(start, 6), round(float(d), 6)))
-        start += float(d)
-    return ranges
-
-
-def _run_wav2lip_chunked(
-    face_video: str,
-    full_wav: str,
-    final_out: str,
-    work_dir: str,
-    chunk_s: int,
-    inference,          # callable(face, wav, out, log_path) -> bool
-    log: logging.Logger,
-) -> bool:
-    """Split the video into ~chunk_s segments, lip-sync each, then concatenate.
-
-    Peak RAM is bounded by the chunk length instead of the whole video, so long
-    or HD clips no longer OOM while Wav2Lip loads every frame. Sync is preserved
-    by deriving each audio slice from the actual (probed) segment durations.
-    """
-    seg_pattern = os.path.join(work_dir, "src_%04d.mp4")
-    # One decode pass; force keyframes at the split points so segments are exact.
-    seg_cmd = [
-        "ffmpeg", "-y", "-i", face_video, "-map", "0:v:0", "-an",
-        "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-force_key_frames", f"expr:gte(t,n_forced*{chunk_s})",
-        "-f", "segment", "-segment_time", str(chunk_s), "-reset_timestamps", "1",
-        seg_pattern,
-    ]
-    try:
-        r = subprocess.run(seg_cmd, capture_output=True, timeout=3600)
-        if r.returncode != 0:
-            log.warning("Wav2Lip: video segmentation failed:\n"
-                        + (r.stderr or b"").decode("utf-8", "ignore")[-600:])
-            return False
-    except Exception as e:
-        log.warning(f"Wav2Lip: video segmentation failed: {e}")
-        return False
-
-    segments = sorted(glob.glob(os.path.join(work_dir, "src_*.mp4")))
-    if not segments:
-        log.warning("Wav2Lip: no video segments were produced — skipping lip-sync.")
-        return False
-
-    durations: List[float] = []
-    for seg in segments:
-        d = _ffprobe_duration(seg)
-        if not d or d <= 0:
-            log.warning(f"Wav2Lip: could not probe segment {os.path.basename(seg)} — skipping.")
-            return False
-        durations.append(d)
-    ranges = _wav2lip_audio_ranges(durations)
-
-    out_segments: List[str] = []
-    total = len(segments)
-    for i, (seg, (a_start, a_dur)) in enumerate(zip(segments, ranges)):
-        aud = os.path.join(work_dir, f"aud_{i:04d}.wav")
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-ss", f"{a_start:.6f}", "-t", f"{a_dur:.6f}",
-                 "-i", full_wav, "-ac", "1", "-ar", "16000", aud],
-                capture_output=True, timeout=600,
-            )
-            if r.returncode != 0 or not os.path.exists(aud):
-                log.warning(f"Wav2Lip: audio slice {i + 1}/{total} failed:\n"
-                            + (r.stderr or b"").decode("utf-8", "ignore")[-400:])
-                return False
-        except Exception as e:
-            log.warning(f"Wav2Lip: audio slice {i + 1}/{total} failed: {e}")
-            return False
-
-        out_seg = os.path.join(work_dir, f"out_{i:04d}.mp4")
-        seg_log = os.path.join(work_dir, f"chunk_{i:04d}.log")
-        log.info(f"  Wav2Lip chunk {i + 1}/{total} …")
-        if not inference(seg, aud, out_seg, seg_log):
-            log.warning(f"Wav2Lip: chunk {i + 1}/{total} did not complete — skipping lip-sync.")
-            return False
-        out_segments.append(out_seg)
-
-    # Concatenate the lip-synced chunks. Try stream-copy first (all chunks share
-    # codec/params); fall back to a re-encode if the copy demuxer refuses.
-    list_path = os.path.join(work_dir, "concat.txt")
-    _write_text_file(list_path, "\n".join(f"file '{p}'" for p in out_segments) + "\n")
-    copy_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-                "-c", "copy", final_out]
-    reenc_cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_path,
-                 "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
-                 "-pix_fmt", "yuv420p", final_out]
-    for cmd in (copy_cmd, reenc_cmd):
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=3600)
-            if r.returncode == 0 and os.path.exists(final_out):
-                return True
-        except Exception:
-            pass
-    log.warning("Wav2Lip: concatenation of lip-synced chunks failed — skipping lip-sync.")
-    return False
-
-
-def run_wav2lip(
-    face_video: str,
-    dub_audio: str,
-    srt_path: str,
-    output_path: str,
-    config: PipelineConfig,
-    log: logging.Logger,
-    temp_dir: str,
-) -> bool:
-    """Optional post-processing: re-sync the speaker's lips to the French dub.
-
-    Feeds the ORIGINAL video (``face_video``) plus the dubbed audio
-    (``dub_audio``) to Wav2Lip and writes a lip-synced ``output_path``. The SRT
-    is then re-attached with :func:`mux_final_video` (video stream-copied), so
-    the result carries the same subtitle track as ``{name}_french.mp4``.
-
-    Wav2Lip runs in a **separate virtualenv** (``config.wav2lip_python``) as a
-    subprocess — its pinned librosa/numpy/opencv would otherwise conflict with
-    this pipeline's environment. The stage is deliberately best-effort: any
-    problem (not installed, checkpoint missing, no detectable face on screen)
-    is logged and returns ``False`` **without raising**, because the caller has
-    already produced every standard output before this runs.
-
-    Returns True only when a lip-synced file was written.
-    """
-    repo_dir = config.wav2lip_repo_dir
-    py = config.wav2lip_python
-    ckpt = config.wav2lip_checkpoint
-    inference_py = os.path.join(repo_dir, "inference.py")
-
-    # --- Preflight: everything must be present, or we skip cleanly. -----------
-    missing = [
-        label for label, pth in (
-            ("wav2lip python", py),
-            ("inference.py", inference_py),
-            ("checkpoint", ckpt),
-        ) if not os.path.exists(pth)
-    ]
-    if missing:
-        log.warning(
-            "Wav2Lip not available (missing: %s) — skipping lip-sync. "
-            "Run 04_setup.sh on the pod to install it." % ", ".join(missing)
-        )
-        return False
-
-    # Wav2Lip reads audio through librosa; hand it a plain 16 kHz mono WAV so we
-    # never hit an m4a/codec edge case inside the isolated env.
-    tmp_wav = os.path.join(temp_dir, "wav2lip_audio.wav")
-    tmp_out = os.path.join(temp_dir, "wav2lip_raw.mp4")
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", dub_audio, "-ar", "16000", "-ac", "1", tmp_wav],
-            check=True, capture_output=True, timeout=600,
-        )
-    except Exception as e:
-        log.warning(f"Wav2Lip: could not extract audio ({e}) — skipping lip-sync.")
-        return False
-
-    # The parent may export an empty/invalid PYTHONHASHSEED (e.g. "" from the web
-    # launcher), which makes a freshly-started Python abort at init with
-    # "PYTHONHASHSEED must be 'random' or an integer …" before running any code.
-    # Force a valid value for the isolated interpreter so it always starts.
-    child_env = os.environ.copy()
-    _hs = (child_env.get("PYTHONHASHSEED") or "").strip()
-    _hs_valid = _hs == "random" or (_hs.isdigit() and 0 <= int(_hs) <= 4294967295)
-    if not _hs_valid:
-        child_env["PYTHONHASHSEED"] = "0"
-
-    w2l_dir = os.path.join(temp_dir, "wav2lip")
-    os.makedirs(w2l_dir, exist_ok=True)
-    tmp_out = os.path.join(temp_dir, "wav2lip_raw.mp4")
-
-    def _inference(face: str, wav: str, out: str, log_path: str) -> bool:
-        """Run one Wav2Lip pass; capture merged output; diagnose failures.
-
-        stderr is merged into stdout so tqdm progress AND any Python traceback
-        are captured together, and the full transcript is written to log_path —
-        a bare "Wav2Lip failed:" with empty stderr (e.g. a signal kill) is
-        useless for diagnosis.
-        """
-        cmd = [
-            py, inference_py,
-            "--checkpoint_path", ckpt,
-            "--face", face,
-            "--audio", wav,
-            "--outfile", out,
-            "--resize_factor", str(config.wav2lip_resize_factor),
-            "--pads", *[str(p) for p in config.wav2lip_pads],
-            "--face_det_batch_size", str(config.wav2lip_face_det_batch),
-            "--wav2lip_batch_size", str(config.wav2lip_batch),
-        ]
-        if config.wav2lip_nosmooth:
-            cmd.append("--nosmooth")
-        try:
-            # cwd=repo_dir so Wav2Lip resolves its bundled face_detection weights.
-            proc = subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=config.wav2lip_timeout, cwd=repo_dir, env=child_env,
-            )
-            text = (proc.stdout or b"").decode("utf-8", "ignore")
-            rc = proc.returncode
-        except subprocess.TimeoutExpired as e:
-            text = (e.output or b"").decode("utf-8", "ignore") if e.output else ""
-            _write_text_file(log_path, text)
-            log.warning(
-                f"Wav2Lip timed out after {config.wav2lip_timeout}s. Log: {log_path}"
-            )
-            return False
-        except Exception as e:
-            log.warning(f"Wav2Lip could not be launched: {e}")
-            return False
-
-        _write_text_file(log_path, text)
-        if rc != 0:
-            tail = "\n".join(text.strip().splitlines()[-25:]) or "(no output captured)"
-            # "Face not detected" is the common, expected case for slide-only footage.
-            if "Face not detected" in text:
-                log.warning("Wav2Lip: no face detected in this segment.")
-            elif rc < 0:
-                log.warning(
-                    f"Wav2Lip killed by signal {-rc} — usually out-of-RAM while "
-                    f"loading frames. Lower wav2lip.chunk_seconds, or raise "
-                    f"wav2lip.resize_factor. Log: {log_path}\n{tail}"
-                )
-            else:
-                log.warning(f"Wav2Lip failed (exit {rc}). Log: {log_path}\n{tail}")
-            return False
-        if not os.path.exists(out):
-            log.warning(f"Wav2Lip exited cleanly but wrote no file. Log: {log_path}")
-            return False
-        return True
-
-    chunk_s = int(config.wav2lip_chunk_seconds or 0)
-    if chunk_s > 0:
-        log.info(
-            f"  Running Wav2Lip in isolated env, {chunk_s}s chunks "
-            f"(bounds RAM on long/HD video) …"
-        )
-        ok = _run_wav2lip_chunked(
-            face_video, tmp_wav, tmp_out, w2l_dir, chunk_s, _inference, log,
-        )
-    else:
-        log.info("  Running Wav2Lip in isolated env (single pass — whole video in RAM) …")
-        ok = _inference(
-            face_video, tmp_wav, tmp_out, os.path.join(temp_dir, "wav2lip.log")
-        )
-
-    if not ok or not os.path.exists(tmp_out):
-        return False
-
-    # Re-attach the delivery audio (AAC) + subtitles onto the lip-synced picture.
-    # mux_final_video stream-copies the video, so this is fast and lossless.
-    return mux_final_video(
-        tmp_out, dub_audio, srt_path, output_path, log,
-        burn_subs=config.burn_subs,
-    )
-
-
 # ============================================================================
 # Step 8: SRT generation — direct from merged segment timings
 # ============================================================================
@@ -5096,20 +4771,6 @@ def process_video(
         ):
             final_mp4 = candidate
 
-    # Optional lip-sync — re-sync the mouth to the French dub. Runs last so the
-    # standard outputs above are already written; a failure here never loses them.
-    # Not emitted as a "[N/6]" banner so the web progress bar (which parses that
-    # pattern) is unaffected; Wav2Lip's own progress still streams to the log.
-    wav2lip_mp4: Optional[str] = None
-    if config.wav2lip_enabled and final_mp4:
-        log.info("Lip-sync (Wav2Lip) — re-syncing the mouth to the French dub (this can take a while) …")
-        candidate_w2l = os.path.join(output_dir, f"{name}_french_wav2lip.mp4")
-        if run_wav2lip(video_path, mux_audio, final_srt, candidate_w2l, config, log, temp_dir):
-            wav2lip_mp4 = candidate_w2l
-            log.info(f"  Lip-synced video: {Path(candidate_w2l).name}")
-        else:
-            log.warning("  Wav2Lip stage did not complete — standard outputs are unaffected.")
-
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
     else:
@@ -5121,8 +4782,6 @@ def process_video(
     log.info(f"  Subs  : {final_srt}")
     if final_mp4:
         log.info(f"  Video : {final_mp4}")
-    if wav2lip_mp4:
-        log.info(f"  Lip-sync : {wav2lip_mp4}")
     log.info(f"{'=' * 60}\n")
     return True
 
@@ -5585,20 +5244,6 @@ def process_video_phase2(
         ):
             final_mp4 = candidate
 
-    # Optional lip-sync — re-sync the mouth to the French dub. Runs last so the
-    # standard outputs above are already written; a failure here never loses them.
-    # Not emitted as a "[N/6]" banner so the web progress bar (which parses that
-    # pattern) is unaffected; Wav2Lip's own progress still streams to the log.
-    wav2lip_mp4: Optional[str] = None
-    if config.wav2lip_enabled and final_mp4:
-        log.info("Lip-sync (Wav2Lip) — re-syncing the mouth to the French dub (this can take a while) …")
-        candidate_w2l = os.path.join(output_dir, f"{name}_french_wav2lip.mp4")
-        if run_wav2lip(video_path, mux_audio, final_srt, candidate_w2l, config, log, temp_dir):
-            wav2lip_mp4 = candidate_w2l
-            log.info(f"  Lip-synced video: {Path(candidate_w2l).name}")
-        else:
-            log.warning("  Wav2Lip stage did not complete — standard outputs are unaffected.")
-
     if config.keep_temp:
         log.info(f"  [keep_temp] Temp files preserved at: {temp_dir}")
     else:
@@ -5610,8 +5255,6 @@ def process_video_phase2(
     log.info(f"  Subs  : {final_srt}")
     if final_mp4:
         log.info(f"  Video : {final_mp4}")
-    if wav2lip_mp4:
-        log.info(f"  Lip-sync : {wav2lip_mp4}")
     log.info(f"{'=' * 60}\n")
     return True
 
@@ -5663,14 +5306,6 @@ def process_video_phase2(
     default=None,
     help="Phase 2: load segments from this path instead of the default location.",
 )
-@click.option(
-    "--wav2lip/--no-wav2lip",
-    "wav2lip_flag",
-    default=None,
-    help="Run (or skip) the optional Wav2Lip lip-sync stage, overriding "
-         "wav2lip.enabled in config.yaml for this run. Emits an extra "
-         "{name}_french_wav2lip.mp4 with the mouth re-synced to the French dub.",
-)
 def main(
     video: str,
     output_dir: str,
@@ -5682,7 +5317,6 @@ def main(
     keep_temp: bool,
     phase: Optional[str],
     segments_file: Optional[str],
-    wav2lip_flag: Optional[bool],
 ) -> None:
     """Dub a video to French (audio track + SRT subtitles).
 
@@ -5713,9 +5347,6 @@ def main(
             config.diarization_max_speakers = speakers
     if keep_temp:
         config.keep_temp = True
-    if wav2lip_flag is not None:
-        # Explicit --wav2lip/--no-wav2lip overrides config.yaml for this run only.
-        config.wav2lip_enabled = wav2lip_flag
     log = setup_logging(config.logs_folder, Path(video).stem)
     if phase == "1":
         success = process_video_phase1(video, output_dir, config, log, force=force)

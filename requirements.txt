@@ -1,16 +1,19 @@
 # French Dubbing Pipeline v4.0 — Python Dependencies
 # Install: pip install -r requirements.txt
 #
-# NOTE: torch==2.8.0 and torchaudio==2.8.0 are PRE-INSTALLED on the RunPod
-# pytorch:1.0.2-cu1281-torch280-ubuntu2404 image.
-# If installing outside RunPod, add:
-#   pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-
-# torchcodec MUST match torch 2.8 / CUDA 12.8 — the compatibility matrix maps
-# torch 2.8 ↔ torchcodec 0.6/0.7. Newer torchcodec (0.14.x, pulled in transitively
-# by f5-tts) targets torch 2.11 / CUDA 13 and links libnvrtc.so.13, which is absent
-# on cu128 → OSError on import → pyannote 4.x "AudioDecoder NameError" + degraded F5-TTS.
-torchcodec>=0.6,<0.8
+# ── PyTorch stack (CUDA 13.x wheels from PyPI; needs NVIDIA driver >= 580) ────
+# torch, torchaudio, torchvision and torchcodec are pinned together. torchaudio's
+# last release is 2.11.x (audio I/O moved to torchcodec); it only requires
+# torch>=2.11 and works with torch 2.15. torchcodec 0.17 is the release paired
+# with torch 2.15 — a mismatched torchcodec fails to load its libs on import,
+# which surfaces as pyannote "AudioDecoder NameError" + degraded F5-TTS.
+# torchvision isn't used directly, but transformers imports it when present and
+# base images ship one built for their own torch: a stale build fails with
+# "operator torchvision::nms does not exist", which breaks the F5-TTS import.
+torch==2.15.0
+torchaudio==2.11.1
+torchvision==0.29.2
+torchcodec==0.17.0
 
 # ── Audio / Video ──────────────────────────────────────────────────────────────
 # Upper bound: pyannote.audio 4.x would otherwise pull numpy 2.5.x, which breaks
@@ -26,6 +29,10 @@ demucs>=4.0.0
 
 # ── Transcription — faster-whisper (CTranslate2) ──────────────────────────────
 faster-whisper>=1.1.0
+# faster-whisper (<=1.2.1) decodes files with av.open(..., metadata_errors=...),
+# an argument PyAV 19 removed → "open() got an unexpected keyword argument
+# 'metadata_errors'" at transcription. Cap PyAV until faster-whisper catches up.
+av<19
 
 # ── Speaker Diarization — pyannote.audio (optional, gated HF model) ───────────
 # 4.x is required by the speaker-diarization-community-1 model and uses the

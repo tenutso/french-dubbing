@@ -1,7 +1,8 @@
 #!/bin/bash
 # French Dubbing Pipeline - Setup v1.0
-# Target: RunPod pytorch:1.0.2-cu1281-torch280-ubuntu2404
-#         (RTX 4090, PyTorch 2.8.0, CUDA 12.8.1, Ubuntu 24.04)
+# Target: Ubuntu 24.04 / Python 3.12 with an NVIDIA GPU (driver >= 580,
+#         CUDA 13.x). Installs PyTorch 2.15 itself from requirements.txt, so any
+#         RunPod PyTorch/CUDA image works (an older preinstalled torch is upgraded).
 #
 # Design: each step handles its own errors.
 # One failing step does NOT abort the whole setup.
@@ -45,13 +46,14 @@ PYTHON=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
 PYTHON_VER=$($PYTHON --version 2>&1 | awk '{print $2}')
 log_success "Python $PYTHON_VER at $PYTHON"
 
-$PYTHON - <<'PYCHECK' || die "PyTorch 2.8.x not found. Use the pytorch:1.0.2-cu1281-torch280-ubuntu2404 RunPod image."
-import sys, torch
-v = torch.__version__
-assert v.startswith("2.8"), f"Expected PyTorch 2.8.x, got {v}"
-assert torch.cuda.is_available(), "torch.cuda.is_available() returned False"
-print(f"PyTorch {v}, CUDA {torch.version.cuda}")
-PYCHECK
+# PyTorch itself is installed from requirements.txt (Step 3). Its CUDA 13.x
+# wheels need an NVIDIA driver >= 580.
+DRIVER_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+DRIVER_MAJOR=${DRIVER_VER%%.*}
+if [[ "$DRIVER_MAJOR" =~ ^[0-9]+$ ]] && (( DRIVER_MAJOR < 580 )); then
+    die "NVIDIA driver $DRIVER_VER is too old for the CUDA 13 PyTorch wheels (need >= 580). Pick a pod/host with CUDA 13.x."
+fi
+log_success "NVIDIA driver $DRIVER_VER"
 
 log_success "Prerequisites OK"
 
@@ -63,7 +65,7 @@ log_step "Loading configuration from config.yaml …"
 
 CONFIG_FILE="$SCRIPT_DIR/config.yaml"
 
-# PyYAML is installed properly in Step 9; ensure it's importable now so the
+# PyYAML is installed properly in Step 3; ensure it's importable now so the
 # config reader below works before the main dependency install.
 $PYTHON -c "import yaml" 2>/dev/null \
     || $PYTHON -m pip install --quiet --no-cache-dir pyyaml 2>/dev/null || true
@@ -138,7 +140,8 @@ log_step "Creating workspace at /workspace …"
 
 if mkdir -p "$INPUT_FOLDER" "$OUTPUT_FOLDER" "$WHISPER_CACHE" \
             "$LOGS_FOLDER" "$TEMP_FOLDER" /workspace/scripts && \
-   chmod -R 755 /workspace; then
+   chmod 755 "$INPUT_FOLDER" "$OUTPUT_FOLDER" "$WHISPER_CACHE" \
+             "$LOGS_FOLDER" "$TEMP_FOLDER" /workspace/scripts; then
     log_success "Workspace ready"
 else
     log_error "Workspace creation failed"
@@ -148,192 +151,33 @@ fi
 LOGFILE="$LOGS_FOLDER/setup.log"
 cat /tmp/dubbing_setup.log >> "$LOGFILE" 2>/dev/null || true
 
-# ── Step 3: Python package upgrades ───────────────────────────────────────
+# ── Step 3: Python dependencies (PyTorch stack + pipeline) ────────────────
+# requirements.txt is the single source of truth — it pins torch / torchaudio /
+# torchcodec together (CUDA 13.x wheels from PyPI), so a base image with an
+# older torch is simply upgraded in place.
 
 log_step "Upgrading pip / setuptools / wheel …"
-
-if $PYTHON -m pip install --upgrade --no-cache-dir pip setuptools wheel packaging \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "pip/setuptools/wheel upgraded"
-else
-    log_warn "pip upgrade had issues — continuing anyway"
-fi
-
-# ── Step 4: Core scientific stack ─────────────────────────────────────────
-
-log_step "Installing numpy / scipy …"
-
-if $PYTHON -m pip install --no-cache-dir \
-       "numpy>=1.26.4" "scipy>=1.13.1" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "numpy / scipy installed"
-else
-    log_error "numpy/scipy installation failed"
-fi
-
-# ── Step 5: torchaudio 2.8.0 ──────────────────────────────────────────────
-
-log_step "Installing torchaudio 2.8.0 (CUDA 12.8) …"
-
-# Check if already present at the right version
-if $PYTHON -c "import torchaudio; assert torchaudio.__version__.startswith('2.8')" 2>/dev/null; then
-    log_success "torchaudio 2.8.x already present"
-else
-    if $PYTHON -m pip install --no-cache-dir \
-           torchaudio==2.8.0 \
-           --index-url https://download.pytorch.org/whl/cu128 \
-           2>&1 | tail -3 | tee -a "$LOGFILE"; then
-        log_success "torchaudio 2.8.0 installed"
-    else
-        log_warn "torchaudio install failed — audio processing may be limited"
-    fi
-fi
-
-# ── Step 6: Audio libraries ────────────────────────────────────────────────
-
-log_step "Installing audio libraries …"
-
-if $PYTHON -m pip install --no-cache-dir \
-       "librosa>=0.10.2" "soundfile>=0.12.1" "pydub>=0.25.1" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "Audio libraries installed"
-else
-    log_error "Audio library installation failed"
-fi
-
-# ── Step 7: faster-whisper ────────────────────────────────────────────────
-
-log_step "Installing faster-whisper …"
-
-if $PYTHON -m pip install --no-cache-dir "faster-whisper>=1.1.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "faster-whisper installed"
-else
-    log_error "faster-whisper installation failed"
-fi
-
-# ── Step 8: Source separation — Demucs ────────────────────────────────────────
-
-log_step "Installing Demucs (source separation) …"
-
-if $PYTHON -m pip install --no-cache-dir "demucs>=4.0.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "Demucs installed"
-else
-    log_warn "Demucs install failed — pipeline falls back to raw audio (lower voice-clone quality)"
-fi
-
-# ── Step 8b: Speaker denoising — noisereduce (+ FFmpeg anlmdn fallback) ──────
-# DeepFilterNet was dropped (no cp312 wheel → needs Rust; and pins numpy<2.0,
-# which conflicts with the numpy 2.x stack). noisereduce is the primary denoiser;
-# FFmpeg anlmdn is the always-present runtime fallback.
-log_step "Installing noisereduce (speaker reference denoising) …"
-
-if $PYTHON -m pip install --no-cache-dir "noisereduce>=3.0.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "noisereduce installed"
-else
-    log_warn "noisereduce install failed — pipeline will fall back to FFmpeg anlmdn"
-fi
-
-# ── Step 8c: Speaker diarization — pyannote.audio (gated model) ──────────────
-
-log_step "Installing pyannote.audio (speaker diarization) …"
-
-if $PYTHON -m pip install --no-cache-dir "pyannote.audio>=4.0,<5.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "pyannote.audio installed"
-else
-    log_warn "pyannote.audio install failed — diarization will be unavailable"
-fi
-
-# ── Step 8c-Web: FastAPI web UI dependencies ─────────────────────────────────
-log_step "Installing web UI dependencies (fastapi, uvicorn, python-multipart) …"
-
-if $PYTHON -m pip install --no-cache-dir --upgrade \
-       "fastapi>=0.110" "uvicorn[standard]>=0.27" "python-multipart>=0.0.9" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "Web UI dependencies installed"
-else
-    log_warn "Web UI dependency install failed — 05_web.sh will not run"
-fi
-
-# ── Step 8d: F5-TTS (flow-matching zero-shot voice cloning) ──────────────────
-# Multilingual (incl. French), more reliable than autoregressive XTTS-v2.
-
-log_step "Installing F5-TTS …"
-
-if $PYTHON -m pip install --no-cache-dir "f5-tts>=1.0.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "f5-tts installed"
-else
-    log_error "f5-tts install failed — TTS will not work"
-fi
-
-# ── Step 8d-codec: Pin torchcodec to the torch-2.8-compatible wheel ──────────
-# f5-tts (above) pulls in the latest torchcodec (0.14.x), which targets torch 2.11
-# / CUDA 13 and fails to load on this cu128 image (libnvrtc.so.13 missing). The
-# matrix maps torch 2.8 ↔ torchcodec 0.6/0.7. Force the correct wheel AFTER f5-tts
-# so its transitive pin is overridden — this fixes both pyannote 4.x diarization
-# (AudioDecoder) and F5-TTS reference auto-transcription.
-log_step "Pinning torchcodec to torch-2.8-compatible version (>=0.6,<0.8) …"
-if $PYTHON -m pip install --no-cache-dir "torchcodec>=0.6,<0.8" \
+$PYTHON -m pip install --upgrade --no-cache-dir pip setuptools wheel packaging \
        2>&1 | tail -3 | tee -a "$LOGFILE" \
-   && $PYTHON -c "import torchcodec" 2>/dev/null; then
-    log_success "torchcodec loads cleanly ($($PYTHON -c 'import torchcodec; print(torchcodec.__version__)' 2>/dev/null))"
+    || log_warn "pip upgrade had issues — continuing anyway"
+
+log_step "Installing Python dependencies from requirements.txt (torch + pipeline) …"
+if $PYTHON -m pip install --no-cache-dir -r "$SCRIPT_DIR/requirements.txt" \
+       2>&1 | tail -5 | tee -a "$LOGFILE"; then
+    log_success "Python dependencies installed"
 else
-    log_warn "torchcodec install/import failed — diarization & F5-TTS auto-transcription may be degraded"
+    die "pip install -r requirements.txt failed — see $LOGFILE"
 fi
 
-# F5-TTS pulls in torchcodec which links against libnvrtc.so.N (where N matches
-# the CUDA major version torchcodec was built for).  On PyTorch cu128 the library
-# is libnvrtc.so.12 but torchcodec may expect .13.  Create a compatibility symlink
-# so torchcodec loads without raising an OSError that crashes segment synthesis.
-log_step "Checking torchcodec / libnvrtc compatibility …"
-NVRTC_SO=$(find /usr/local/cuda/lib64 \
-               /usr/local/lib/python3.12/dist-packages/nvidia/cuda_nvrtc/lib \
-               /usr/local/lib/python3.12/dist-packages/nvidia/nvrtc/lib \
-           -maxdepth 1 -name "libnvrtc.so.1[0-9]*" ! -type l 2>/dev/null | sort -V | tail -1)
-if [ -n "$NVRTC_SO" ]; then
-    EXISTING_VER=$(basename "$NVRTC_SO" | sed 's/libnvrtc.so.//')
-    MAJOR=${EXISTING_VER%%.*}
-    NEED_VER=$(python3 -c "
-try:
-    import torchcodec, os, ctypes
-    print('')  # already loads fine
-except OSError as e:
-    msg = str(e)
-    import re; m = re.search(r'libnvrtc\.so\.(\d+)', msg)
-    print(m.group(1) if m else '')
-except Exception:
-    print('')
-" 2>/dev/null)
-    if [ -n "$NEED_VER" ] && [ "$NEED_VER" != "$MAJOR" ]; then
-        TARGET="/usr/local/lib/libnvrtc.so.${NEED_VER}"
-        if [ ! -e "$TARGET" ]; then
-            ln -sf "$NVRTC_SO" "$TARGET" && ldconfig 2>/dev/null || true
-            log_success "Created libnvrtc.so.${NEED_VER} → ${NVRTC_SO}"
-        fi
-    else
-        log_success "torchcodec libnvrtc OK (no symlink needed)"
-    fi
-else
-    log_warn "libnvrtc.so not found — torchcodec GPU decoding may fail (pipeline pre-transcribes refs with faster-whisper as fallback)"
-fi
-
-# ── Step 9: Utilities ─────────────────────────────────────────────────────
-
-log_step "Installing utility packages …"
-
-if $PYTHON -m pip install --no-cache-dir \
-       "pysrt>=1.1.2" "chardet<6" "requests>=2.32.0" \
-       "tqdm>=4.66.0" "click>=8.1.7" "pyyaml>=6.0.1" \
-       "python-dotenv>=1.0.0" "hf_transfer>=0.1.6" "yt-dlp>=2024.1.0" \
-       2>&1 | tail -3 | tee -a "$LOGFILE"; then
-    log_success "Utilities installed"
-else
-    log_error "Utility package installation failed"
-fi
+$PYTHON - <<'PYCHECK' 2>&1 | tee -a "$LOGFILE" || die "PyTorch stack failed its GPU check — see $LOGFILE"
+import torch, torchaudio, torchcodec
+from torchcodec.decoders import AudioDecoder  # fails if torchcodec doesn't match torch
+assert torch.cuda.is_available(), "torch.cuda.is_available() returned False (driver too old for CUDA 13?)"
+x = torch.randn(8, 8, device="cuda"); _ = x @ x
+print(f"PyTorch {torch.__version__} (CUDA {torch.version.cuda}), torchaudio {torchaudio.__version__}, "
+      f"torchcodec {torchcodec.__version__}, GPU {torch.cuda.get_device_name(0)}")
+PYCHECK
+log_success "PyTorch stack OK"
 
 # hf_transfer is opt-in via env var; export now and persist in /workspace/.env
 # so it's active for all subsequent pre-downloads and pipeline runs.
@@ -341,90 +185,7 @@ export HF_HUB_ENABLE_HF_TRANSFER=1
 grep -q "HF_HUB_ENABLE_HF_TRANSFER" /workspace/.env 2>/dev/null \
     || echo "HF_HUB_ENABLE_HF_TRANSFER=1" >> /workspace/.env
 
-# ── Step 9b: Wav2Lip — optional lip-sync stage (ISOLATED virtualenv) ─────────
-# Wav2Lip re-syncs the on-screen speaker's mouth to the dubbed audio. It pins
-# OLD, conflicting dependencies (librosa 0.9 / numpy 1.x / opencv) that would
-# break the main pipeline stack, so it lives in a DEDICATED virtualenv and is
-# invoked by 02_pipeline.py as a subprocess — it never touches the main env.
-#
-# The whole step is OPT-IN and NON-FATAL: every failure is a warning, not an
-# abort, because the stage is disabled by default (config wav2lip.enabled:false)
-# and only runs when a job passes --wav2lip / ticks the web checkbox.
-log_step "Installing Wav2Lip (optional lip-sync stage) …"
-
-W2L_ROOT=/workspace/wav2lip
-W2L_REPO="$W2L_ROOT/Wav2Lip"
-W2L_VENV="$W2L_ROOT/venv"
-W2L_MODELS="$MODELS_FOLDER/wav2lip"
-# Checkpoint sources are overridable — upstream's original Google-Drive/SharePoint
-# links are flaky. Defaults point at a long-lived Hugging Face mirror (GAN weights)
-# and the canonical S3FD face-detector weights. Override with WAV2LIP_GAN_URL /
-# S3FD_URL if a mirror goes down.
-WAV2LIP_GAN_URL="${WAV2LIP_GAN_URL:-https://huggingface.co/rippertnt/wav2lip/resolve/main/checkpoints/wav2lip_gan.pth}"
-S3FD_URL="${S3FD_URL:-https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth}"
-
-mkdir -p "$W2L_ROOT" "$W2L_MODELS"
-
-# 1. Clone the Wav2Lip repo (idempotent — shallow to keep it small).
-if [ -d "$W2L_REPO/.git" ]; then
-    log_success "Wav2Lip repo already present"
-elif git clone --depth 1 https://github.com/Rudrabha/Wav2Lip "$W2L_REPO" 2>&1 | tail -2 | tee -a "$LOGFILE"; then
-    log_success "Wav2Lip repo cloned"
-else
-    log_warn "Wav2Lip clone failed — lip-sync stage unavailable (opt-in, safe to ignore)"
-fi
-
-# 2. Dedicated virtualenv with pinned, self-contained deps. torch/torchaudio are
-#    matched to the pod's CUDA 12.8; librosa is held at 0.9.2 because Wav2Lip's
-#    audio.py calls librosa.filters.mel() positionally, which breaks on 0.10+.
-if [ -d "$W2L_REPO" ] && [ ! -x "$W2L_VENV/bin/python" ]; then
-    if python3 -m venv "$W2L_VENV" 2>&1 | tee -a "$LOGFILE"; then
-        "$W2L_VENV/bin/pip" install --no-cache-dir --upgrade pip >/dev/null 2>&1 || true
-        if "$W2L_VENV/bin/pip" install --no-cache-dir \
-               torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128 \
-               2>&1 | tail -2 | tee -a "$LOGFILE" \
-           && "$W2L_VENV/bin/pip" install --no-cache-dir \
-               "numpy<2" "librosa==0.9.2" opencv-python scipy numba tqdm \
-               2>&1 | tail -2 | tee -a "$LOGFILE"; then
-            log_success "Wav2Lip virtualenv ready ($W2L_VENV)"
-        else
-            log_warn "Wav2Lip dependency install failed — lip-sync stage unavailable (opt-in)"
-        fi
-    else
-        log_warn "Wav2Lip venv creation failed — lip-sync stage unavailable (opt-in)"
-    fi
-elif [ -x "$W2L_VENV/bin/python" ]; then
-    log_success "Wav2Lip virtualenv already present"
-fi
-
-# 3. Download the model weights (idempotent): the Wav2Lip GAN generator and the
-#    S3FD face detector (the repo expects it at face_detection/detection/sfd/).
-if [ -d "$W2L_REPO" ]; then
-    S3FD_DIR="$W2L_REPO/face_detection/detection/sfd"
-    mkdir -p "$S3FD_DIR"
-    if [ ! -s "$W2L_MODELS/wav2lip_gan.pth" ]; then
-        if wget -q --show-progress -O "$W2L_MODELS/wav2lip_gan.pth" "$WAV2LIP_GAN_URL" 2>&1 | tail -1 | tee -a "$LOGFILE"; then
-            log_success "Downloaded wav2lip_gan.pth (~436 MB)"
-        else
-            rm -f "$W2L_MODELS/wav2lip_gan.pth"
-            log_warn "wav2lip_gan.pth download failed — set WAV2LIP_GAN_URL to a mirror and re-run (opt-in)"
-        fi
-    else
-        log_success "wav2lip_gan.pth already present"
-    fi
-    if [ ! -s "$S3FD_DIR/s3fd.pth" ]; then
-        if wget -q --show-progress -O "$S3FD_DIR/s3fd.pth" "$S3FD_URL" 2>&1 | tail -1 | tee -a "$LOGFILE"; then
-            log_success "Downloaded s3fd.pth (face detector)"
-        else
-            rm -f "$S3FD_DIR/s3fd.pth"
-            log_warn "s3fd.pth download failed — set S3FD_URL to a mirror and re-run (opt-in)"
-        fi
-    else
-        log_success "s3fd.pth already present"
-    fi
-fi
-
-# ── Step 10: Ollama ───────────────────────────────────────────────────────
+# ── Step 4: Ollama ───────────────────────────────────────────────────────
 
 log_step "Setting up Ollama …"
 
@@ -445,7 +206,7 @@ else
     fi
 fi
 
-# ── Step 11: Start Ollama service ─────────────────────────────────────────
+# ── Step 5: Start Ollama service ─────────────────────────────────────────
 
 log_step "Starting Ollama service …"
 
@@ -468,7 +229,7 @@ else
     log_warn "Ollama not installed — skipping service start"
 fi
 
-# ── Step 12: Pull the translation model ─────────────────────────────────
+# ── Step 6: Pull the translation model ─────────────────────────────────
 
 pull_with_retry() {
     local model="$1"
@@ -492,7 +253,7 @@ else
     log_warn "Ollama not reachable — skipping model download. Run: ollama pull $OLLAMA_MODEL"
 fi
 
-# ── Step 12b: HuggingFace token (pyannote diarization is a gated model) ──────
+# ── Step 7: HuggingFace token (pyannote diarization is a gated model) ──────
 
 log_step "Configuring HuggingFace access for pyannote diarization …"
 
@@ -539,7 +300,7 @@ else
     log_warn "No HuggingFace token provided — diarization will be disabled at runtime"
 fi
 
-# ── Step 13: Pre-download Whisper large-v3 ────────────────────────────────
+# ── Step 8: Pre-download Whisper large-v3 ────────────────────────────────
 
 log_step "Pre-downloading Whisper $WHISPER_MODEL (~3 GB) …"
 
@@ -559,7 +320,7 @@ else
     log_warn "Whisper download failed — it will auto-download on first use"
 fi
 
-# ── Step 14: Pre-download F5-TTS weights (~1.5 GB) ───────────────────────────
+# ── Step 9: Pre-download F5-TTS weights (~1.5 GB) ───────────────────────────
 
 log_step "Pre-downloading F5-TTS model (~1.5 GB) …"
 
@@ -584,32 +345,16 @@ try:
         t = F5TTS(model=model)
     del t
     print("✓ F5-TTS cached")
-except ImportError:
-    print("f5-tts not installed — skipping pre-download")
 except Exception as e:
     print(f"F5-TTS download error: {e}")
     raise
 PYEOF
-    log_success "F5-TTS cached (or not installed)"
+    log_success "F5-TTS cached"
 else
-    log_warn "F5-TTS pre-download failed — it will download on first use"
+    log_error "F5-TTS failed to import or download — TTS will not work (see $LOGFILE)"
 fi
 
-# ── Step 14b: Refresh latest releases for non-pinned packages ────────────────
-
-log_step "Upgrading non-pinned packages to latest …"
-
-$PYTHON -m pip install --upgrade --no-cache-dir \
-       faster-whisper "pyannote.audio>=4.0,<5.0" noisereduce transformers \
-       2>&1 | tail -5 | tee -a "$LOGFILE" \
-    && log_success "Packages upgraded" \
-    || log_warn "Upgrade pass had non-fatal issues — pipeline still usable"
-
-if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    ollama pull "$OLLAMA_MODEL" 2>&1 | tail -3 | tee -a "$LOGFILE" || true
-fi
-
-# ── Step 16: Install scripts & config ─────────────────────────────────────
+# ── Step 10: Install scripts & config ─────────────────────────────────────
 
 log_step "Installing pipeline scripts …"
 
@@ -643,7 +388,7 @@ else
     log_warn "canadian_glossary.yaml not found in $SCRIPT_DIR — Canadian French locale will skip glossary"
 fi
 
-# ── Step 17: Web UI package + runtime directories ────────────────────────────
+# ── Step 11: Web UI package + runtime directories ────────────────────────────
 log_step "Installing web UI (FastAPI) …"
 
 if [[ -d "$SCRIPT_DIR/web" ]]; then

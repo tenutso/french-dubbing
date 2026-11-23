@@ -96,8 +96,6 @@ def main():
         line       = out.splitlines()[0]
         name, mem  = (line.split(",") + ["?"])[:2]
         c.check("NVIDIA GPU", True, f"{name.strip()} ({mem.strip()})")
-        if not any(x in name for x in ("4090", "A5000", "A100", "A6000", "H100")):
-            c.warn("GPU model", f"{name.strip()} — verify 24 GB+ VRAM")
     else:
         c.check("NVIDIA GPU", False, "nvidia-smi not found")
 
@@ -114,7 +112,9 @@ def main():
     try:
         import torch
         c.check("PyTorch import", True, torch.__version__)
-        c.check("PyTorch 2.8.x", torch.__version__.startswith("2.8"), torch.__version__)
+        from packaging.version import Version
+        tv = Version(torch.__version__.split("+")[0])
+        c.check("PyTorch >= 2.15", tv >= Version("2.15"), torch.__version__)
         c.check("CUDA available", torch.cuda.is_available())
         if torch.cuda.is_available():
             mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -125,8 +125,15 @@ def main():
                 c.check("GPU compute", True, "tensor ops OK")
             except Exception as e:
                 c.check("GPU compute", False, str(e))
-        ok2, cuda_ver = run('python3 -c "import torch; print(torch.version.cuda)"')
-        c.check("CUDA 12.8", ok2 and "12.8" in (cuda_ver or ""), cuda_ver or "unknown")
+        cuda_ver = torch.version.cuda or ""
+        c.check("CUDA 13.x build", cuda_ver.startswith("13."), cuda_ver or "unknown")
+        try:
+            import torchaudio, torchcodec
+            from torchcodec.decoders import AudioDecoder  # noqa: F401 — fails on a torch/torchcodec mismatch
+            c.check("torchaudio / torchcodec", True,
+                    f"torchaudio {torchaudio.__version__}, torchcodec {torchcodec.__version__}")
+        except Exception as e:
+            c.check("torchaudio / torchcodec", False, str(e).splitlines()[0][:120])
     except ImportError:
         c.check("PyTorch import", False, "torch not installed")
 
@@ -182,11 +189,12 @@ def main():
         try:
             from packaging.version import Version
             v = Version(ver)
-            if Version("1.26.4") <= v < Version("2.0.0"):
-                c.check("numpy <2.0.0", True, ver)
+            # numba (librosa/demucs) supports numpy < 2.5; pyannote 4.x needs 2.x.
+            if Version("2.0.0") <= v < Version("2.5.0"):
+                c.check("numpy 2.x (<2.5)", True, ver)
             else:
-                c.warn("numpy <2.0.0",
-                       f"{ver} — run: pip install --force-reinstall 'numpy>=1.26.4,<2.0.0'")
+                c.warn("numpy 2.x (<2.5)",
+                       f"{ver} — run: pip install -r requirements.txt")
         except Exception:
             c.warn("numpy version", f"could not parse {ver}")
 
@@ -208,7 +216,11 @@ def main():
 
     # ── transformers ──────────────────────────────────────────────────────────
     print(f"\n{BLUE}transformers{RESET}")
-    hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
+    try:
+        from huggingface_hub import constants as _hf_constants
+        hf_cache = Path(_hf_constants.HF_HUB_CACHE)  # honours HF_HOME / HF_HUB_CACHE
+    except Exception:
+        hf_cache = Path.home() / ".cache" / "huggingface" / "hub"
     ok2, ver = pkg("transformers")
     c.check("transformers", ok2, f"v{ver}" if ok2 else ver)
 
@@ -217,9 +229,10 @@ def main():
     ok2, ver = pkg("f5_tts")
     if ok2:
         c.check("f5-tts", True, f"v{ver}")
-        f5_cached = any(
+        f5_cached = hf_cache.exists() and any(
             "f5tts" in str(p).lower() or "f5-tts" in str(p).lower()
-            for p in hf_cache.rglob("*.safetensors") if hf_cache.exists()
+            for pattern in ("*.safetensors", "*.pt")
+            for p in hf_cache.rglob(pattern)
         )
         if f5_cached:
             c.check("F5-TTS weights cached", True)

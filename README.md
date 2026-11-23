@@ -194,19 +194,13 @@ cost is volume storage, a few $/month):
    editing translations, or saving voice references does. Jobs paused at the review stage
    persist on the volume and survive a stop. `/api/health` reports `idle_for_s` so you can
    see the countdown.
-3. **Start on demand with [trigger.sh](trigger.sh)** from any machine (needs `curl` + `python3`):
-
-   ```bash
-   export RUNPOD_API_KEY=... RUNPOD_POD_ID=... DUBBING_UI_TOKEN=...
-   ./trigger.sh --path /workspace/videos/input/webinar.mp4 --locale fr-ca --speakers 3 --wait --download ./out
-   ```
-
-   It starts the pod, waits for the API, submits the job (on‑pod path or file upload), and optionally polls to completion and downloads the outputs. The pod then
-   idle‑stops on its own. Any backend can do the same three HTTP calls directly:
-   `POST rest.runpod.io/v1/pods/{id}/start` → poll `GET /api/health` → `POST /api/jobs`.
+3. **Start on demand**: start the pod from the RunPod console when you have work, submit
+   through the web UI, and let it idle‑stop afterwards. To automate this, a script or backend
+   needs three HTTP calls: `POST rest.runpod.io/v1/pods/{id}/start` → poll `GET /api/health` →
+   `POST /api/jobs` (Bearer‑auth with `DUBBING_UI_TOKEN`).
 
 One caveat: a *stopped* pod is not guaranteed to get its GPU back at start time. If
-`trigger.sh` reports the pod can't start, create a fresh pod on the same network volume
+the pod can't start, create a fresh pod on the same network volume
 (same template) — nothing is lost.
 
 ---
@@ -316,7 +310,6 @@ french-dubbing/
 ├── 03_batch_runner.py        # batch a folder of MP4s
 ├── 04_setup.sh               # one‑shot installer (RunPod / Ubuntu 24.04)
 ├── 05_web.sh                 # uvicorn launcher (web UI)
-├── trigger.sh                # on-demand client: start pod → submit job → download
 ├── bootstrap.sh              # RunPod container‑start entrypoint
 ├── verify_setup.py           # GO/NO‑GO post‑install check
 ├── config.yaml               # all knobs (commented)

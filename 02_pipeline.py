@@ -1415,13 +1415,19 @@ def _looks_like_instruction_leak(text: str) -> bool:
     return bool(_LEAK_SIGNATURE_RE.search(text))
 
 
-# Empirical French syllable density: ~0.32 syllables per character for typical
-# spoken French (content + function words mixed). Used to derive syllable-per-
-# second budgets from the character-per-second config values so that the
-# compression trigger and CPS-split threshold are linguistically grounded
-# rather than relying on character counts, which over-penalise long French
-# words and under-penalise dense short ones.
-_FR_SYL_PER_CHAR: float = 0.32
+# Empirical French syllable density, as measured by _count_syllables (pyphen):
+# ~0.24 syllables per character for spoken French (content + function words
+# mixed). Used to derive syllable-per-second budgets from the character-per-
+# second config values so that the compression trigger and CPS-split threshold
+# are linguistically grounded rather than relying on character counts, which
+# over-penalise long French words and under-penalise dense short ones.
+#
+# This MUST match what _count_syllables actually returns, or the syllable
+# budgets drift away from budget_cps. It was 0.32, which made the compression
+# trigger fire only at ~21 chars/s instead of budget_cps (16): on a 29-min
+# webinar it flagged 46/212 segments and missed 44 of the 49 that later needed
+# >1.3x speed-up. Measured 0.241 on that run; 0.24 flags 45/49 of them.
+_FR_SYL_PER_CHAR: float = 0.24
 
 _pyphen_cache: dict = {}
 
@@ -2718,8 +2724,9 @@ _TTS_SLOW_PACE_CPS = 12.0
 def _split_for_tts(text: str, limit: int) -> List[str]:
     """Break text into ≤limit-char chunks on natural boundaries.
 
-    Always splits at sentence boundaries so the caller's chunk_gap inserts an
-    audible inter-sentence pause even for short texts. Further sub-splits long
+    Splits at sentence boundaries so the caller's chunk_gap inserts an audible
+    inter-sentence pause, except that sentences shorter than ~20 chars are folded
+    into a neighbour (F5-TTS pads tiny inputs into drawn-out audio). Further sub-splits long
     sentences on clause punctuation or hard-wraps as a last resort.
     Returns chunks that are each ≤ limit chars.
     """
@@ -2729,6 +2736,31 @@ def _split_for_tts(text: str, limit: int) -> List[str]:
     import re as _re
 
     pieces = _re.split(r"(?<=[.!?…])\s+", text)
+    # Fold very short sentences ("D'accord.", "Oh non.") into a neighbour:
+    # F5-TTS pads tiny inputs, so a stand-alone 9-char chunk comes out as ~3 s
+    # of drawn-out audio ("runaway TTS"). Prefer joining onto the previous
+    # sentence; fall back to the next one if the previous would exceed limit.
+    MIN_CHUNK = 20
+    merged: List[str] = []
+    carry = ""
+    for piece in pieces:
+        if carry:
+            piece = f"{carry} {piece}"
+            carry = ""
+        if len(piece) < MIN_CHUNK:
+            if merged and len(merged[-1]) + 1 + len(piece) <= limit:
+                merged[-1] = f"{merged[-1]} {piece}"
+            else:
+                carry = piece
+            continue
+        merged.append(piece)
+    if carry:
+        if merged and len(merged[-1]) + 1 + len(carry) <= limit:
+            merged[-1] = f"{merged[-1]} {carry}"
+        else:
+            merged.append(carry)
+    pieces = merged
+
     out: List[str] = []
     for piece in pieces:
         if len(piece) <= limit:

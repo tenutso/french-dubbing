@@ -170,7 +170,11 @@ class PipelineConfig:
     # Grouped tempo smoothing: segments separated by ≤ this many seconds of
     # original silence share a single uniform stretch ratio, so speed-ups/
     # slow-downs are spread across the group instead of hitting one segment.
-    tts_group_gap: float = 0.4
+    tts_group_gap: float = 0.4   # no_drop / lock only; anchored places per line
+    # anchored: a line may start up to this many seconds BEFORE its source onset
+    # when the previous line finished early, so idle time absorbs some of the
+    # speed-up a dense line would otherwise need.
+    tts_anchor_lead: float = 0.3
     # Stretch engine: "rubberband" (natural, formant-preserving) or "atempo".
     tts_stretcher: str = "rubberband"
     f5tts_model: str = "F5TTS_v1_Multilingual"
@@ -340,6 +344,7 @@ def load_config(path: str) -> PipelineConfig:
         verify_retries=int(tts.get("verify_retries", 2)),
         tts_max_stretch=tts.get("max_stretch", 1.3),
         tts_group_gap=tts.get("group_gap", 0.4),
+        tts_anchor_lead=float(tts.get("anchor_lead", 0.3)),
         tts_stretcher=tts.get("stretcher", "rubberband"),
         timing_policy=tts.get("timing_policy", "anchored"),
         tts_reading_cps=float(tts.get("reading_cps", 16.0)),
@@ -3375,6 +3380,113 @@ def _equal_power_crossfade(buf: np.ndarray, start: int, new_audio: np.ndarray, x
     return n
 
 
+def _place_anchored(
+    ordered: List[Tuple[np.ndarray, float, float]],
+    trimmed: List[np.ndarray],
+    assembled: np.ndarray,
+    total_duration: float,
+    src_rate: int,
+    max_stretch: float,
+    temp_dir: str,
+    log: logging.Logger,
+    stretcher: str,
+    xfade_samples: int,
+    fade_in_samples: int,
+    fade_out_samples: int,
+    placements_out: Optional[Dict[int, Tuple[float, float]]],
+    seg_text_chars: Optional[Dict[int, int]],
+    read_cps: float,
+    max_slowdown: float,
+    max_lead: float = 0.0,
+) -> Tuple[int, Dict[str, float]]:
+    """timing_policy=anchored: give every line its own deadline.
+
+    Each line starts at its source onset (never earlier — the dub must not
+    run ahead of the speaker) or, if the previous line ran long, right after
+    it. It must finish by the NEXT line's source onset (the video's end for
+    the last line), and its speed is chosen per line to meet that deadline:
+
+      * fits with room to spare → natural speed, or gently slowed toward
+        read_cps (≤ max_slowdown, never past the deadline) so dense text reads
+        comfortably;
+      * doesn't fit → sped up just enough, capped at max_stretch. A line that
+        starts late has less room, so it speeds up to catch up immediately; any
+        lag the cap can't absorb is carried into the next line, which then
+        tries to recover it.
+
+    The earlier grouped scheme gave a whole run of abutting lines one uniform
+    speed sized to the run's TOTAL window. Because a short line can't start
+    early, its spare time was thrown away while a long line's overrun carried
+    forward, so on continuous speech (one ~70 s "group" after another) the dub
+    lagged the speaker by up to ~18 s mid-run and could overrun the video's end.
+
+    The last line is hard-limited to the video's end: whatever still doesn't
+    fit at max_stretch is faded out there (logged), so the dub never runs past
+    the picture. Returns (write_cursor_samples, stats).
+    """
+    xfade_s = xfade_samples / src_rate
+    end_limit_s = int(total_duration * src_rate)
+    cursor_s = 0
+    n_nat = n_slow = n_fast = n_capped = 0
+    lags: List[float] = []
+    trimmed_tail_s = 0.0
+
+    for i, (_, onset, _) in enumerate(ordered):
+        a = trimmed[i]
+        L = len(a) / src_rate
+        start_s = max(cursor_s, int(max(onset - max_lead, 0.0) * src_rate))
+        start = start_s / src_rate
+        is_last = i + 1 == len(ordered)
+        deadline = total_duration if is_last else ordered[i + 1][1] - xfade_s
+        avail = max(deadline - start, 0.05)
+
+        if L <= avail:
+            chars = seg_text_chars.get(round(onset * 1000), 0) if seg_text_chars else 0
+            t_read = chars / read_cps if (chars and read_cps > 0) else 0.0
+            t_target = min(max(L, t_read), avail, L * max_slowdown)
+            speed = L / t_target if t_target > 0 else 1.0
+            if speed < 0.995:
+                n_slow += 1
+            else:
+                speed = 1.0
+                n_nat += 1
+        else:
+            speed = min(L / avail, max_stretch)
+            n_fast += 1
+            if L / avail > max_stretch:
+                n_capped += 1
+
+        if abs(speed - 1.0) > 1e-3:
+            a = _stretch_audio(a, speed, src_rate, temp_dir, log, stretcher)
+        if is_last and start_s + len(a) > end_limit_s:
+            keep = max(0, end_limit_s - start_s)
+            trimmed_tail_s = (len(a) - keep) / src_rate
+            a = a[:keep]
+        a = _apply_fade_in(a, fade_in_samples)
+        a = _apply_fade_out(a, fade_out_samples)
+
+        _equal_power_crossfade(assembled, start_s, a, xfade_samples)
+        if placements_out is not None:
+            placements_out[round(onset * 1000)] = (start, len(a) / src_rate)
+        lags.append(start - onset)
+        cursor_s = start_s + len(a)
+
+    if trimmed_tail_s > 0.05:
+        log.warning(
+            f"  Anchored timing: last line overran the video end by "
+            f"{trimmed_tail_s:.1f}s even at {max_stretch:.2f}x — faded out at the end."
+        )
+    srt = sorted(lags)
+    stats = {
+        "natural": n_nat, "slowed": n_slow, "sped": n_fast, "capped": n_capped,
+        "lag_median": srt[len(srt) // 2] if srt else 0.0,
+        "lag_p90": srt[int(0.9 * len(srt))] if srt else 0.0,
+        "lag_max": srt[-1] if srt else 0.0,
+        "trimmed_tail_s": trimmed_tail_s,
+    }
+    return cursor_s, stats
+
+
 def assemble_and_encode(
     synthesized: List[Tuple[np.ndarray, float, float]],
     total_duration: float,
@@ -3393,6 +3505,7 @@ def assemble_and_encode(
     seg_text_chars: Optional[Dict[int, int]] = None,
     read_cps: float = 16.0,
     max_slowdown: float = 1.25,
+    anchor_lead: float = 0.3,
 ) -> bool:
     """Place synthesized segments into the timeline with grouped tempo smoothing.
 
@@ -3440,25 +3553,34 @@ def assemble_and_encode(
     total_samples = int((total_duration + 2) * src_rate) + headroom
     assembled     = np.zeros(total_samples, dtype=np.float32)
 
-    # Build groups: consecutive segments whose original inter-gap <= group_gap.
+    anchored_stats: Dict[str, float] = {}
     groups: List[List[int]] = []
-    current = [0]
-    for i in range(1, len(ordered)):
-        prev_end   = ordered[i - 1][2]
-        next_start = ordered[i][1]
-        if next_start - prev_end <= group_gap:
-            current.append(i)
-        else:
-            groups.append(current)
-            current = [i]
-    groups.append(current)
+    if anchored:
+        # Per-line deadlines (see _place_anchored); no grouping needed.
+        write_cursor_anchored, anchored_stats = _place_anchored(
+            ordered, trimmed, assembled, total_duration, src_rate, max_stretch,
+            temp_dir, log, stretcher, xfade_samples, fade_in_samples,
+            fade_out_samples, placements_out, seg_text_chars, read_cps,
+            max_slowdown, max_lead=anchor_lead,
+        )
+    else:
+        # Build groups: consecutive segments whose original inter-gap <= group_gap.
+        current = [0]
+        for i in range(1, len(ordered)):
+            prev_end   = ordered[i - 1][2]
+            next_start = ordered[i][1]
+            if next_start - prev_end <= group_gap:
+                current.append(i)
+            else:
+                groups.append(current)
+                current = [i]
+        groups.append(current)
 
     stretched_groups = 0
     truncated_groups = 0
     natural_groups   = 0
-    extended_groups  = 0
     slowed_groups    = 0
-    write_cursor_s   = 0   # furthest sample written (no_drop: prevents overlap)
+    write_cursor_s   = write_cursor_anchored if anchored else 0  # furthest sample written
 
     for g_i, group in enumerate(groups):
         group_start    = ordered[group[0]][1]
@@ -3480,31 +3602,7 @@ def assemble_and_encode(
             sum(seg_text_chars.get(round(ordered[idx][1] * 1000), 0) for idx in group)
             if seg_text_chars else 0
         )
-        if anchored:
-            # Hold the source timeline: fit each group into its window W with
-            # *bidirectional* stretch. Dense groups are sped up (capped at
-            # max_stretch) instead of extending the timeline — this is what
-            # stops drift accumulating across a long talk. A group is only
-            # *slowed* when it already fits AND there is spare room, so the
-            # subtitle reads at ≤ read_cps; the slow-down is bounded by the
-            # window edge (W) and max_slowdown so it can never push past its slot.
-            if A <= W * 1.02:
-                t_read = group_chars / read_cps if (group_chars and read_cps > 0) else 0.0
-                t_target = min(max(A, t_read), W, A * max_slowdown) if A > 0 else A
-                speed = A / t_target if t_target > 0 else 1.0
-                if speed < 0.995:
-                    slowed_groups += 1
-                else:
-                    natural_groups += 1
-            else:
-                ideal_speed = A / W
-                speed = min(ideal_speed, max_stretch)
-                stretched_groups += 1
-                if ideal_speed > max_stretch:
-                    # Can't fully fit even at the cap; the small residual
-                    # overrun is absorbed by re-anchoring at the next silence.
-                    extended_groups += 1
-        elif no_drop:
+        if no_drop:
             # Never speed up (extend the timeline instead). Additionally, when
             # the group's TEXT is denser than read_cps, slow the audio toward
             # the reading pace (bounded by max_slowdown) so the dub — and the
@@ -3605,11 +3703,14 @@ def assemble_and_encode(
     if anchored:
         total_out = (write_cursor_s / src_rate) if write_cursor_s else 0.0
         drift = total_out - total_duration
+        st_ = anchored_stats
         log.info(
-            f"  Grouped smoothing [anchored]: {natural_groups} natural, "
-            f"{slowed_groups} slowed, {stretched_groups} sped up "
-            f"(≤ {max_stretch:.2f}x), {extended_groups} over-cap — output "
-            f"{total_out:.1f}s vs source {total_duration:.1f}s (drift {drift:+.1f}s)"
+            f"  Anchored timing (per line): {st_['natural']} natural, "
+            f"{st_['slowed']} slowed, {st_['sped']} sped up (≤ {max_stretch:.2f}x), "
+            f"{st_['capped']} over-cap — lag behind source median "
+            f"{st_['lag_median']:.1f}s / p90 {st_['lag_p90']:.1f}s / max "
+            f"{st_['lag_max']:.1f}s — output {total_out:.1f}s vs source "
+            f"{total_duration:.1f}s (drift {drift:+.1f}s)"
         )
     elif no_drop:
         total_out = (write_cursor_s / src_rate) if write_cursor_s else 0.0
@@ -4753,6 +4854,7 @@ def process_video(
         seg_text_chars=seg_text_chars,
         read_cps=config.tts_reading_cps,
         max_slowdown=config.tts_max_slowdown,
+        anchor_lead=config.tts_anchor_lead,
     ):
         return False
 
@@ -5227,6 +5329,7 @@ def process_video_phase2(
         seg_text_chars=seg_text_chars,
         read_cps=config.tts_reading_cps,
         max_slowdown=config.tts_max_slowdown,
+        anchor_lead=config.tts_anchor_lead,
     ):
         return False
 

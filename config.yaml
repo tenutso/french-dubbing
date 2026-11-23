@@ -209,16 +209,19 @@ tts:
   # speaker in the web review UI when the source audio is too degraded to clone.
   voices_dir: /workspace/voices
 
-  # Per-group speed-up cap. In timing_policy=anchored this is how much a dense
-  # run may be sped up to stay inside the source timeline (1.30 ≈ inaudible on
-  # speech). Keep it gentle for naturalness. (Slow-down is governed by
+  # Speed-up cap. In timing_policy=anchored this is how much a single line may
+  # be sped up to finish before the next line's source onset (1.30 ≈ inaudible
+  # on speech). Keep it gentle for naturalness. (Slow-down is governed by
   # reading_cps / max_slowdown below.)
   max_stretch: 1.3
 
   # Timing policy when a dub run is longer than its time window:
-  #   anchored → hold the source timeline: speed dense runs up (≤ max_stretch)
-  #              and re-anchor drift at each pause, so the dub stays in sync with
-  #              the video over a full-length program. Recommended.
+  #   anchored → hold the source timeline PER LINE: each line starts at its
+  #              source onset (or right after a late previous line) and is sped
+  #              up just enough (≤ max_stretch) to finish by the next line's
+  #              onset, so any lag is recovered immediately instead of building
+  #              up over a long run of continuous speech. The dub never runs
+  #              past the video's end. Recommended.
   #   no_drop  → never speed up; extend the timeline so no words are lost. On a
   #              dense 1-hour talk the audio/subs drift progressively LONGER than
   #              the video — this is the cause of end-of-video desync.
@@ -233,6 +236,13 @@ tts:
   reading_cps: 16.0
   max_slowdown: 1.25
 
+  # anchored only: a line may start up to this many seconds BEFORE its source
+  # onset when the previous line finished early, so that idle time absorbs part
+  # of a dense line's speed-up. 0.3 s is not noticeable without lip-sync; 0 =
+  # strict (never start before the speaker).
+  anchor_lead: 0.3
+
+  # no_drop / lock only (anchored places each line on its own).
   # Grouped tempo smoothing: consecutive segments separated by <= this many
   # seconds of original silence share one uniform stretch ratio, so
   # speed-ups/slow-downs are spread evenly across a speech run instead of

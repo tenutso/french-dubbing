@@ -169,21 +169,28 @@ After synthesis, each cloned voice's measured pace is logged per speaker, with a
 ## 8. Assembly, timing, and subtitles
 
 Synthesized clips are placed on a numpy timeline, time‑stretched with the Rubber Band FFmpeg
-filter (formant‑preserving), and crossfaded. Consecutive segments within `tts.group_gap` share
-one stretch ratio so speed changes are spread across a run, not dumped on one segment.
+filter (formant‑preserving), and crossfaded. Under `anchored` each line is timed on its own;
+under `no_drop` / `lock`, consecutive segments within `tts.group_gap` share one stretch ratio.
 
 **Timing policy (`tts.timing_policy`):**
 
-- `anchored` (default) — **holds the source timeline** so the dub stays in sync over a
-  full‑length program. Each group is fit into its slot bidirectionally: dense runs are sped up
-  (capped at `tts.max_stretch`, ~1.30×) instead of extending the timeline, and any small residual
-  overrun is **re‑anchored** to the original timeline at the next pause, so drift can't accumulate.
-  Crucially, **every line is floored at its own original onset** (isochrony): if the French for a
-  run is shorter than the source speech, the dub waits for each line's real onset (a natural pause)
-  rather than racing ahead of the picture — so a line can lag briefly in a dense burst and catch up,
-  but **never leads** the speaker on screen. A group is only *slowed* toward `tts.reading_cps` when
-  it already fits and has spare room in the slot (never past the slot edge). Best paired with a tight
-  `translation.budget_cps`. The assembly log reports `output Xs vs source Ys (drift ±Zs)`.
+- `anchored` (default) — **holds the source timeline, line by line** (`_place_anchored`). Each
+  line starts at its source onset — or right after the previous line if that one ran late — and
+  must finish by the **next line's source onset** (the video's end for the last line). Its speed is
+  chosen per line: natural if it fits (or gently *slowed* toward `tts.reading_cps` when there is
+  spare room, never past the deadline), otherwise sped up just enough, capped at
+  `tts.max_stretch` (~1.30×). A line that starts late has less room and so speeds up to catch up
+  immediately; lag the cap can't absorb carries into the next line, which keeps trying.
+  `tts.anchor_lead` (0.3 s) lets a line start slightly *before* its onset when the previous line
+  finished early, so idle time absorbs part of a dense line's speed‑up. The last line is
+  hard‑limited to the video's end (anything still over at the cap is faded out and logged).
+
+  This replaced a grouped scheme that gave a whole run of abutting lines one speed sized to the
+  run's *total* window. Because a short line could not start early, its spare time was wasted
+  while a long line's overrun carried forward; on continuous speech (a 29‑min webinar had only
+  25 pauses long enough to start a new group) the dub lagged the speaker by a median 4–6 s and up
+  to ~18 s, and could overrun the video's end. The assembly log now reports the lag directly:
+  `lag behind source median / p90 / max`, plus `output Xs vs source Ys (drift ±Zs)`.
 - `no_drop` — audio is **never sped up**: dense runs are only slowed, and overruns **extend** the
   timeline, pushing later groups back. Nothing is cut, but on a dense long talk the output drifts
   progressively longer than the source (the original cause of end‑of‑video desync).
@@ -231,6 +238,6 @@ during synthesis — each phase fits comfortably within 24 GB. Smaller translati
 | Translation + guards | `translate_segments`, `_retranslate_leftover_english`, `compress_overflowing_translations`, `apply_glossary` |
 | Diarization / profiles | `diarize_audio`, `assign_speakers`, `build_speaker_profiles` |
 | TTS + spoken-form normalization | `synthesize_all_segments`, `_tts_spoken_form` |
-| Timeline / anchored / drift re‑anchoring | `assemble_and_encode` |
+| Timeline / anchored per‑line timing | `assemble_and_encode`, `_place_anchored` |
 | Video mux | `mux_final_video` |
 | Subtitles | `create_srt`, `_split_into_chunks`, `_wrap_two_lines`, `_enforce_subtitle_timing` |
